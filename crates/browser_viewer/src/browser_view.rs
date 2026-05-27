@@ -17,9 +17,10 @@
 use anyhow::{Context as _, anyhow};
 use futures::channel::oneshot;
 use gpui::{
-    App, Bounds, Context, Element, ElementId, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Render,
-    SharedString, Style, Window, div, relative, size,
+    App, Bounds, Context, Div, Element, ElementId, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, Style, Window, div, relative, size,
 };
 use ui::prelude::*;
 use workspace::{
@@ -30,6 +31,25 @@ use workspace::{
 #[cfg(target_os = "windows")]
 mod windows_imports {
     pub use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    pub use webview2_com::Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_MOUSE_EVENT_KIND, COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN, COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOUBLE_CLICK,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP, COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOUBLE_CLICK,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOWN,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_UP, COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN, COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_CONTROL,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_MIDDLE_BUTTON,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_RIGHT_BUTTON,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_SHIFT,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_X_BUTTON1,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_X_BUTTON2,
+    };
     pub use windows::Win32::Foundation::HWND;
 }
 
@@ -38,6 +58,10 @@ use windows_imports::*;
 
 #[cfg(target_os = "windows")]
 use crate::webview2_host::{WebView2Session, initialize};
+
+/// One notch on a mouse wheel; matches Win32 `WHEEL_DELTA`.
+#[cfg(target_os = "windows")]
+const WHEEL_DELTA: f32 = 120.0;
 
 /// Backing model for one browser tab.
 pub struct BrowserItem {
@@ -92,6 +116,253 @@ impl BrowserView {
     pub fn item(&self) -> &Entity<BrowserItem> {
         &self.item
     }
+
+    #[cfg(target_os = "windows")]
+    fn attach_mouse_handlers(&self, root: Div, cx: &mut Context<Self>) -> Div {
+        root.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                window.focus(&this.focus_handle, cx);
+                let kind = if ev.click_count >= 2 {
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK
+                } else {
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN
+                };
+                let vk = virtual_keys(&ev.modifiers, Some(MouseButton::Left));
+                forward_mouse_event(this, cx, ev.position, kind, vk, 0);
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                let vk = virtual_keys(&ev.modifiers, None);
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+                    vk,
+                    0,
+                );
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                let kind = if ev.click_count >= 2 {
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOUBLE_CLICK
+                } else {
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN
+                };
+                let vk = virtual_keys(&ev.modifiers, Some(MouseButton::Middle));
+                forward_mouse_event(this, cx, ev.position, kind, vk, 0);
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Middle,
+            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                let vk = virtual_keys(&ev.modifiers, None);
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP,
+                    vk,
+                    0,
+                );
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                let kind = if ev.click_count >= 2 {
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOUBLE_CLICK
+                } else {
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOWN
+                };
+                let vk = virtual_keys(&ev.modifiers, Some(MouseButton::Right));
+                forward_mouse_event(this, cx, ev.position, kind, vk, 0);
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Right,
+            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                let vk = virtual_keys(&ev.modifiers, None);
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_UP,
+                    vk,
+                    0,
+                );
+            }),
+        )
+        // X1/X2 "navigate back/forward" mouse buttons. Forward to WebView2
+        // as X_BUTTON events so the page can handle them, then call
+        // `cx.stop_propagation()` to prevent the enclosing Pane
+        // (`workspace::pane`) from also handling them via
+        // `workspace.go_back()` / `go_forward()`. Without the propagation
+        // stop the Pane's handlers fire too, switching workspace tabs and
+        // stealing focus from the BrowserView — visible to the user as the
+        // browser becoming unresponsive.
+        .on_mouse_down(
+            MouseButton::Navigate(NavigationDirection::Back),
+            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                let vk = virtual_keys(&ev.modifiers, Some(ev.button));
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN,
+                    vk,
+                    1,
+                );
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Navigate(NavigationDirection::Back),
+            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                let vk = virtual_keys(&ev.modifiers, None);
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP,
+                    vk,
+                    1,
+                );
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Navigate(NavigationDirection::Forward),
+            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                let vk = virtual_keys(&ev.modifiers, Some(ev.button));
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN,
+                    vk,
+                    2,
+                );
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_up(
+            MouseButton::Navigate(NavigationDirection::Forward),
+            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+                let vk = virtual_keys(&ev.modifiers, None);
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP,
+                    vk,
+                    2,
+                );
+                cx.stop_propagation();
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+            let vk = virtual_keys(&ev.modifiers, ev.pressed_button);
+            forward_mouse_event(
+                this,
+                cx,
+                ev.position,
+                COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
+                vk,
+                0,
+            );
+        }))
+        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+            let (delta_x, delta_y) = match ev.delta {
+                ScrollDelta::Lines(p) => (p.x * WHEEL_DELTA, p.y * WHEEL_DELTA),
+                ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
+            };
+            let vk = virtual_keys(&ev.modifiers, None);
+            // WebView2 wheel mouse_data convention matches Win32
+            // WM_MOUSEWHEEL: positive = wheel rotated forward / scroll page
+            // content UP. GPUI ScrollDelta also follows the convention
+            // "positive y = scroll up", so pass through directly without
+            // negating.
+            if delta_y.abs() >= 1.0 {
+                let data = (delta_y as i32) as u32;
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
+                    vk,
+                    data,
+                );
+            }
+            if delta_x.abs() >= 1.0 {
+                let data = (delta_x as i32) as u32;
+                forward_mouse_event(
+                    this,
+                    cx,
+                    ev.position,
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
+                    vk,
+                    data,
+                );
+            }
+        }))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn virtual_keys(
+    modifiers: &Modifiers,
+    pressed_button: Option<MouseButton>,
+) -> COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS {
+    let mut bits: i32 = 0;
+    if modifiers.shift {
+        bits |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_SHIFT.0;
+    }
+    if modifiers.control {
+        bits |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_CONTROL.0;
+    }
+    match pressed_button {
+        Some(MouseButton::Left) => bits |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON.0,
+        Some(MouseButton::Middle) => bits |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_MIDDLE_BUTTON.0,
+        Some(MouseButton::Right) => bits |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_RIGHT_BUTTON.0,
+        Some(MouseButton::Navigate(NavigationDirection::Back)) => {
+            bits |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_X_BUTTON1.0
+        }
+        Some(MouseButton::Navigate(NavigationDirection::Forward)) => {
+            bits |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_X_BUTTON2.0
+        }
+        _ => {}
+    }
+    COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS(bits)
+}
+
+#[cfg(target_os = "windows")]
+fn forward_mouse_event(
+    view: &mut BrowserView,
+    cx: &mut Context<BrowserView>,
+    position: Point<Pixels>,
+    kind: COREWEBVIEW2_MOUSE_EVENT_KIND,
+    vk: COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS,
+    mouse_data: u32,
+) {
+    view.item.update(cx, |item, _| {
+        let Some(session) = item.session.as_ref() else {
+            return;
+        };
+        let Some(bounds) = item.last_bounds else {
+            return;
+        };
+        let local_x = (f32::from(position.x) - f32::from(bounds.origin.x)) as i32;
+        let local_y = (f32::from(position.y) - f32::from(bounds.origin.y)) as i32;
+        if let Err(err) = session.send_mouse_input(kind, vk, mouse_data, local_x, local_y) {
+            log::debug!("send_mouse_input failed: {err}");
+        }
+    });
 }
 
 impl EventEmitter<()> for BrowserView {}
@@ -105,11 +376,18 @@ impl Focusable for BrowserView {
 impl Render for BrowserView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let item = self.item.clone();
-        div()
+        let mut root = div()
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .child(BrowserViewportElement::new(item))
+            .child(BrowserViewportElement::new(item));
+
+        #[cfg(target_os = "windows")]
+        {
+            root = self.attach_mouse_handlers(root, cx);
+        }
+
+        root
     }
 }
 
@@ -249,24 +527,16 @@ fn drive_session(
 
     // Reposition the visual whenever the element's rect changes.
     let bounds_changed = item.last_bounds != Some(bounds);
-    if bounds_changed && item.session.is_some() {
+    if bounds_changed {
         if let Some(session) = &item.session {
-            let offset_x = f32::from(bounds.origin.x);
-            let offset_y = f32::from(bounds.origin.y);
+            let x = f32::from(bounds.origin.x);
+            let y = f32::from(bounds.origin.y);
             let width = f32::from(bounds.size.width) as i32;
             let height = f32::from(bounds.size.height) as i32;
-            if let Err(err) = session.set_position(offset_x, offset_y) {
-                log::warn!("BrowserItem: set_position failed: {err:?}");
-            }
-            if let Err(err) = session.set_size(width, height) {
-                log::warn!("BrowserItem: set_size failed: {err:?}");
-            }
-            if let Err(err) = session.commit() {
-                log::warn!("BrowserItem: commit failed: {err:?}");
+            if let Err(err) = session.set_rect(x, y, width, height) {
+                log::warn!("BrowserItem: set_rect failed: {err:?}");
             }
         }
-        item.last_bounds = Some(bounds);
-    } else if bounds_changed {
         item.last_bounds = Some(bounds);
     }
 
@@ -292,27 +562,33 @@ fn start_session(
     let visual = gpui_windows::create_child_visual_for_hwnd(hwnd)
         .context("gpui_windows::create_child_visual_for_hwnd")?;
 
-    let offset_x = f32::from(bounds.origin.x);
-    let offset_y = f32::from(bounds.origin.y);
+    let x = f32::from(bounds.origin.x);
+    let y = f32::from(bounds.origin.y);
     let width = f32::from(bounds.size.width) as i32;
     let height = f32::from(bounds.size.height) as i32;
 
+    // Position the visual where the BrowserView element lives in the
+    // window. The subsequent `initialize` call configures controller
+    // bounds + popup-position notification on the same coords.
     unsafe {
         visual
             .visual()
-            .SetOffsetX2(offset_x)
+            .SetOffsetX2(x)
             .map_err(|err| anyhow!("initial SetOffsetX2: {err}"))?;
         visual
             .visual()
-            .SetOffsetY2(offset_y)
+            .SetOffsetY2(y)
             .map_err(|err| anyhow!("initial SetOffsetY2: {err}"))?;
     }
 
+    // Initial controller bounds are placed at the visual's screen-space
+    // origin so popups (right-click menu, autofill, alert dialogs) land
+    // anchored to the page, not at the parent window's (0, 0).
     let rect = windows::Win32::Foundation::RECT {
-        left: 0,
-        top: 0,
-        right: width,
-        bottom: height,
+        left: x as i32,
+        top: y as i32,
+        right: x as i32 + width,
+        bottom: y as i32 + height,
     };
 
     let (tx, rx) = oneshot::channel();

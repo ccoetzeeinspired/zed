@@ -25,12 +25,13 @@ use webview2_com::{
     CreateCoreWebView2CompositionControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_MOUSE_EVENT_KIND, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS,
         CreateCoreWebView2Environment, ICoreWebView2CompositionController,
         ICoreWebView2Controller, ICoreWebView2Environment3,
     },
 };
 use windows::{
-    Win32::Foundation::{HWND, RECT},
+    Win32::Foundation::{HWND, POINT, RECT},
     core::{HSTRING, Interface, PCWSTR},
 };
 
@@ -39,9 +40,6 @@ use windows::{
 /// controller (same COM object cast to a different interface) exposes
 /// `SetBounds`, `SetIsVisible`, and `CoreWebView2()`.
 pub(crate) struct WebView2Session {
-    // Held alive for COM ref-counting; later phases will use it for input
-    // dispatch (SendMouseInput, SendKeyEvent) and design-mode JS injection.
-    #[allow(dead_code)]
     pub composition_controller: ICoreWebView2CompositionController,
     pub controller: ICoreWebView2Controller,
     /// Held so the visual stays attached to the DComp tree for the lifetime
@@ -50,43 +48,67 @@ pub(crate) struct WebView2Session {
 }
 
 impl WebView2Session {
-    /// Move the WebView's visual to the given DIP offset from the parent
-    /// window's client-area origin. Caller must subsequently call
-    /// [`commit`](Self::commit) for the change to become visible.
-    pub fn set_position(&self, offset_x: f32, offset_y: f32) -> Result<()> {
+    /// Position and size the WebView atomically. `x`/`y` are in DIPs from
+    /// the parent HWND's client-area origin. This updates three things:
+    ///
+    /// 1. The DComp visual's offset (where the page is actually rendered).
+    /// 2. The controller's `Bounds` to a rect at the same position. The
+    ///    bounds rect's *size* defines the WebView2 viewport; its
+    ///    *position* is what popup menus and dialogs use to anchor
+    ///    themselves to the host window. Setting it equal to the visual's
+    ///    offset keeps right-click menus, autofill popups, etc. aligned
+    ///    with the content.
+    /// 3. Calls `NotifyParentWindowPositionChanged` so WebView2
+    ///    recomputes screen-space positions for any open popups.
+    ///
+    /// All changes are committed to the DComp tree before returning.
+    pub fn set_rect(&self, x: f32, y: f32, width: i32, height: i32) -> Result<()> {
         unsafe {
             self.visual
                 .visual()
-                .SetOffsetX2(offset_x)
+                .SetOffsetX2(x)
                 .map_err(|err| anyhow!("SetOffsetX2: {err}"))?;
             self.visual
                 .visual()
-                .SetOffsetY2(offset_y)
+                .SetOffsetY2(y)
                 .map_err(|err| anyhow!("SetOffsetY2: {err}"))?;
         }
-        Ok(())
-    }
-
-    /// Resize the WebView's rendering viewport. Coordinates are in the
-    /// visual's local space (origin at the visual's offset).
-    pub fn set_size(&self, width: i32, height: i32) -> Result<()> {
         let rect = windows::Win32::Foundation::RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: height,
+            left: x as i32,
+            top: y as i32,
+            right: x as i32 + width,
+            bottom: y as i32 + height,
         };
         unsafe {
             self.controller
                 .SetBounds(rect)
                 .map_err(|err| anyhow!("controller.SetBounds: {err}"))?;
+            self.controller
+                .NotifyParentWindowPositionChanged()
+                .map_err(|err| anyhow!("NotifyParentWindowPositionChanged: {err}"))?;
         }
+        self.visual.commit()?;
         Ok(())
     }
 
-    /// Commit pending visual transform changes to the DComp tree.
-    pub fn commit(&self) -> Result<()> {
-        self.visual.commit()
+    /// Forward a mouse event into the WebView. Coordinates are in browser-
+    /// local space (origin at the visual's top-left). `mouse_data` carries
+    /// the wheel delta for wheel events (signed WHEEL_DELTA units), 0
+    /// otherwise.
+    pub fn send_mouse_input(
+        &self,
+        kind: COREWEBVIEW2_MOUSE_EVENT_KIND,
+        virtual_keys: COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS,
+        mouse_data: u32,
+        x: i32,
+        y: i32,
+    ) -> Result<()> {
+        unsafe {
+            self.composition_controller
+                .SendMouseInput(kind, virtual_keys, mouse_data, POINT { x, y })
+                .map_err(|err| anyhow!("SendMouseInput: {err}"))?;
+        }
+        Ok(())
     }
 }
 
