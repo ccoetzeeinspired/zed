@@ -15,6 +15,7 @@
 //! `cx.notify()` for a re-render.
 
 use anyhow::{Context as _, anyhow};
+use editor::Editor;
 use futures::{
     StreamExt as _,
     channel::{mpsc, oneshot},
@@ -26,6 +27,7 @@ use gpui::{
     NavigationDirection, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
     Style, Window, div, relative, size,
 };
+use ui::Tooltip;
 use ui::prelude::*;
 use workspace::{
     Workspace,
@@ -141,27 +143,112 @@ pub enum BrowserViewEvent {
 pub struct BrowserView {
     item: Entity<BrowserItem>,
     focus_handle: FocusHandle,
+    url_editor: Entity<Editor>,
 }
 
 impl BrowserView {
-    pub fn new(url: SharedString, cx: &mut Context<Self>) -> Self {
-        let item = cx.new(|_| BrowserItem::new(url));
+    pub fn new(url: SharedString, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let item = cx.new(|_| BrowserItem::new(url.clone()));
 
-        // Re-emit on every BrowserItem change so the workspace re-renders the
-        // tab strip when the page title or URL updates.
-        cx.observe(&item, |_, _, cx| {
+        let url_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(url.as_ref(), window, cx);
+            editor
+        });
+
+        // Re-emit + re-render on every BrowserItem change. The tab strip
+        // picks up the UpdateTab event; the render pass syncs the URL
+        // editor from the model when needed (it has &mut Window).
+        cx.observe(&item, move |_view, _item, cx| {
             cx.emit(BrowserViewEvent::UpdateTab);
+            cx.notify();
         })
         .detach();
 
         Self {
             item,
             focus_handle: cx.focus_handle(),
+            url_editor,
         }
     }
 
     pub fn item(&self) -> &Entity<BrowserItem> {
         &self.item
+    }
+
+    #[cfg(target_os = "windows")]
+    fn navigate_to(&self, target: String, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                let url_h = windows::core::HSTRING::from(&target);
+                unsafe {
+                    if let Err(err) = session
+                        .webview
+                        .Navigate(windows::core::PCWSTR(url_h.as_ptr()))
+                    {
+                        log::warn!("BrowserView::navigate_to({target}): {err}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn go_back(&self, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                unsafe {
+                    let _ = session.webview.GoBack();
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn go_forward(&self, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                unsafe {
+                    let _ = session.webview.GoForward();
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn reload_page(&self, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                unsafe {
+                    let _ = session.webview.Reload();
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn stop_loading(&self, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                unsafe {
+                    let _ = session.webview.Stop();
+                }
+            }
+        });
+    }
+
+    fn on_submit_url(
+        &mut self,
+        _: &menu::Confirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.url_editor.read(cx).text(cx);
+        let target = parse_address_bar_input(&input);
+        #[cfg(target_os = "windows")]
+        self.navigate_to(target, cx);
+        #[cfg(not(target_os = "windows"))]
+        let _ = target;
     }
 
     #[cfg(target_os = "windows")]
@@ -421,20 +508,122 @@ impl Focusable for BrowserView {
 }
 
 impl Render for BrowserView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Sync the address bar editor text from the model when (a) the model
+        // URL has changed and (b) the user isn't typing into the input.
+        let model_url = self.item.read(cx).url.clone();
+        let editor_focused = self.url_editor.focus_handle(cx).is_focused(window);
+        if !editor_focused {
+            let editor_text = self.url_editor.read(cx).text(cx);
+            if editor_text != model_url.as_ref() {
+                self.url_editor.update(cx, |editor, cx| {
+                    editor.set_text(model_url.as_ref(), window, cx);
+                });
+            }
+        }
+
+        let can_back = self.item.read(cx).can_go_back;
+        let can_fwd = self.item.read(cx).can_go_forward;
+        let is_loading = self.item.read(cx).is_loading;
         let item = self.item.clone();
-        let mut root = div()
-            .track_focus(&self.focus_handle)
-            .size_full()
+
+        let mut viewport = div()
+            .flex_1()
+            .min_h_0()
             .bg(cx.theme().colors().editor_background)
             .child(BrowserViewportElement::new(item));
 
         #[cfg(target_os = "windows")]
         {
-            root = self.attach_mouse_handlers(root, cx);
+            viewport = self.attach_mouse_handlers(viewport, cx);
         }
 
-        root
+        v_flex()
+            .track_focus(&self.focus_handle)
+            .key_context("BrowserView")
+            .on_action(cx.listener(Self::on_submit_url))
+            .size_full()
+            .child(self.render_address_bar(can_back, can_fwd, is_loading, cx))
+            .child(viewport)
+    }
+}
+
+impl BrowserView {
+    fn render_address_bar(
+        &self,
+        can_back: bool,
+        can_fwd: bool,
+        is_loading: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .h_8()
+            .flex_none()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().tab_bar_background)
+            .child(
+                IconButton::new("browser-back", IconName::ArrowLeft)
+                    .icon_size(IconSize::Small)
+                    .disabled(!can_back)
+                    .tooltip(Tooltip::text("Back"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        #[cfg(target_os = "windows")]
+                        this.go_back(cx);
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = (this, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("browser-forward", IconName::ArrowRight)
+                    .icon_size(IconSize::Small)
+                    .disabled(!can_fwd)
+                    .tooltip(Tooltip::text("Forward"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        #[cfg(target_os = "windows")]
+                        this.go_forward(cx);
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = (this, cx);
+                    })),
+            )
+            .child(
+                IconButton::new(
+                    "browser-reload",
+                    if is_loading {
+                        IconName::Close
+                    } else {
+                        IconName::ArrowCircle
+                    },
+                )
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text(if is_loading { "Stop" } else { "Reload" }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    #[cfg(target_os = "windows")]
+                    {
+                        if is_loading {
+                            this.stop_loading(cx);
+                        } else {
+                            this.reload_page(cx);
+                        }
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = (this, cx);
+                })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(self.url_editor.clone()),
+            )
     }
 }
 
@@ -761,6 +950,76 @@ pub fn open_new_tab(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let view = cx.new(|cx| BrowserView::new(url, cx));
+    let view = cx.new(|cx| BrowserView::new(url, window, cx));
     workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+}
+
+/// Best-effort parsing of address-bar input: if it parses as a URL with a
+/// scheme, use as-is; if it looks like a host (contains a `.` and no spaces),
+/// prepend `https://`; otherwise treat as a Google search query.
+fn parse_address_bar_input(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "about:blank".to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const KNOWN_SCHEMES: &[&str] = &[
+        "http://",
+        "https://",
+        "file://",
+        "about:",
+        "data:",
+        "javascript:",
+    ];
+    if KNOWN_SCHEMES.iter().any(|p| lower.starts_with(p)) {
+        return trimmed.to_string();
+    }
+    // localhost:port is a common dev-server case.
+    if trimmed.starts_with("localhost") || trimmed.starts_with("127.0.0.1") {
+        return format!("http://{trimmed}");
+    }
+    // Bare host or host/path — must contain a dot, no spaces, and start
+    // with an alphanumeric.
+    let looks_like_host = trimmed.contains('.')
+        && !trimmed.contains(' ')
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if looks_like_host {
+        return format!("https://{trimmed}");
+    }
+    // Fall through to search.
+    let encoded = url_encode_query(trimmed);
+    format!("https://www.google.com/search?q={encoded}")
+}
+
+/// Tiny URL form-encoder for the search-query fallback. Replaces spaces
+/// with `+` and percent-encodes characters outside the unreserved set.
+fn url_encode_query(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                let hi = byte >> 4;
+                let lo = byte & 0xF;
+                out.push(if hi < 10 {
+                    (b'0' + hi) as char
+                } else {
+                    (b'A' + hi - 10) as char
+                });
+                out.push(if lo < 10 {
+                    (b'0' + lo) as char
+                } else {
+                    (b'A' + lo - 10) as char
+                });
+            }
+        }
+    }
+    out
 }
