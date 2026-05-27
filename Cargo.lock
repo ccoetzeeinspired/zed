@@ -2244,12 +2244,16 @@ name = "browser_viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "editor",
  "futures 0.3.32",
  "gpui",
  "gpui_windows",
  "log",
+ "menu",
  "project",
  "raw-window-handle",
+ "settings",
+ "theme_settings",
  "ui",
  "webview2-com",
  "windows 0.61.3",

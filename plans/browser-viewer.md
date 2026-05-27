@@ -331,26 +331,69 @@ drop, so the owner can simply drop the handle to clean up.
 
 WebView2 in composition mode does not receive input from the OS
 directly — the host is responsible for forwarding every relevant
-event. The full surface:
+event. Mouse is straightforward via `SendMouseInput`; **keyboard is
+not symmetric**, which we learned the hard way and is documented
+here so future sessions don't repeat the experiment.
+
+#### Mouse (shipped in Phase 1.D)
 
 | GPUI event             | WebView2 call                                  |
 |------------------------|------------------------------------------------|
 | MouseDown / MouseUp    | `SendMouseInput(LeftButtonDown/Up, ...)`       |
 | MouseMove              | `SendMouseInput(Move, x, y)`                   |
 | ScrollWheel            | `SendMouseInput(Wheel/HorizontalWheel, delta)` |
-| KeyDown / KeyUp        | `SendKeyEvent(KeyDown/KeyUp, virtual_key)`     |
-| Char input (IME)       | `SendKeyEvent(Char, char_code)`                |
-| Focus gained           | `controller.MoveFocus(Programmatic)`           |
-| Focus lost             | (page-side handled via blur)                   |
+| Navigate (X1/X2)       | `SendMouseInput(X_BUTTON_DOWN/UP, ...)` + `cx.stop_propagation()` so the Pane's history handler doesn't double-fire |
 
-**IME** requires special handling. WebView2 in composition mode does
-not pump IME messages itself; the host must:
-1. When focus enters the browser, register an IME composition window
-   sized to the browser rect.
-2. On `WM_IME_*` messages, forward the active composition string to
-   the page via `SendKeyEvent(Char, ...)` calls.
+#### Keyboard — Phase 3, not 1.D
 
-Phase 3 implements this for English + CJK as the primary cases.
+**`ICoreWebView2CompositionController` has no `SendKeyEvent`.** We
+verified this across versions 1, 2, and 3 of the interface in
+`webview2-com-sys 0.38`. Composition mode treats keyboard
+fundamentally differently from mouse: the SDK does not expose a
+direct injection method.
+
+Phase 1.D briefly attempted to call `controller.MoveFocus(PROGRAMMATIC)`
+on viewport click, hoping WebView2's internal subclass of the
+parent HWND would then route keyboard messages to the page. The
+result: page keyboard still didn't work, **and** it broke address
+bar typing (intermittently). The MoveFocus call was reverted; this
+section captures why and what the real fix looks like.
+
+Four real options for the actual keyboard implementation:
+
+1. **Host-side HWND subclass + JS injection.** Subclass Zed's
+   parent HWND. Intercept `WM_KEYDOWN`/`WM_KEYUP`/`WM_CHAR` when
+   the BrowserView has focus. Run `ToUnicodeEx` to produce
+   character data, then `ExecuteScript` to dispatch a `KeyboardEvent`
+   on the focused element in the page. Loses native input handling
+   (autofill, password manager) but works.
+2. **`SendInput` Win32 simulation.** Synthesize OS-level keystrokes
+   when the page should receive input. Affects system focus, so
+   plays badly with multiple Zed windows. Most brittle.
+3. **Newer WebView2 SDK + `ICoreWebView2KeyboardInputController`.**
+   Microsoft has been working on a proper keyboard injection API.
+   When `webview2-com` is bumped to a version that exposes it (the
+   underlying SDK is 1.0.2592+), this becomes a clean drop-in
+   parallel to `SendMouseInput`. Until then, we'd need to bind it
+   ourselves via raw COM.
+4. **CDP `Input.dispatchKeyEvent`.** Open a Chrome DevTools
+   Protocol channel to the same WebView and inject keyboard via
+   CDP. Works for content but bypasses some native widgets in the
+   page.
+
+**IME (composition mode for CJK and other complex scripts)** is a
+separate axis, gated on whichever of 1–4 we choose. None of them
+get IME right without explicit `WM_IME_*` handling.
+
+**Decision punted to Phase 3.** Of the four, option 3 (newer SDK)
+is the right long-term answer; until that's available, option 1
+(subclass + JS) is the most viable interim approach. Phase 3 will
+re-evaluate which SDK version `webview2-com` ships with at that
+point and pick accordingly.
+
+For Phase 1, the address bar gives the user a way to enter URLs,
+back/forward/reload work, and link clicks navigate. That covers
+the dogfood-localhost-dev-server use case without keyboard-in-page.
 
 ### 6.4 Design mode JS protocol
 
