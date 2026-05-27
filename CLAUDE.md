@@ -5,9 +5,19 @@
 This is a personal fork of `zed-industries/zed`, hosted at
 `https://github.com/ccoetzeeinspired/zed`. The notes below describe how this
 fork differs from upstream, why those differences exist, and the workflow for
-keeping it in sync. These notes live only on the `pdf-viewer` branch so that
-`main` stays a byte-for-byte mirror of upstream and never produces sync
-conflicts on this file.
+keeping it in sync. These notes live only on the `pdf-viewer` and
+`claude-only` branches so that `main` stays a byte-for-byte mirror of
+upstream and never produces sync conflicts on this file.
+
+## Specs and plans (under `plans/`)
+
+Design documents for in-flight or upcoming features live under `plans/`.
+Read the relevant plan before starting implementation work on the
+corresponding feature.
+
+| Plan                                            | Status        | Branch (future)  |
+|-------------------------------------------------|---------------|------------------|
+| [`browser-viewer.md`](plans/browser-viewer.md)  | Draft, ready  | `browser-viewer` |
 
 ## Remotes
 
