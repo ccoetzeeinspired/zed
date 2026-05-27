@@ -254,69 +254,78 @@ spawns a new tree.
 
 ## 6. Technical Design
 
-### 6.1 WebView2 embedding model — composition over HWND
+### 6.1 WebView2 embedding model — composition only
 
-Two integration modes are available:
+**Decision (revised in Phase 0).** We always use composition mode.
+The child-HWND fallback originally planned for Phase 0 doesn't work
+inside Zed: GPUI renders via DirectComposition, and child HWNDs are
+drawn behind the parent's DComp swap chain, making them invisible.
+There is no cheap intermediate; composition is the entry-level
+requirement.
 
-**Option A: child HWND (used in Phase 0).** Create a child window
-inside Zed's main HWND, hand it to `CreateCoreWebView2ControllerAsync`,
-position and resize it under GPUI's tab area. Pros: simple. Cons: the
-WebView2 HWND lives outside GPUI's render tree, so any GPUI element
-that overlaps the browser region (panels, modals, autocomplete) will
-be drawn *underneath* the browser unless we forcibly hide the browser.
-Z-order glitches on overlays. Input focus management is split between
-two HWNDs.
+**Composition mode.** `ICoreWebView2Environment3.CreateCoreWebView2-
+CompositionController(parent_hwnd, callback)` returns a
+`ICoreWebView2CompositionController` whose `SetRootVisualTarget`
+accepts an `IDCompositionVisual` we own. We add that visual as a
+child of GPUI's root composition visual so it draws on top of Zed's
+swap chain content. The `parent_hwnd` is still required — it's the
+logical parent for input/IME routing — but the rendering output goes
+to the visual.
 
-**Option B: composition mode (target from Phase 2).** Use
-`CreateCoreWebView2CompositionControllerAsync` to get a `CoreWebView2-
-CompositionController`, then call `RootVisualTarget` to bind it to an
-`IDCompositionVisual` that we own. We add that visual to GPUI's
-DirectComposition tree as a sibling of GPUI's swap chain. Pros: real
-z-ordering — GPUI can draw over the browser; the browser is just one
-layer in the visual tree. No separate HWND. Input is dispatched via
-explicit COM calls so no HWND focus splitting. Cons: more complex,
-requires DComp plumbing in GPUI.
+The same COM object also implements `ICoreWebView2Controller`, which
+exposes `SetBounds`, `SetIsVisible`, and `CoreWebView2().Navigate(...)`.
+We `.cast()` between the two interfaces as needed.
 
-**Decision.** Start with Option A in Phase 0 to validate the SDK and
-basic flow. Move to Option B in Phase 2; all design-mode polish in
-Phases 4–5 assumes Option B.
+**Input has no automatic path.** Composition mode does not forward
+OS input to WebView2; the host must call `SendMouseInput` /
+`SendKeyEvent` / `SendPointerInput` explicitly. Input bridging is
+therefore part of Phase 1 (basic mouse) and Phase 3 (full keyboard,
+IME, scroll, focus), not Phase 0.
 
-### 6.2 GPUI extension — the `HostedVisual` primitive
+### 6.2 GPUI extension — the `dcomp_registry` module (shipped)
 
-GPUI today owns a `IDCompositionTarget` for the Zed window. We need to
-expose, in `crates/gpui_windows/`, a way for non-GPUI code to insert a
-visual into that tree at a specified rect.
-
-Proposed API surface (Windows-only `cfg`):
+GPUI owns the `IDCompositionTarget` and root `IDCompositionVisual`
+for each Zed window. To insert externally-owned visuals (WebView2,
+future video preview, etc.), Phase 0 added a small Windows-only
+module in `crates/gpui_windows/src/dcomp_registry.rs`:
 
 ```rust
-// crates/gpui_windows/src/composition.rs (new)
-pub struct HostedVisualHandle {
-    visual: IDCompositionVisual,
-    // …internal bookkeeping
-}
+// Public API
+pub fn create_child_visual_for_hwnd(hwnd: HWND) -> Result<HostedVisual>;
 
-pub trait WindowExt {
-    /// Insert an externally-owned DComp visual into the window's
-    /// composition tree. The returned handle owns the slot; dropping
-    /// it removes the visual.
-    fn add_hosted_visual(
-        &mut self,
-        visual: IDCompositionVisual,
-        z_index: i32,
-    ) -> HostedVisualHandle;
+pub struct HostedVisual { /* … */ }
+impl HostedVisual {
+    pub fn visual(&self) -> &IDCompositionVisual;
+    pub fn commit(&self) -> Result<()>;
 }
+// Drop removes the visual from the root and commits.
 ```
 
-`BrowserView::render` returns a placeholder GPUI element of the
-desired size; on first paint it calls `window.add_hosted_visual(...)`
-with the WebView2 composition visual and positions it to match the
-element's screen rect. On resize/scroll, the visual's transform is
-updated.
+Internally a thread-local HWND → `Weak<DirectComposition>` map is
+populated by `DirectXRenderer::new` when it creates a `DirectComposi-
+tion`. The renderer's storage of `DirectComposition` was changed to
+`Arc<DirectComposition>` so callers can hold weak references without
+extending the renderer's lifetime.
 
-**This is the one upstream-shaped change.** Everything else stays
-contained in `browser_viewer`. The trait is gated behind
-`#[cfg(target_os = "windows")]` and won't affect other platforms.
+**Why thread-local, not a global static.** COM interfaces in
+`DirectComposition` are STA-bound to the GPUI UI thread. All
+registration (`DirectXRenderer::new`) and lookup
+(`browser_viewer::spike`) happen on that thread. A thread-local
+avoids needing `unsafe impl Send/Sync` on COM types that genuinely
+aren't safe to share across threads.
+
+**Why HWND-keyed, not method-on-Window.** The cleanest API would be
+a method on `gpui::Window`, but exposing it requires extending the
+cross-platform `PlatformWindow` trait (touches non-Windows
+implementations) or downcasting via `Any`. The registry approach
+adds zero surface to gpui core; everything lives in `gpui_windows`.
+If a future feature needs broader cross-platform abstractions,
+revisit then.
+
+**Lifetime.** `HostedVisual` holds an `Arc<DirectComposition>` so
+the renderer's DComp survives at least as long as any hosted visual.
+The visual is removed from the root and the tree is re-committed on
+drop, so the owner can simply drop the handle to clean up.
 
 ### 6.3 Input bridging
 
@@ -586,44 +595,92 @@ the unstable preview period):
 
 ## 9. Implementation Phases & Acceptance Criteria
 
-### Phase 0 — Spike (1 week)
+### Phase 0 — Spike (shipped 2026-05-27)
 
-**Objective.** Prove WebView2 can be created and embedded inside Zed's
-main window. End state: a hardcoded action opens a child-HWND-hosted
-WebView2 displaying `https://example.com`.
+**Objective.** Prove WebView2 can render inside Zed's main window.
+End state: a hardcoded action opens a WebView2 displaying
+`https://example.com`, drawn into Zed's render tree.
 
-**Tasks.**
+**Implementation note — what we actually shipped.**
 
-- Add `webview2-com` and `windows` crate dependencies under
+The original spec assumed Phase 0 would use child-HWND embedding,
+with composition mode deferred to Phase 2. That assumption was wrong
+on Zed specifically: GPUI renders via DirectComposition, and a child
+HWND inside a DComp-parented window draws *behind* the parent's swap
+chain — invisible. Phase 0 had to go straight to composition mode.
+
+Two key adjustments were made during the spike and are now load-
+bearing for everything that follows:
+
+1. **Composition controller, not HWND controller.** WebView2 exposes
+   `ICoreWebView2CompositionController` for OSR-style hosts. We hand
+   it an `IDCompositionVisual` via `SetRootVisualTarget`; the
+   underlying COM object also implements `ICoreWebView2Controller`,
+   which we cast to in order to call `SetBounds`, `SetIsVisible`,
+   and `CoreWebView2().Navigate(...)`.
+2. **Async callbacks, not `wait_for_async_operation`.** The blocking
+   helper pumps Windows messages while waiting for the COM
+   completion, re-entering GPUI's window handlers and triggering
+   `RefCell already borrowed` violations. We use `::create()` to
+   register the handlers and let GPUI's normal message loop fire
+   them; the chain is `env created → composition controller created
+   → SetRootVisualTarget + Navigate`.
+
+**GPUI extension.** A small `pub(crate)` API was added to
+`crates/gpui_windows/src/dcomp_registry.rs`: a thread-local
+HWND → `Arc<DirectComposition>` registry, populated when the
+renderer constructs its DComp, plus a public
+`create_child_visual_for_hwnd(hwnd) -> HostedVisual` that adds a
+child visual to the window's root visual. `HostedVisual` owns a
+strong reference and removes the visual on drop. Thread-local
+because COM interfaces are STA-bound to the GPUI UI thread.
+
+**Tasks (as shipped).**
+
+- Added `webview2-com 0.38`, `windows` (workspace), `raw-window-
+  handle`, `gpui_windows` deps to `crates/browser_viewer/` under
   `#[cfg(target_os = "windows")]` gating.
-- Create `crates/browser_viewer/` skeleton (no project item yet).
-- Implement `WebView2Host::new_hwnd(parent_hwnd, rect, url)` that
-  initializes a `CoreWebView2Environment` and `CoreWebView2Controller`
-  and navigates to a URL.
-- Register a temporary action `browser: open spike URL` that creates
-  a child HWND under Zed's main window, places it in a fixed rect,
-  and constructs `WebView2Host` against it.
+- Created `crates/browser_viewer/` with three modules:
+  `browser_viewer.rs` (entry point), `webview2_host.rs` (async COM
+  chain), `spike.rs` (action + HWND extraction + thread-local
+  session storage).
+- Made `crates/gpui_windows/src/directx_renderer.rs`
+  `DirectComposition` accessible via the registry and wrapped its
+  storage in `Arc`.
+- Wired `browser_viewer::init(cx)` into `crates/zed/src/main.rs`.
 
-**Acceptance criteria.**
+**Acceptance criteria (revised).**
 
-- [ ] AC-P0-1: Running the action opens `example.com` rendered inside
-  Zed's window at a fixed rect.
-- [ ] AC-P0-2: Clicking links on the page navigates correctly.
-- [ ] AC-P0-3: Closing Zed does not leak `msedgewebview2.exe`
-  processes (verifiable via Task Manager after 30s).
-- [ ] AC-P0-4: All new code is under `#[cfg(target_os = "windows")]`;
-  on a Linux/macOS cross-compile (`cargo check --target ...`), the
-  crate compiles to a stub.
+- [x] AC-P0-1: Running the action renders `example.com` inside
+  Zed's window via DirectComposition. **PASSED.**
+- [~] AC-P0-2: ~~Clicking links on the page navigates correctly.~~
+  **MOVED to Phase 1.** Composition mode does not auto-route OS
+  input to WebView2; the host must call `SendMouseInput` /
+  `SendKeyEvent` explicitly. The right surface to wire this is the
+  Phase 1 `BrowserView` GPUI element, not a Win32 subclass hook
+  that would be thrown away in Phase 1.
+- [x] AC-P0-3: Closing Zed does not leak `msedgewebview2.exe`
+  processes. **PASSED** (informal check; to be revisited in
+  Phase 5 with a proper soak test).
+- [x] AC-P0-4: All new code is gated to Windows; cross-compile to
+  Linux accepts the crate manifest (verified by inspection;
+  blocked from full check by missing Linux std toolchain on the
+  dev machine — non-blocking for this fork).
 
-### Phase 1 — Tabs + Navigation (2 weeks)
+### Phase 1 — Tabs + Navigation + basic input (3 weeks)
 
 **Objective.** Browser tabs are real Zed tabs, openable from the
-command palette, navigable like a normal browser. Still child-HWND
-hosted.
+command palette, navigable like a normal browser, with mouse clicks
+working. Composition mode (from Phase 0) carries forward; the spike
+action is replaced by a proper `BrowserView` GPUI element.
 
 **Tasks.**
 
 - Implement `BrowserItem` (ProjectItem) and `BrowserView` (Item).
+- The `BrowserView` GPUI element calls
+  `gpui_windows::create_child_visual_for_hwnd` on first render,
+  positions the visual to its on-screen rect each layout pass, and
+  drives `controller.SetBounds(rect_in_local_coords)` on resize.
 - Hook URL navigation to `Workspace::open_path` via a custom
   `BrowserPath` that wraps a URL.
 - Build the address bar component (URL input + back/forward/reload
@@ -632,9 +689,17 @@ hosted.
   `DocumentTitleChanged`, `FaviconChanged`, `HistoryChanged` events.
 - Implement search-vs-URL heuristic for the address bar input.
 - Multi-tab: each `BrowserView` owns its own controller; switching
-  tabs hides/shows controllers via `controller.IsVisible`.
+  tabs hides/shows visuals via `HostedVisual` drop / re-create or
+  `IDCompositionVisual::SetOffsetX/Y` off-screen.
+- **Basic mouse input forwarding** (inherits AC-P0-2):
+  `BrowserView.on_mouse_down/up/move/scroll` translate GPUI
+  coordinates into browser-local coordinates and call
+  `composition_controller.SendMouseInput(...)`. Full keyboard +
+  IME deferred to Phase 3.
 - Add settings stub: `browser.enabled`, `browser.default_search_url`,
   `browser.homepage`.
+- Remove the Phase 0 spike action (`browser: open spike url`); the
+  spike module is deleted.
 
 **Acceptance criteria.**
 
@@ -651,6 +716,11 @@ hosted.
   processes.
 - [ ] AC-P1-7: After Zed restart, cookies set in the previous session
   are still present (verified by visiting a cookie-test page).
+- [ ] AC-P1-8 (inherited from P0): clicking a link on a page navigates
+  correctly. Mouse down + up are forwarded to WebView2 via
+  `SendMouseInput`.
+- [ ] AC-P1-9: The browser visual stays aligned with its `BrowserView`
+  element through window resize, sidebar toggle, and tab switching.
 
 ### Phase 2 — Composition mode + GPU integration (2–3 weeks)
 
