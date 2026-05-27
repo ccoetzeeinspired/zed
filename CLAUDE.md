@@ -62,10 +62,15 @@ personal build, not appropriate to upstream.
 
 ## Build notes
 
-- Target directory is the out-of-tree `D:\zt\` (configured via
-  `CARGO_TARGET_DIR` or a `.cargo/config.toml` somewhere in the environment).
-  Built binary lands at `D:\zt\debug\zed.exe` (debug) or
-  `D:\zt\release\zed.exe` (release).
+- Target directory is the default in-tree `D:\src\zed\target\`.
+  Built binary lands at `D:\src\zed\target\debug\zed.exe` (debug) or
+  `D:\src\zed\target\release\zed.exe` (release).
+- An older out-of-tree target dir at `D:\zt\` exists from a previous
+  shell session that had `CARGO_TARGET_DIR=D:\zt` set. **Don't run
+  binaries from `D:\zt\` — they're stale.** Safe to delete the whole
+  `D:\zt\` tree to reclaim ~16 GB. The current shell has no
+  `CARGO_TARGET_DIR` set and no project `.cargo/config.toml`
+  override, so cargo uses the in-tree default.
 - Runtime dependency: poppler's `pdftoppm.exe`. Install via
   `winget install oschwartz10612.Poppler`, or ensure it's on PATH.
 
