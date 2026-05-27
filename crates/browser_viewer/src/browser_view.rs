@@ -15,12 +15,16 @@
 //! `cx.notify()` for a re-render.
 
 use anyhow::{Context as _, anyhow};
-use futures::channel::oneshot;
+use futures::{
+    StreamExt as _,
+    channel::{mpsc, oneshot},
+};
 use gpui::{
-    App, Bounds, Context, Div, Element, ElementId, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Modifiers, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Style, Window, div, relative, size,
+    App, AppContext as _, Bounds, Context, Div, Element, ElementId, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    NavigationDirection, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
+    Style, Window, div, relative, size,
 };
 use ui::prelude::*;
 use workspace::{
@@ -57,7 +61,7 @@ mod windows_imports {
 use windows_imports::*;
 
 #[cfg(target_os = "windows")]
-use crate::webview2_host::{WebView2Session, initialize};
+use crate::webview2_host::{NavigationEvent, WebView2Session, initialize};
 
 /// One notch on a mouse wheel; matches Win32 `WHEEL_DELTA`.
 #[cfg(target_os = "windows")]
@@ -65,8 +69,20 @@ const WHEEL_DELTA: f32 = 120.0;
 
 /// Backing model for one browser tab.
 pub struct BrowserItem {
+    /// Currently displayed URL. Starts as the URL the tab was opened with and
+    /// updates on every navigation (including `pushState`).
     url: SharedString,
+    /// Page `<title>`, falling back to the URL until the first
+    /// `DocumentTitleChanged` arrives.
     title: SharedString,
+    /// True between the first `NavigationStarting` and the corresponding
+    /// `NavigationCompleted`. The address bar (Phase 1.B) will turn the
+    /// reload button into a stop button while this is set.
+    is_loading: bool,
+    /// Browser-history state from the most recent `HistoryChanged`.
+    /// Drives the address bar's back/forward button enabled state.
+    can_go_back: bool,
+    can_go_forward: bool,
     #[cfg(target_os = "windows")]
     session: Option<WebView2Session>,
     /// True between kicking off WebView2 init and the session landing in
@@ -80,6 +96,9 @@ impl BrowserItem {
         Self {
             title: url.clone(),
             url,
+            is_loading: false,
+            can_go_back: false,
+            can_go_forward: false,
             #[cfg(target_os = "windows")]
             session: None,
             init_started: false,
@@ -94,9 +113,29 @@ impl BrowserItem {
     pub fn title(&self) -> &SharedString {
         &self.title
     }
+
+    pub fn is_loading(&self) -> bool {
+        self.is_loading
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.can_go_back
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.can_go_forward
+    }
 }
 
 impl EventEmitter<()> for BrowserItem {}
+
+/// Events emitted by `BrowserView`. Tracking these separately from
+/// `BrowserItem`'s notifications lets us translate them into the
+/// workspace's `ItemEvent` vocabulary.
+pub enum BrowserViewEvent {
+    /// Tab title or icon should be re-fetched.
+    UpdateTab,
+}
 
 /// The Zed tab view.
 pub struct BrowserView {
@@ -107,6 +146,14 @@ pub struct BrowserView {
 impl BrowserView {
     pub fn new(url: SharedString, cx: &mut Context<Self>) -> Self {
         let item = cx.new(|_| BrowserItem::new(url));
+
+        // Re-emit on every BrowserItem change so the workspace re-renders the
+        // tab strip when the page title or URL updates.
+        cx.observe(&item, |_, _, cx| {
+            cx.emit(BrowserViewEvent::UpdateTab);
+        })
+        .detach();
+
         Self {
             item,
             focus_handle: cx.focus_handle(),
@@ -365,7 +412,7 @@ fn forward_mouse_event(
     });
 }
 
-impl EventEmitter<()> for BrowserView {}
+impl EventEmitter<BrowserViewEvent> for BrowserView {}
 
 impl Focusable for BrowserView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -392,9 +439,13 @@ impl Render for BrowserView {
 }
 
 impl Item for BrowserView {
-    type Event = ();
+    type Event = BrowserViewEvent;
 
-    fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(ItemEvent)) {}
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        match event {
+            BrowserViewEvent::UpdateTab => f(ItemEvent::UpdateTab),
+        }
+    }
 
     fn for_each_project_item(
         &self,
@@ -591,17 +642,19 @@ fn start_session(
         bottom: y as i32 + height,
     };
 
-    let (tx, rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (events_tx, events_rx) = mpsc::unbounded::<NavigationEvent>();
     let url = item.url.to_string();
     initialize(
         hwnd,
         visual,
         rect,
         url,
+        events_tx,
         Box::new(move |result| {
             // Sender is dropped here if the channel is gone; that means the
             // tab was closed before init finished, which is fine.
-            let _ = tx.send(result);
+            let _ = ready_tx.send(result);
         }),
     )
     .context("initialize")?;
@@ -609,29 +662,96 @@ fn start_session(
     item.init_started = true;
     item.last_bounds = Some(bounds);
 
+    // Single foreground task that:
+    // 1. Waits for the WebView2Session to be ready.
+    // 2. Stores it on the entity.
+    // 3. Drains navigation events for the rest of the tab's lifetime,
+    //    updating BrowserItem state on each event. When the session is
+    //    dropped (tab closed), its Drop removes the event handlers,
+    //    closing the channel and ending this task.
     cx.spawn(async move |this, cx| {
-        let Ok(result) = rx.await else {
+        let Ok(result) = ready_rx.await else {
             return;
         };
-        let _ = this.update(cx, |item, cx| match result {
-            Ok(session) => {
-                log::info!("browser_viewer: session ready for {}", item.url);
-                item.session = Some(session);
-                cx.notify();
+        let session_stored = match this.update(cx, |item, cx| {
+            match result {
+                Ok(session) => {
+                    log::info!("browser_viewer: session ready for {}", item.url);
+                    item.session = Some(session);
+                    cx.notify();
+                    true
+                }
+                Err(err) => {
+                    log::error!(
+                        "browser_viewer: WebView2 init failed for {}: {err:?}",
+                        item.url
+                    );
+                    item.init_started = false;
+                    cx.notify();
+                    false
+                }
             }
-            Err(err) => {
-                log::error!(
-                    "browser_viewer: WebView2 init failed for {}: {err:?}",
-                    item.url
-                );
-                item.init_started = false;
-                cx.notify();
+        }) {
+            Ok(stored) => stored,
+            Err(_) => return,
+        };
+        if !session_stored {
+            return;
+        }
+
+        // Drain navigation events for the rest of the session's life.
+        let mut events_rx = events_rx;
+        while let Some(event) = events_rx.next().await {
+            if this
+                .update(cx, |item, cx| {
+                    apply_navigation_event(item, event);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
             }
-        });
+        }
     })
     .detach();
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn apply_navigation_event(item: &mut BrowserItem, event: NavigationEvent) {
+    match event {
+        NavigationEvent::TitleChanged(title) => {
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                item.title = SharedString::new(trimmed);
+            }
+        }
+        NavigationEvent::SourceChanged(url) => {
+            item.url = SharedString::new(url);
+            // If we haven't received a title yet, fall back to the URL so
+            // the tab label stays meaningful.
+            if item.title.as_ref() == item.url.as_ref() || item.title.is_empty() {
+                item.title = item.url.clone();
+            }
+        }
+        NavigationEvent::HistoryChanged {
+            can_go_back,
+            can_go_forward,
+        } => {
+            item.can_go_back = can_go_back;
+            item.can_go_forward = can_go_forward;
+        }
+        NavigationEvent::NavigationStarting => {
+            item.is_loading = true;
+        }
+        NavigationEvent::NavigationCompleted { is_success } => {
+            item.is_loading = false;
+            if !is_success {
+                log::debug!("browser_viewer: navigation completed without success");
+            }
+        }
+    }
 }
 
 /// Open a new browser tab in the active pane of the given workspace.

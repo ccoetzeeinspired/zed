@@ -20,31 +20,67 @@
 //! lifetime management.
 
 use anyhow::{Result, anyhow};
+use futures::channel::mpsc;
 use gpui_windows::HostedVisual;
 use webview2_com::{
     CreateCoreWebView2CompositionControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
+    HistoryChangedEventHandler,
     Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_MOUSE_EVENT_KIND, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS,
-        CreateCoreWebView2Environment, ICoreWebView2CompositionController,
+        CreateCoreWebView2Environment, ICoreWebView2, ICoreWebView2CompositionController,
         ICoreWebView2Controller, ICoreWebView2Environment3,
     },
+    NavigationCompletedEventHandler, NavigationStartingEventHandler, SourceChangedEventHandler,
+    take_pwstr,
 };
 use windows::{
     Win32::Foundation::{HWND, POINT, RECT},
-    core::{HSTRING, Interface, PCWSTR},
+    core::{HSTRING, Interface, PCWSTR, PWSTR},
 };
 
 /// What the caller gets when initialization completes successfully. The
 /// composition controller drives input + visual target binding; the regular
 /// controller (same COM object cast to a different interface) exposes
 /// `SetBounds`, `SetIsVisible`, and `CoreWebView2()`.
+/// One observable change on the WebView, delivered to the host via the
+/// `events_tx` passed to [`initialize`].
+#[derive(Debug, Clone)]
+pub(crate) enum NavigationEvent {
+    /// Page `<title>` changed, including via JS `document.title = ...`.
+    TitleChanged(String),
+    /// The displayed URL changed — happens on navigation and on
+    /// `pushState`/`replaceState` from SPAs.
+    SourceChanged(String),
+    /// Either `CanGoBack` or `CanGoForward` changed.
+    HistoryChanged { can_go_back: bool, can_go_forward: bool },
+    /// Top-level navigation kicked off.
+    NavigationStarting,
+    /// Top-level navigation finished, successfully or not.
+    NavigationCompleted { is_success: bool },
+}
+
+/// Tokens returned by `add_*` handlers, kept so we can `remove_*` on drop.
+#[derive(Default)]
+struct EventTokens {
+    title: Option<i64>,
+    source: Option<i64>,
+    history: Option<i64>,
+    navigation_starting: Option<i64>,
+    navigation_completed: Option<i64>,
+}
+
 pub(crate) struct WebView2Session {
     pub composition_controller: ICoreWebView2CompositionController,
     pub controller: ICoreWebView2Controller,
+    /// The WebView interface — exposes navigation methods (GoBack,
+    /// GoForward, Reload, Navigate, ExecuteScript) and event registration.
+    pub webview: ICoreWebView2,
     /// Held so the visual stays attached to the DComp tree for the lifetime
     /// of the session. Dropping the session removes the visual.
     visual: HostedVisual,
+    /// Event-handler tokens; removed on drop before `controller.Close()`.
+    event_tokens: EventTokens,
 }
 
 impl WebView2Session {
@@ -115,11 +151,145 @@ impl WebView2Session {
 impl Drop for WebView2Session {
     fn drop(&mut self) {
         unsafe {
+            // Remove event handlers before closing so the underlying closures
+            // (which hold a clone of the events channel sender) get dropped,
+            // closing the channel and signalling the drain task to exit.
+            if let Some(t) = self.event_tokens.title.take() {
+                let _ = self.webview.remove_DocumentTitleChanged(t);
+            }
+            if let Some(t) = self.event_tokens.source.take() {
+                let _ = self.webview.remove_SourceChanged(t);
+            }
+            if let Some(t) = self.event_tokens.history.take() {
+                let _ = self.webview.remove_HistoryChanged(t);
+            }
+            if let Some(t) = self.event_tokens.navigation_starting.take() {
+                let _ = self.webview.remove_NavigationStarting(t);
+            }
+            if let Some(t) = self.event_tokens.navigation_completed.take() {
+                let _ = self.webview.remove_NavigationCompleted(t);
+            }
             if let Err(err) = self.controller.Close() {
                 log::warn!("WebView2Session: controller.Close() failed: {err}");
             }
         }
     }
+}
+
+/// Register the five navigation-state events on `webview`, each pushing into
+/// `events_tx`. Returns tokens for removal on drop.
+fn register_navigation_events(
+    webview: &ICoreWebView2,
+    events_tx: mpsc::UnboundedSender<NavigationEvent>,
+) -> Result<EventTokens> {
+    let mut tokens = EventTokens::default();
+
+    // --- Title --------------------------------------------------------
+    let tx = events_tx.clone();
+    let handler = DocumentTitleChangedEventHandler::create(Box::new(move |sender, _| {
+        if let Some(webview) = sender {
+            let mut title = PWSTR::null();
+            unsafe {
+                if webview.DocumentTitle(&mut title).is_ok() && !title.is_null() {
+                    let title = take_pwstr(title);
+                    let _ = tx.unbounded_send(NavigationEvent::TitleChanged(title));
+                }
+            }
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe {
+        webview
+            .add_DocumentTitleChanged(&handler, &mut token)
+            .map_err(|e| anyhow!("add_DocumentTitleChanged: {e}"))?;
+    }
+    tokens.title = Some(token);
+
+    // --- Source (URL) -------------------------------------------------
+    let tx = events_tx.clone();
+    let handler = SourceChangedEventHandler::create(Box::new(move |sender, _| {
+        if let Some(webview) = sender {
+            let mut uri = PWSTR::null();
+            unsafe {
+                if webview.Source(&mut uri).is_ok() && !uri.is_null() {
+                    let uri = take_pwstr(uri);
+                    let _ = tx.unbounded_send(NavigationEvent::SourceChanged(uri));
+                }
+            }
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe {
+        webview
+            .add_SourceChanged(&handler, &mut token)
+            .map_err(|e| anyhow!("add_SourceChanged: {e}"))?;
+    }
+    tokens.source = Some(token);
+
+    // --- History (can_go_back / can_go_forward) -----------------------
+    let tx = events_tx.clone();
+    let handler = HistoryChangedEventHandler::create(Box::new(move |sender, _| {
+        if let Some(webview) = sender {
+            let mut back = windows::core::BOOL(0);
+            let mut fwd = windows::core::BOOL(0);
+            unsafe {
+                let _ = webview.CanGoBack(&mut back);
+                let _ = webview.CanGoForward(&mut fwd);
+            }
+            let _ = tx.unbounded_send(NavigationEvent::HistoryChanged {
+                can_go_back: back.as_bool(),
+                can_go_forward: fwd.as_bool(),
+            });
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe {
+        webview
+            .add_HistoryChanged(&handler, &mut token)
+            .map_err(|e| anyhow!("add_HistoryChanged: {e}"))?;
+    }
+    tokens.history = Some(token);
+
+    // --- Navigation starting -----------------------------------------
+    let tx = events_tx.clone();
+    let handler = NavigationStartingEventHandler::create(Box::new(move |_, _| {
+        let _ = tx.unbounded_send(NavigationEvent::NavigationStarting);
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe {
+        webview
+            .add_NavigationStarting(&handler, &mut token)
+            .map_err(|e| anyhow!("add_NavigationStarting: {e}"))?;
+    }
+    tokens.navigation_starting = Some(token);
+
+    // --- Navigation completed ----------------------------------------
+    let tx = events_tx;
+    let handler = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
+        let is_success = args
+            .as_ref()
+            .and_then(|a| {
+                let mut success = windows::core::BOOL(0);
+                unsafe { a.IsSuccess(&mut success).ok() }?;
+                Some(success.as_bool())
+            })
+            .unwrap_or(false);
+        let _ = tx.unbounded_send(NavigationEvent::NavigationCompleted { is_success });
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe {
+        webview
+            .add_NavigationCompleted(&handler, &mut token)
+            .map_err(|e| anyhow!("add_NavigationCompleted: {e}"))?;
+    }
+    tokens.navigation_completed = Some(token);
+
+    Ok(tokens)
 }
 
 /// Initialize WebView2 against `parent` (for input parenting/IME), targeting
@@ -133,6 +303,7 @@ pub(crate) fn initialize(
     visual: HostedVisual,
     bounds: RECT,
     url: String,
+    events_tx: mpsc::UnboundedSender<NavigationEvent>,
     on_done: Box<dyn FnOnce(Result<WebView2Session>) + 'static>,
 ) -> Result<()> {
     // The env handler runs after `CreateCoreWebView2Environment` resolves.
@@ -209,6 +380,12 @@ pub(crate) fn initialize(
                                     .CoreWebView2()
                                     .map_err(|err| anyhow!("CoreWebView2: {err}"))?
                             };
+
+                            // Wire navigation events before the first navigate
+                            // so even the initial load fires title/source events.
+                            let event_tokens =
+                                register_navigation_events(&webview, events_tx)?;
+
                             let url_h = HSTRING::from(&url);
                             unsafe {
                                 webview
@@ -219,7 +396,9 @@ pub(crate) fn initialize(
                             Ok(WebView2Session {
                                 composition_controller: comp_ctrl,
                                 controller,
+                                webview,
                                 visual,
+                                event_tokens,
                             })
                         })();
 
