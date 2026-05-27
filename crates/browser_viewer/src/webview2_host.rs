@@ -41,11 +41,53 @@ use windows::{
 pub(crate) struct WebView2Session {
     // Held alive for COM ref-counting; later phases will use it for input
     // dispatch (SendMouseInput, SendKeyEvent) and design-mode JS injection.
-    pub _composition_controller: ICoreWebView2CompositionController,
+    #[allow(dead_code)]
+    pub composition_controller: ICoreWebView2CompositionController,
     pub controller: ICoreWebView2Controller,
     /// Held so the visual stays attached to the DComp tree for the lifetime
     /// of the session. Dropping the session removes the visual.
-    pub _visual: HostedVisual,
+    visual: HostedVisual,
+}
+
+impl WebView2Session {
+    /// Move the WebView's visual to the given DIP offset from the parent
+    /// window's client-area origin. Caller must subsequently call
+    /// [`commit`](Self::commit) for the change to become visible.
+    pub fn set_position(&self, offset_x: f32, offset_y: f32) -> Result<()> {
+        unsafe {
+            self.visual
+                .visual()
+                .SetOffsetX2(offset_x)
+                .map_err(|err| anyhow!("SetOffsetX2: {err}"))?;
+            self.visual
+                .visual()
+                .SetOffsetY2(offset_y)
+                .map_err(|err| anyhow!("SetOffsetY2: {err}"))?;
+        }
+        Ok(())
+    }
+
+    /// Resize the WebView's rendering viewport. Coordinates are in the
+    /// visual's local space (origin at the visual's offset).
+    pub fn set_size(&self, width: i32, height: i32) -> Result<()> {
+        let rect = windows::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        unsafe {
+            self.controller
+                .SetBounds(rect)
+                .map_err(|err| anyhow!("controller.SetBounds: {err}"))?;
+        }
+        Ok(())
+    }
+
+    /// Commit pending visual transform changes to the DComp tree.
+    pub fn commit(&self) -> Result<()> {
+        self.visual.commit()
+    }
 }
 
 impl Drop for WebView2Session {
@@ -153,9 +195,9 @@ pub(crate) fn initialize(
                             }
 
                             Ok(WebView2Session {
-                                _composition_controller: comp_ctrl,
+                                composition_controller: comp_ctrl,
                                 controller,
-                                _visual: visual,
+                                visual,
                             })
                         })();
 

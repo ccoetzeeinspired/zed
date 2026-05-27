@@ -14,8 +14,11 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+futures.workspace = true
 gpui.workspace = true
 log.workspace = true
+project.workspace = true
+ui.workspace = true
 workspace.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]

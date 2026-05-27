@@ -1,29 +1,47 @@
-//! In-editor embedded browser, Phase 0 spike.
+//! In-editor embedded browser.
 //!
-//! Phase 0 goal: prove that WebView2 can be created and embedded inside Zed's
-//! main window via a child HWND. Subsequent phases replace the child HWND with
-//! a DirectComposition-hosted visual, add real tab/project-item integration,
-//! input bridging, and design mode. See `plans/browser-viewer.md`.
+//! Phase 1.A: a new browser tab can be opened via the `browser: new tab`
+//! action; the tab hosts a WebView2 view inside Zed's window via
+//! DirectComposition. See `plans/browser-viewer.md`.
 //!
-//! The whole crate is gated to Windows; on other platforms `init` is a no-op
-//! stub so the workspace cross-compiles cleanly.
+//! Gated to Windows; on other platforms `init` is a no-op so the workspace
+//! cross-compiles cleanly.
 
-use gpui::App;
+use gpui::{App, actions};
+use ui::SharedString;
+use workspace::Workspace;
+
+pub mod browser_view;
 
 #[cfg(target_os = "windows")]
 mod webview2_host;
 
-#[cfg(target_os = "windows")]
-mod spike;
+pub use browser_view::{BrowserItem, BrowserView, open_new_tab};
+
+actions!(
+    browser,
+    [
+        /// Open a new browser tab navigating to the default URL.
+        NewTab
+    ]
+);
+
+/// Default URL the `NewTab` action opens. Real configurable homepage lands
+/// in Phase 1.B settings; for now this proves end-to-end navigation.
+const DEFAULT_NEW_TAB_URL: &str = "https://example.com";
 
 /// Register the browser-viewer feature with the application.
-///
-/// On Windows this wires up the `browser: open spike URL` action for the
-/// Phase 0 acceptance test; on other platforms this is a no-op.
 pub fn init(cx: &mut App) {
     #[cfg(target_os = "windows")]
     {
-        spike::init(cx);
+        cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+            workspace.register_action(
+                |workspace, _: &NewTab, window, cx| {
+                    open_new_tab(workspace, SharedString::new(DEFAULT_NEW_TAB_URL), window, cx);
+                },
+            );
+        })
+        .detach();
     }
     #[cfg(not(target_os = "windows"))]
     {
