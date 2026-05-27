@@ -64,8 +64,45 @@ personal build, not appropriate to upstream.
 
 - Target directory is the out-of-tree `D:\zt\` (configured via
   `CARGO_TARGET_DIR` or a `.cargo/config.toml` somewhere in the environment).
+  Built binary lands at `D:\zt\debug\zed.exe` (debug) or
+  `D:\zt\release\zed.exe` (release).
 - Runtime dependency: poppler's `pdftoppm.exe`. Install via
   `winget install oschwartz10612.Poppler`, or ensure it's on PATH.
+
+### Build with `-j 4` on this machine
+
+Always build with `cargo build -j 4` (not bare `cargo build`).
+
+- **Why:** the machine has 8C/16T and 32 GB RAM. Cargo defaults to one
+  `rustc` per logical core (16), and several Zed crates
+  (`language_model`, `editor`, `theme`, `wasmtime-wasi`) peak at 4–8 GB
+  per `rustc` instance. 16 parallel rustcs at that footprint blow past
+  available RAM and trigger `rustc-LLVM ERROR: out of memory`, which
+  manifests as cascading "invalid metadata" / "only metadata stub
+  found" errors in unrelated crates. Closing memory hogs (Chrome,
+  Slack) helps, but `-j 4` is the reliable fix: ~24 GB peak, fits in
+  available RAM with headroom.
+- **How to apply:** every cargo invocation in the sync workflow and
+  during day-to-day development. From-scratch debug builds at `-j 4`
+  finish in ~5 minutes on this hardware.
+
+### After a toolchain bump, `cargo clean` first
+
+If `rust-toolchain.toml` changes between syncs (upstream bumps the
+pinned Rust version), the next build will fail with errors like:
+
+```
+error[E0786]: found invalid metadata files for crate `gpui`
+error: only metadata stub found for `dylib` dependency `std` ...
+```
+
+- **Why:** stale `.rmeta` files in `D:\zt\` were written by the old
+  compiler and can't be read by the new one. These same errors can
+  *also* be caused by mid-build OOM (see `-j 4` note above); the
+  differentiator is whether the build output earlier shows `rustup`
+  installing components.
+- **How to apply:** run `cargo clean` once after a toolchain bump,
+  then build normally. Costs the ~5 min from-scratch build time.
 
 ## Sync workflow — pulling upstream changes into this fork
 
@@ -83,7 +120,7 @@ git checkout pdf-viewer
 git rebase main
 #    ...resolve conflicts if any (likely Cargo.toml / Cargo.lock /
 #    crates/zed/src/main.rs / crates/zed/src/zed.rs — see below)...
-cargo build                           # verify it still compiles
+cargo build -j 4                      # verify it still compiles (see Build notes for why -j 4)
 git push --force-with-lease origin pdf-viewer
 ```
 
