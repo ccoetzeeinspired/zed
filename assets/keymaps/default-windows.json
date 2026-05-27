@@ -1503,6 +1503,15 @@
     },
   },
   {
+    "context": "PdfView",
+    "bindings": {
+      "ctrl-=": "pdf_viewer::ZoomIn",
+      "ctrl-+": "pdf_viewer::ZoomIn",
+      "ctrl--": "pdf_viewer::ZoomOut",
+      "ctrl-0": "pdf_viewer::ResetZoom",
+    },
+  },
+  {
     "context": "RunModal",
     "bindings": {
       "alt-1": "new_process_modal::ActivateTaskTab",

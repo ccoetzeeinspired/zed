@@ -1,0 +1,21 @@
+# Local no-op replacement for the crates.io `msvc_spectre_libs` crate, applied
+# via [patch.crates-io] in the workspace root. The upstream crate's build.rs
+# panics (when the `error` feature is enabled, as microsoft/pet does) unless the
+# VS "Spectre-mitigated libs" component is installed. We don't need that
+# mitigation for a personal build, so this stub does nothing and lets the linker
+# use the normal CRT. The upstream lib.rs is already empty, so there is no API to
+# preserve; we only keep the `error` feature so dependents that enable it resolve.
+[package]
+name = "msvc_spectre_libs"
+version = "0.1.3"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "No-op stub of msvc_spectre_libs (see comment)."
+build = "build.rs"
+
+[features]
+error = []
+
+[lib]
+name = "msvc_spectre_libs"
+path = "src/lib.rs"
