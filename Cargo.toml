@@ -21,6 +21,7 @@ members = [
     "crates/aws_http_client",
     "crates/bedrock",
     "crates/breadcrumbs",
+    "crates/browser_viewer",
     "crates/buffer_diff",
     "crates/call",
     "crates/channel",
@@ -287,6 +288,7 @@ auto_update_ui = { path = "crates/auto_update_ui" }
 aws_http_client = { path = "crates/aws_http_client" }
 bedrock = { path = "crates/bedrock" }
 breadcrumbs = { path = "crates/breadcrumbs" }
+browser_viewer = { path = "crates/browser_viewer" }
 buffer_diff = { path = "crates/buffer_diff" }
 call = { path = "crates/call" }
 channel = { path = "crates/channel" }

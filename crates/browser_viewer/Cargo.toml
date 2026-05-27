@@ -1,0 +1,25 @@
+[package]
+name = "browser_viewer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/browser_viewer.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+log.workspace = true
+workspace.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_windows = { workspace = true }
+raw-window-handle = "0.6"
+webview2-com = "0.38"
+windows = { workspace = true }

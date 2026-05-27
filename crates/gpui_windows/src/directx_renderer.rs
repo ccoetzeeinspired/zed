@@ -42,7 +42,7 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
-    direct_composition: Option<DirectComposition>,
+    direct_composition: Option<std::sync::Arc<DirectComposition>>,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -97,10 +97,10 @@ struct DirectXGlobalElements {
     sampler: Option<ID3D11SamplerState>,
 }
 
-struct DirectComposition {
-    comp_device: IDCompositionDevice,
-    comp_target: IDCompositionTarget,
-    comp_visual: IDCompositionVisual,
+pub(crate) struct DirectComposition {
+    pub(crate) comp_device: IDCompositionDevice,
+    pub(crate) comp_target: IDCompositionTarget,
+    pub(crate) comp_visual: IDCompositionVisual,
 }
 
 impl DirectXRendererDevices {
@@ -159,6 +159,10 @@ impl DirectXRenderer {
             composition
                 .set_swap_chain(&resources.swap_chain)
                 .context("Setting swap chain for DirectComposition")?;
+            let composition = std::sync::Arc::new(composition);
+            // FORK: register so external code (browser_viewer) can attach
+            // child visuals to this window's composition tree by HWND lookup.
+            crate::dcomp_registry::register(hwnd, &composition);
             Some(composition)
         };
 
@@ -281,6 +285,10 @@ impl DirectXRenderer {
             let composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
             composition.set_swap_chain(&resources.swap_chain)?;
+            let composition = std::sync::Arc::new(composition);
+            // FORK: re-register after device-lost recovery; the old Weak
+            // is now dangling and the new Arc takes its slot.
+            crate::dcomp_registry::register(self.hwnd, &composition);
             Some(composition)
         };
 
