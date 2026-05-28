@@ -23,9 +23,9 @@ use futures::{
 use gpui::{
     App, AppContext as _, Bounds, Context, Div, Element, ElementId, Entity, EntityId,
     EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    NavigationDirection, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    Style, WeakEntity, Window, div, relative, size,
+    KeyDownEvent, KeyUpEvent, Keystroke, LayoutId, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, SharedString, Style, WeakEntity, Window, div, relative, size,
 };
 use ui::Tooltip;
 use ui::prelude::*;
@@ -256,6 +256,21 @@ impl BrowserView {
         });
     }
 
+    fn on_focus_address_bar(
+        &mut self,
+        _: &crate::FocusAddressBar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_focus = self.url_editor.focus_handle(cx);
+        window.focus(&editor_focus, cx);
+        // Select all so typing replaces the current URL — matches real
+        // browser Ctrl+L behavior.
+        self.url_editor.update(cx, |editor, cx| {
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+        });
+    }
+
     fn on_open_devtools(
         &mut self,
         _: &crate::OpenDevTools,
@@ -276,12 +291,78 @@ impl BrowserView {
         let _ = cx;
     }
 
-    fn on_submit_url(
+    /// Phase 3: forward GPUI key events that GPUI didn't bind to actions
+    /// into WebView2 via CDP `Input.dispatchKeyEvent`. On focus only
+    /// happens when the user has actually clicked the page (mouse_down
+    /// focuses BrowserView), so editor / address-bar typing is
+    /// unaffected — that focus path routes through the editor's own
+    /// key handlers first.
+    #[cfg(target_os = "windows")]
+    fn on_key_down(
         &mut self,
-        _: &menu::Confirm,
+        event: &KeyDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dispatch_key("keyDown", &event.keystroke, cx);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // On key-up suppress `text` so the renderer doesn't double-fire
+        // `input` — only the keyDown carries the text payload.
+        let mut ks = event.keystroke.clone();
+        ks.key_char = None;
+        self.dispatch_key("keyUp", &ks, cx);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn dispatch_key(&self, event_type: &str, ks: &Keystroke, cx: &mut Context<Self>) {
+        let Some((key, code, vk, text)) = keystroke_to_cdp(ks) else {
+            return;
+        };
+        let modifiers = cdp_modifiers_mask(&ks.modifiers);
+        let text_for_up = if event_type == "keyUp" { None } else { text };
+        self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                if let Err(err) = session.dispatch_key_event(
+                    event_type,
+                    &key,
+                    &code,
+                    modifiers,
+                    vk,
+                    text_for_up.as_deref(),
+                ) {
+                    log::debug!("dispatch_key_event({event_type}, {key}) failed: {err:?}");
+                }
+            }
+        });
+    }
+
+    fn on_submit_url(
+        &mut self,
+        _: &menu::Confirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // When the URL editor isn't focused, Enter came from the page
+        // viewport (we focus BrowserView on click). GPUI counts the
+        // action as consumed once dispatched here, so `on_key_down`
+        // won't fire — forward Enter to the page via CDP ourselves so
+        // form submits / search submits / chat-send work.
+        if !self.url_editor.focus_handle(cx).is_focused(window) {
+            #[cfg(target_os = "windows")]
+            {
+                let ks = Keystroke {
+                    modifiers: Modifiers::default(),
+                    key: "enter".to_string(),
+                    key_char: None,
+                };
+                self.dispatch_key("keyDown", &ks, cx);
+                self.dispatch_key("keyUp", &ks, cx);
+            }
+            return;
+        }
         use settings::Settings as _;
         let input = self.url_editor.read(cx).text(cx);
         let search_url = crate::BrowserSettings::get_global(cx).search_url.clone();
@@ -297,16 +378,15 @@ impl BrowserView {
         root.on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                // Deliberately do NOT call `window.focus(&this.focus_handle, cx)`
-                // here. Doing so retargets the keymap context chain to
-                // `BrowserView`, but the `key_context("BrowserView")` we set
-                // doesn't inherit the Workspace bindings the way we expected —
-                // and Ctrl+Shift+P / Ctrl+P stop dispatching as a result.
-                // Until proper Phase 3 keyboard wiring (host-HWND subclass +
-                // SendKeyboardInput on a newer SDK) lets the page have real
-                // input focus, keeping Zed's existing focus untouched is the
-                // right call: page keyboard doesn't work either way, and the
-                // command palette / file finder stay reachable.
+                // Phase 3: focus the BrowserView so page key events route to
+                // our `on_key_down` handler (which forwards to WebView2 via
+                // CDP `Input.dispatchKeyEvent`). Ctrl+Shift+P / Ctrl+P still
+                // work because (a) Workspace-context bindings match anywhere
+                // in the context chain including under BrowserView, and (b)
+                // the post-forward `SetFocus(zed_hwnd)` in `forward_mouse_event`
+                // keeps Win32 focus on Zed so `translate_accelerator` still
+                // delivers WM_KEYDOWN to gpui_windows.
+                window.focus(&this.focus_handle, cx);
                 let kind = if ev.click_count >= 2 {
                     COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK
                 } else {
@@ -645,12 +725,19 @@ impl Render for BrowserView {
             viewport = self.attach_mouse_handlers(viewport, cx);
         }
 
-        v_flex()
+        let root = v_flex()
             .track_focus(&self.focus_handle)
             .key_context("BrowserView")
             .on_action(cx.listener(Self::on_submit_url))
             .on_action(cx.listener(Self::on_open_devtools))
-            .size_full()
+            .on_action(cx.listener(Self::on_focus_address_bar));
+
+        #[cfg(target_os = "windows")]
+        let root = root
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(Self::on_key_up));
+
+        root.size_full()
             .child(self.render_address_bar(can_back, can_fwd, is_loading, cx))
             .child(viewport)
     }
@@ -1186,4 +1273,134 @@ fn url_encode_query(input: &str) -> String {
         }
     }
     out
+}
+
+/// CDP modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8. Matches the
+/// values `Input.dispatchKeyEvent.modifiers` expects.
+#[cfg(target_os = "windows")]
+fn cdp_modifiers_mask(m: &Modifiers) -> i32 {
+    let mut bits = 0;
+    if m.alt {
+        bits |= 1;
+    }
+    if m.control {
+        bits |= 2;
+    }
+    if m.platform {
+        bits |= 4;
+    }
+    if m.shift {
+        bits |= 8;
+    }
+    bits
+}
+
+/// Translate a GPUI `Keystroke` into the four fields CDP
+/// `Input.dispatchKeyEvent` needs: (`KeyboardEvent.key`,
+/// `KeyboardEvent.code`, `windowsVirtualKeyCode`, `text`).
+///
+/// `text` is `Some` only for printable single-character keystrokes
+/// without Ctrl/Alt modifiers — that's what tells the renderer to
+/// fire an `input` event on form controls. Special keys (Tab,
+/// Enter, arrows, F1-F12, ...) intentionally pass `None`.
+///
+/// The `KeyboardEvent.code` value is the physical key code from the
+/// US-QWERTY layout — for non-US layouts this may not match the
+/// user's actual keycap, but pages that care use `key` (the logical
+/// value) anyway. Acceptable for Phase 3.
+#[cfg(target_os = "windows")]
+fn keystroke_to_cdp(ks: &Keystroke) -> Option<(String, String, i32, Option<String>)> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+
+    let m = &ks.modifiers;
+    let key_str = ks.key.as_str();
+
+    // Special-key table: GPUI's `key` string → (KeyboardEvent.key,
+    // KeyboardEvent.code, VK_*). Drives non-printable keys; printable
+    // keys fall through to the text path below.
+    let special: Option<(&str, &str, i32)> = match key_str {
+        "enter" => Some(("Enter", "Enter", VK_RETURN.0 as i32)),
+        "tab" => Some(("Tab", "Tab", VK_TAB.0 as i32)),
+        "escape" => Some(("Escape", "Escape", VK_ESCAPE.0 as i32)),
+        "backspace" => Some(("Backspace", "Backspace", VK_BACK.0 as i32)),
+        "delete" => Some(("Delete", "Delete", VK_DELETE.0 as i32)),
+        "insert" => Some(("Insert", "Insert", VK_INSERT.0 as i32)),
+        "space" => Some((" ", "Space", VK_SPACE.0 as i32)),
+        "up" => Some(("ArrowUp", "ArrowUp", VK_UP.0 as i32)),
+        "down" => Some(("ArrowDown", "ArrowDown", VK_DOWN.0 as i32)),
+        "left" => Some(("ArrowLeft", "ArrowLeft", VK_LEFT.0 as i32)),
+        "right" => Some(("ArrowRight", "ArrowRight", VK_RIGHT.0 as i32)),
+        "home" => Some(("Home", "Home", VK_HOME.0 as i32)),
+        "end" => Some(("End", "End", VK_END.0 as i32)),
+        "pageup" => Some(("PageUp", "PageUp", VK_PRIOR.0 as i32)),
+        "pagedown" => Some(("PageDown", "PageDown", VK_NEXT.0 as i32)),
+        "f1" => Some(("F1", "F1", VK_F1.0 as i32)),
+        "f2" => Some(("F2", "F2", VK_F2.0 as i32)),
+        "f3" => Some(("F3", "F3", VK_F3.0 as i32)),
+        "f4" => Some(("F4", "F4", VK_F4.0 as i32)),
+        "f5" => Some(("F5", "F5", VK_F5.0 as i32)),
+        "f6" => Some(("F6", "F6", VK_F6.0 as i32)),
+        "f7" => Some(("F7", "F7", VK_F7.0 as i32)),
+        "f8" => Some(("F8", "F8", VK_F8.0 as i32)),
+        "f9" => Some(("F9", "F9", VK_F9.0 as i32)),
+        "f10" => Some(("F10", "F10", VK_F10.0 as i32)),
+        "f11" => Some(("F11", "F11", VK_F11.0 as i32)),
+        "f12" => Some(("F12", "F12", VK_F12.0 as i32)),
+        _ => None,
+    };
+    if let Some((key, code, vk)) = special {
+        return Some((key.to_string(), code.to_string(), vk, None));
+    }
+
+    // Printable single-character paths: letters, digits, punctuation.
+    let lower = key_str.to_ascii_lowercase();
+    let mut chars = lower.chars();
+    let first = chars.next()?;
+    if chars.next().is_some() {
+        // Multi-char key string we don't recognize — skip.
+        return None;
+    }
+
+    let (code, vk): (String, i32) = match first {
+        'a'..='z' => {
+            let upper = first.to_ascii_uppercase();
+            (format!("Key{upper}"), upper as i32)
+        }
+        '0'..='9' => (format!("Digit{first}"), first as i32),
+        '`' => ("Backquote".to_string(), VK_OEM_3.0 as i32),
+        '-' => ("Minus".to_string(), VK_OEM_MINUS.0 as i32),
+        '=' => ("Equal".to_string(), VK_OEM_PLUS.0 as i32),
+        '[' => ("BracketLeft".to_string(), VK_OEM_4.0 as i32),
+        ']' => ("BracketRight".to_string(), VK_OEM_6.0 as i32),
+        '\\' => ("Backslash".to_string(), VK_OEM_5.0 as i32),
+        ';' => ("Semicolon".to_string(), VK_OEM_1.0 as i32),
+        '\'' => ("Quote".to_string(), VK_OEM_7.0 as i32),
+        ',' => ("Comma".to_string(), VK_OEM_COMMA.0 as i32),
+        '.' => ("Period".to_string(), VK_OEM_PERIOD.0 as i32),
+        '/' => ("Slash".to_string(), VK_OEM_2.0 as i32),
+        _ => return None,
+    };
+
+    // KeyboardEvent.key is the logical typed value: lowercase when
+    // unshifted, uppercase/shifted symbol when shift is held. We use
+    // GPUI's `key_char` when available (already reflects shift + dead
+    // keys), falling back to the raw `key` letter.
+    let key_for_event = ks
+        .key_char
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| lower.clone());
+
+    // `text` is what makes the renderer fire `input` events on inputs.
+    // Only set it for keystrokes that produce a typeable character —
+    // Ctrl-combos and Alt-combos suppress the text so a binding like
+    // Ctrl+S doesn't also dump "s" into a focused text field.
+    let typeable = !(m.control || m.alt) && !key_for_event.is_empty();
+    let text = if typeable {
+        Some(key_for_event.clone())
+    } else {
+        None
+    };
+
+    Some((key_for_event, code, vk, text))
 }

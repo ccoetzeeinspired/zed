@@ -614,6 +614,7 @@
     "bindings": {
       "ctrl-shift-i": "browser::OpenDevTools",
       "f12": "browser::OpenDevTools",
+      "ctrl-l": "browser::FocusAddressBar",
     },
   },
   {

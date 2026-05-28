@@ -23,6 +23,7 @@ use anyhow::{Result, anyhow};
 use futures::channel::mpsc;
 use gpui_windows::HostedVisual;
 use webview2_com::{
+    CallDevToolsProtocolMethodCompletedHandler,
     CreateCoreWebView2CompositionControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
     HistoryChangedEventHandler,
@@ -131,6 +132,56 @@ impl WebView2Session {
     /// local space (origin at the visual's top-left). `mouse_data` carries
     /// the wheel delta for wheel events (signed WHEEL_DELTA units), 0
     /// otherwise.
+    /// Send a `Input.dispatchKeyEvent` over the WebView2 CDP channel.
+    /// Phase 3 uses CDP for keyboard because
+    /// `ICoreWebView2CompositionController` has no public
+    /// `SendKeyboardInput` equivalent (verified across every released
+    /// SDK including 1.0.4015-prerelease). CDP dispatches at the
+    /// renderer level so it bypasses Win32 focus entirely — pages
+    /// receive the key event regardless of which HWND currently has
+    /// Win32 focus, which is exactly what we need given gpui_windows'
+    /// `translate_accelerator` keeps Zed's HWND as the focus owner.
+    ///
+    /// `event_type` is one of `"keyDown"`, `"keyUp"`, `"char"`,
+    /// `"rawKeyDown"`. `text` is set on keyDown for printable keys so
+    /// the renderer fires `input` events on form controls — non-text
+    /// keys pass `None`.
+    ///
+    /// The completion handler is a no-op; we fire-and-forget. Any CDP
+    /// error returns asynchronously and only matters for diagnosis.
+    pub fn dispatch_key_event(
+        &self,
+        event_type: &str,
+        key: &str,
+        code: &str,
+        modifiers: i32,
+        windows_virtual_key_code: i32,
+        text: Option<&str>,
+    ) -> Result<()> {
+        let params = build_dispatch_key_event_json(
+            event_type,
+            key,
+            code,
+            modifiers,
+            windows_virtual_key_code,
+            text,
+        );
+        let method = HSTRING::from("Input.dispatchKeyEvent");
+        let params_h = HSTRING::from(params);
+        let handler =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_hr, _result| Ok(())));
+        unsafe {
+            self.webview
+                .CallDevToolsProtocolMethod(
+                    PCWSTR(method.as_ptr()),
+                    PCWSTR(params_h.as_ptr()),
+                    &handler,
+                )
+                .map_err(|err| anyhow!("CallDevToolsProtocolMethod: {err}"))?;
+        }
+        Ok(())
+    }
+
     /// Show or hide the WebView. Hidden WebViews still hold their
     /// composition visual in the DComp tree, but the controller stops
     /// painting into it, so the inactive tab's contents don't bleed
@@ -303,6 +354,56 @@ fn register_navigation_events(
     tokens.navigation_completed = Some(token);
 
     Ok(tokens)
+}
+
+/// Build the CDP `Input.dispatchKeyEvent` JSON payload by hand to avoid
+/// pulling `serde_json` for one call site. Strings are minimally escaped
+/// (`"` and `\`) — the inputs are short, ASCII, controlled by us; we
+/// don't need full JSON-escape coverage.
+fn build_dispatch_key_event_json(
+    event_type: &str,
+    key: &str,
+    code: &str,
+    modifiers: i32,
+    windows_virtual_key_code: i32,
+    text: Option<&str>,
+) -> String {
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    let mut json = String::with_capacity(160);
+    json.push_str("{\"type\":\"");
+    json.push_str(event_type);
+    json.push_str("\",\"key\":\"");
+    json.push_str(&esc(key));
+    json.push_str("\",\"code\":\"");
+    json.push_str(&esc(code));
+    json.push_str("\",\"modifiers\":");
+    json.push_str(&modifiers.to_string());
+    json.push_str(",\"windowsVirtualKeyCode\":");
+    json.push_str(&windows_virtual_key_code.to_string());
+    if let Some(t) = text {
+        json.push_str(",\"text\":\"");
+        json.push_str(&esc(t));
+        json.push_str("\",\"unmodifiedText\":\"");
+        json.push_str(&esc(t));
+        json.push('"');
+    }
+    json.push('}');
+    json
 }
 
 /// Initialize WebView2 against `parent` (for input parenting/IME), targeting

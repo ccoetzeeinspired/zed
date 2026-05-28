@@ -27,7 +27,9 @@ actions!(
         /// Open a new browser tab navigating to the configured homepage.
         NewTab,
         /// Open WebView2 DevTools on the active browser tab.
-        OpenDevTools
+        OpenDevTools,
+        /// Focus the address bar (Ctrl+L convention from real browsers).
+        FocusAddressBar
     ]
 );
 

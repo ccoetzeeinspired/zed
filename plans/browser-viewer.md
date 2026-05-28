@@ -344,56 +344,79 @@ here so future sessions don't repeat the experiment.
 | ScrollWheel            | `SendMouseInput(Wheel/HorizontalWheel, delta)` |
 | Navigate (X1/X2)       | `SendMouseInput(X_BUTTON_DOWN/UP, ...)` + `cx.stop_propagation()` so the Pane's history handler doesn't double-fire |
 
-#### Keyboard — Phase 3, not 1.D
+#### Keyboard — CDP `Input.dispatchKeyEvent` (shipped in Phase 3)
 
-**`ICoreWebView2CompositionController` has no `SendKeyEvent`.** We
-verified this across versions 1, 2, and 3 of the interface in
-`webview2-com-sys 0.38`. Composition mode treats keyboard
-fundamentally differently from mouse: the SDK does not expose a
-direct injection method.
+**Background.** `ICoreWebView2CompositionController` has no
+`SendKeyEvent`. We verified this across every released SDK including
+the latest prerelease at the time of writing (1.0.4015-prerelease) —
+the keyboard equivalent of `SendMouseInput` has never shipped, is not
+on the public roadmap, and the MicrosoftEdge/WebView2Feedback issue
+tracking it has no ETA. Bumping `webview2-com` will not unblock this.
 
-Phase 1.D briefly attempted to call `controller.MoveFocus(PROGRAMMATIC)`
-on viewport click, hoping WebView2's internal subclass of the
-parent HWND would then route keyboard messages to the page. The
-result: page keyboard still didn't work, **and** it broke address
-bar typing (intermittently). The MoveFocus call was reverted; this
-section captures why and what the real fix looks like.
+We also briefly tried (Phase 1.D) calling
+`controller.MoveFocus(PROGRAMMATIC)` on viewport click hoping
+WebView2's internal HWND subclass would then route keyboard messages
+to the page. Result: page keyboard still didn't work, and address-bar
+typing broke intermittently. Reverted.
 
-Four real options for the actual keyboard implementation:
+**Decision: CDP `Input.dispatchKeyEvent` via
+`ICoreWebView2.CallDevToolsProtocolMethod`.** Available since
+WebView2 SDK 1.0.* (well before our 0.38 binding), survives all future
+SDK upgrades, dispatches at the renderer level so Win32 focus stays on
+Zed's HWND, and is the path Microsoft themselves point developers to
+in WebView2Feedback threads about composition-mode keyboard.
 
-1. **Host-side HWND subclass + JS injection.** Subclass Zed's
-   parent HWND. Intercept `WM_KEYDOWN`/`WM_KEYUP`/`WM_CHAR` when
-   the BrowserView has focus. Run `ToUnicodeEx` to produce
-   character data, then `ExecuteScript` to dispatch a `KeyboardEvent`
-   on the focused element in the page. Loses native input handling
-   (autofill, password manager) but works.
-2. **`SendInput` Win32 simulation.** Synthesize OS-level keystrokes
-   when the page should receive input. Affects system focus, so
-   plays badly with multiple Zed windows. Most brittle.
-3. **Newer WebView2 SDK + `ICoreWebView2KeyboardInputController`.**
-   Microsoft has been working on a proper keyboard injection API.
-   When `webview2-com` is bumped to a version that exposes it (the
-   underlying SDK is 1.0.2592+), this becomes a clean drop-in
-   parallel to `SendMouseInput`. Until then, we'd need to bind it
-   ourselves via raw COM.
-4. **CDP `Input.dispatchKeyEvent`.** Open a Chrome DevTools
-   Protocol channel to the same WebView and inject keyboard via
-   CDP. Works for content but bypasses some native widgets in the
-   page.
+Other options we considered and ruled out:
 
-**IME (composition mode for CJK and other complex scripts)** is a
-separate axis, gated on whichever of 1–4 we choose. None of them
-get IME right without explicit `WM_IME_*` handling.
+1. **Host-side HWND subclass + JS injection** — synthesize
+   `KeyboardEvent` dispatches via `ExecuteScript`. More moving parts
+   (Win32 subclass + per-frame focus inspection + JS), bypasses Chrome
+   form handling.
+2. **`SendInput` Win32 simulation** — affects system focus, plays
+   badly with multi-window Zed, most brittle of all.
+3. **Newer SDK with `ICoreWebView2KeyboardInputController`** — does
+   not exist; eliminated by SDK research.
+4. **Synthetic `WM_KEYDOWN`/`WM_CHAR` to WebView2 child HWND** — used
+   by Tauri/wry as a fallback. Works but fragile across Edge updates
+   (child window class names can change).
 
-**Decision punted to Phase 3.** Of the four, option 3 (newer SDK)
-is the right long-term answer; until that's available, option 1
-(subclass + JS) is the most viable interim approach. Phase 3 will
-re-evaluate which SDK version `webview2-com` ships with at that
-point and pick accordingly.
+**What CDP covers.** Letters, digits, modifier combos, Shift-symbols,
+arrows, Home/End/PgUp/PgDn, Tab, Enter, Backspace, Esc, Delete, Insert,
+F1–F24. Form `input` events fire (so React onChange, contentEditable,
+etc. work). Hold-to-repeat works because Windows fires repeated
+WM_KEYDOWN and we forward each.
 
-For Phase 1, the address bar gives the user a way to enter URLs,
-back/forward/reload work, and link clicks navigate. That covers
-the dogfood-localhost-dev-server use case without keyboard-in-page.
+**What CDP misses.** IME composition (CJK, Arabic), Win32 dead-key
+sequences, autofill heuristics that watch for OS-level keystrokes, OS
+accessibility input (UI Automation, speech-to-text). For US-English
+ASCII workflows — the documented Phase 3 target — none of these block
+dogfooding. IME stays on the roadmap as a separate axis.
+
+**Implementation summary** (see `crates/browser_viewer/src/browser_view.rs`):
+
+- `BrowserView::on_key_down` / `on_key_up` listeners on the focus-rooted
+  `v_flex` forward into `WebView2Session::dispatch_key_event`.
+- `keystroke_to_cdp(&Keystroke)` maps GPUI's `key` strings to
+  `(KeyboardEvent.key, KeyboardEvent.code, windowsVirtualKeyCode, text)`.
+  `text` is set only on `keyDown` for printable keys without
+  Ctrl/Alt, so form `input` events fire and Ctrl-combos don't leak
+  characters.
+- `WebView2Session::dispatch_key_event` builds a CDP JSON payload
+  inline (no `serde_json` dependency) and fire-and-forgets via
+  `CallDevToolsProtocolMethod` with a no-op completion handler.
+
+**Page-focused Enter is special.** GPUI's keymap dispatch counts an
+`on_action` listener as "consumed" once it's invoked. `menu::Confirm`
+is bound to the URL editor's Enter; the same listener fires from the
+page viewport when BrowserView is focused. To avoid Enter being
+swallowed into a no-op (which would prevent form submission),
+`on_submit_url` checks `url_editor.focus_handle.is_focused(window)` —
+if false, it manually forwards `keyDown`/`keyUp` for Enter via CDP and
+returns.
+
+**Phase 3 also added Ctrl+L** (`browser::FocusAddressBar`) — focuses
+the URL editor and selects all, matching real-browser convention. F12
+and Ctrl+Shift+I open WebView2 DevTools (Phase 2's DevTools opener).
 
 ### 6.4 Design mode JS protocol
 
