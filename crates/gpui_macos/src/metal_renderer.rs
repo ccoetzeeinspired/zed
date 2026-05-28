@@ -843,6 +843,8 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                // FORK: alpha-clear cutouts are Windows-only — no-op on Metal.
+                PrimitiveBatch::Cutouts(_) => true,
             };
             if !ok {
                 command_encoder.end_encoding();

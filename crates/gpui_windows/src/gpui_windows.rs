@@ -36,7 +36,9 @@ pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
-pub use dcomp_registry::{HostedVisual, create_child_visual_for_hwnd};
+pub use dcomp_registry::{
+    HostedVisual, create_child_visual_for_hwnd, create_underlay_visual_for_hwnd,
+};
 pub use platform::WindowsPlatform;
 
 pub(crate) use windows::Win32::Foundation::HWND;

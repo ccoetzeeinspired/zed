@@ -790,34 +790,32 @@ impl Focusable for BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Render runs only when this tab is the active item in its pane,
-        // so reaching here is the "activation" signal — sync visibility
-        // against the current modal state (which can have changed while
-        // this tab was inactive, or which was the original reason for
-        // hiding). `deactivated` handles the symmetric "going inactive"
-        // path.
+        // Tab-switch show: `Item::deactivated` calls SetIsVisible(false)
+        // when this tab leaves focus, because multiple browser tabs in
+        // the same pane share the underlay sibling slot — if an
+        // inactive tab kept painting, its pixels could leak through a
+        // sibling's cutout. On reactivation, Render runs again here,
+        // so flip SetIsVisible(true) so the WebView paints into its
+        // underlay visual again. Without this, the cutout would reveal
+        // the empty underlay → the comp_target's blank backing → the
+        // Windows desktop showing through Zed.
+        //
+        // We don't gate this on `modal_open` anymore — Phase 4's
+        // cutout-based architecture means modals naturally render
+        // above the WebView via z-order; no need to hide the page.
         #[cfg(target_os = "windows")]
         {
-            let workspace = self.workspace.as_ref().and_then(|w| w.upgrade());
-            let modal_open = workspace
-                .map(|w| w.update(cx, |ws, cx| ws.has_active_modal(window, cx)))
-                .unwrap_or(false);
-            let desired_visible = !modal_open;
-            let needs_change = self.item.read(cx).is_visible != desired_visible
-                || self.modal_open != modal_open;
-            if needs_change {
-                self.modal_open = modal_open;
-                self.item.update(cx, |item, _| {
-                    if let Some(session) = &item.session {
-                        if let Err(err) = session.set_visible(desired_visible) {
-                            log::warn!(
-                                "BrowserItem: render set_visible({desired_visible}) failed: {err:?}"
-                            );
-                        }
+            self.item.update(cx, |item, _| {
+                if item.is_visible {
+                    return;
+                }
+                if let Some(session) = &item.session {
+                    if let Err(err) = session.set_visible(true) {
+                        log::warn!("BrowserItem: re-show on activate failed: {err:?}");
                     }
-                    item.is_visible = desired_visible;
-                });
-            }
+                }
+                item.is_visible = true;
+            });
         }
 
         // Sync the address bar editor text from the model when (a) the model
@@ -841,11 +839,17 @@ impl Render for BrowserView {
         let drawing_on = self.item.read(cx).drawing_mode_enabled;
         let has_strokes_any = !self.item.read(cx).drawing.is_empty();
 
+        // Phase 4 architectural fix: viewport intentionally has NO
+        // background fill. The WebView2 underlay sits in the DComp
+        // tree under GPUI's swap chain; GPUI's alpha-premultiplied
+        // swap chain clears to transparent (when the window's
+        // background appearance is non-Opaque), so wherever GPUI
+        // doesn't paint a pixel the page shows through. Painting a
+        // bg here would block the page.
         let mut viewport = div()
             .relative()
             .flex_1()
             .min_h_0()
-            .bg(cx.theme().colors().editor_background)
             .child(BrowserViewportElement::new(item.clone()));
 
         #[cfg(target_os = "windows")]
@@ -1310,25 +1314,26 @@ impl Item for BrowserView {
     }
 
     /// Called by `workspace::pane` when this item stops being the active
-    /// item in its pane. Hide the WebView so its composition visual stops
-    /// painting — otherwise the inactive tab's contents show through
-    /// behind the newly active tab in the same pane.
-    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(target_os = "windows")]
-        self.item.update(cx, |item, _| {
-            if !item.is_visible {
-                return;
-            }
-            if let Some(session) = &item.session {
-                if let Err(err) = session.set_visible(false) {
-                    log::warn!("BrowserItem: set_visible(false) failed: {err:?}");
-                }
-            }
-            item.is_visible = false;
-        });
-        #[cfg(not(target_os = "windows"))]
-        let _ = cx;
-    }
+    /// item in its pane. Phase 4 architectural fix made the original
+    /// SetIsVisible(false) call unnecessary AND harmful:
+    ///
+    /// - Unnecessary: WebView2 is now an underlay below GPUI's swap
+    ///   chain. When the tab is inactive, our `BrowserViewportElement`
+    ///   doesn't paint, so no cutout is emitted, so the workspace bg
+    ///   covers the underlay — WebView2's pixels aren't visible
+    ///   anyway. No need to stop it from painting.
+    ///
+    /// - Harmful: calling SetIsVisible(false) here and SetIsVisible(true)
+    ///   on the next `Render` produces a one-frame compositor latency
+    ///   where the cutout is emitted before the WebView has resumed
+    ///   painting, exposing the window's blank backing (the desktop)
+    ///   for ~16 ms. By leaving the WebView always painting, the
+    ///   transition is seamless.
+    ///
+    /// The cost is that inactive browser tabs continue running their
+    /// renderer, but Chromium tabs are already cheap when not visible
+    /// on-screen — Chromium throttles offscreen rendering internally.
+    fn deactivated(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 /// Custom element whose `prepaint` snapshots the window-relative bounds and
@@ -1403,13 +1408,36 @@ impl Element for BrowserViewportElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        // The WebView2 visual draws itself via the DComp tree; nothing to do.
+        // Phase 4 architectural fix: insert a Cutout into the scene at
+        // this element's z-position. The Windows renderer wipes the
+        // swap-chain pixels in `bounds` to alpha = 0 via
+        // ID3D11DeviceContext1::ClearView, exposing the WebView2
+        // underlay visual in the DComp tree. Modals, popovers, the
+        // floating Describe panel, drawing strokes — anything painted
+        // later — render on top of the transparent region and stay
+        // visible.
+        //
+        // Only emit the cutout when our session is live, so before
+        // first navigation the viewport area shows the workspace
+        // background (a fine "loading" placeholder) rather than the
+        // window's compositor background.
+        #[cfg(target_os = "windows")]
+        {
+            let has_session = self.item.read(cx).session.is_some();
+            if has_session {
+                window.paint_cutout(bounds);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (bounds, window, cx);
+        }
     }
 }
 
@@ -1560,8 +1588,14 @@ fn start_session(
     hwnd: HWND,
     cx: &mut Context<BrowserItem>,
 ) -> anyhow::Result<()> {
-    let visual = gpui_windows::create_child_visual_for_hwnd(hwnd)
-        .context("gpui_windows::create_child_visual_for_hwnd")?;
+    // Underlay: the WebView2 visual sits *below* GPUI's swap chain in
+    // the DComp tree. Combined with the window's transparent
+    // background appearance (set below) and a non-opaque viewport div,
+    // GPUI overlays (address bar, floating Describe panel, drawing
+    // strokes) render on top of the page — fixing the Phase 4 z-order
+    // problem documented in plans/browser-viewer.md §AC-P2-2.
+    let visual = gpui_windows::create_underlay_visual_for_hwnd(hwnd)
+        .context("gpui_windows::create_underlay_visual_for_hwnd")?;
 
     let x = f32::from(bounds.origin.x);
     let y = f32::from(bounds.origin.y);

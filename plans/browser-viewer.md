@@ -815,14 +815,24 @@ formalised the host-extension API in `gpui_windows`).
 
 - [x] AC-P2-1: Composition mode means no child HWND for the page —
   WebView2 draws directly into a DComp visual under Zed's swap chain.
-- [x] AC-P2-2: GPUI overlays would normally be occluded because the
-  WebView visual sits above Zed's swap chain in the comp tree. We
-  resolved this in Phase 1.E by hiding the WebView while
-  `workspace.has_active_modal()` is true. The "ideal" alternative —
-  reordering the WebView below GPUI and punching a transparent hole
-  in GPUI's swap chain — was rejected as disproportionate surgery
-  for marginal UX gain (overlays and page content aren't usefully
-  viewed simultaneously).
+- [x] AC-P2-2: GPUI overlays render *above* the page (proper fix
+  shipped in Phase 4 — modal-hide workaround removed). Architecture:
+    1. DComp tree restructured so a new `comp_container` is the root
+       with two children — `comp_visual` (GPUI's swap-chain holder,
+       front-most) and a per-browser-tab WebView2 underlay (behind).
+       New API: `gpui_windows::create_underlay_visual_for_hwnd`.
+    2. New GPUI scene primitive `Cutout` — inserted via
+       `Window::paint_cutout(bounds)`. The Windows D3D11 renderer
+       handles the `PrimitiveBatch::Cutouts` arm by calling
+       `ID3D11DeviceContext1::ClearView` with `[0, 0, 0, 0]`, which
+       writes raw alpha=0 pixels into the swap-chain RTV bypassing
+       blend state. Mac/wgpu renderers no-op the batch.
+    3. `BrowserViewportElement::paint` emits a Cutout for the viewport
+       region at its z-position. Workspace bg paints first → cutout
+       punches alpha=0 → underlay shows through → modals/popovers/
+       drawing strokes painted afterwards remain opaque on top.
+  The original Phase 1.E "hide WebView on modal open" workaround was
+  deleted; modals now naturally render above the page via z-order.
 - [x] AC-P2-3: Resize tracks smoothly. `prepaint` runs every layout
   pass; `set_rect` updates DComp offsets + controller bounds +
   notifies parent-window position changes atomically.

@@ -1305,6 +1305,12 @@ impl WgpuRenderer {
                             // Not implemented for Linux/wgpu
                             true
                         }
+                        // FORK: alpha-clear cutouts are Windows-only.
+                        // wgpu has no equivalent of D3D11's ClearView
+                        // (sub-rect clear bypassing blend state), so
+                        // this path no-ops on Linux/wgpu. browser_viewer
+                        // is gated to Windows anyway.
+                        PrimitiveBatch::Cutouts(_) => true,
                     };
                     if !ok {
                         overflow = true;

@@ -3541,6 +3541,28 @@ impl Window {
     /// Note that the `quad.corner_radii` are allowed to exceed the bounds, creating sharp corners
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
+    /// FORK: insert an [alpha-clear cutout](`crate::Cutout`) at the
+    /// current z-position. On Windows, this wipes the swap-chain
+    /// pixels in `bounds` to fully transparent
+    /// (`ID3D11DeviceContext1::ClearView` with `[0, 0, 0, 0]`), so an
+    /// underlying DComp visual — e.g. WebView2 attached via
+    /// `gpui_windows::create_underlay_visual_for_hwnd` — shows through.
+    /// On other platforms this is a no-op.
+    ///
+    /// Because the cutout is inserted at the calling element's
+    /// z-position, primitives painted *after* it (modals, deferred
+    /// popovers, drawing strokes) remain visible — their pixels
+    /// blend on top of the transparent region.
+    pub fn paint_cutout(&mut self, bounds: Bounds<Pixels>) {
+        self.invalidator.debug_assert_paint();
+        let scale_factor = self.scale_factor();
+        self.next_frame.scene.insert_primitive(crate::Cutout {
+            order: 0,
+            bounds: bounds.scale(scale_factor),
+            content_mask: self.content_mask().scale(scale_factor),
+        });
+    }
+
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
 

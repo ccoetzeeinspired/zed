@@ -100,6 +100,14 @@ struct DirectXGlobalElements {
 pub(crate) struct DirectComposition {
     pub(crate) comp_device: IDCompositionDevice,
     pub(crate) comp_target: IDCompositionTarget,
+    /// Root container. Holds `comp_visual` (GPUI's swap chain) plus
+    /// any underlay visuals registered by host crates (e.g. WebView2
+    /// in `browser_viewer`). Underlays are added with
+    /// `insertAbove = false` so they paint *before* `comp_visual` —
+    /// i.e., GPUI's UI paints over them. The transparent regions of
+    /// GPUI's alpha-premultiplied swap chain let the underlay show
+    /// through where GPUI didn't draw.
+    pub(crate) comp_container: IDCompositionVisual,
     pub(crate) comp_visual: IDCompositionVisual,
 }
 
@@ -346,10 +354,11 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::Cutouts(range) => self.draw_cutouts(&scene.cutouts[range]),
             }
             .context(format!(
                 "scene too large:\
-                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
+                {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces, {} cutouts",
                 scene.paths.len(),
                 scene.shadows.len(),
                 scene.quads.len(),
@@ -358,6 +367,7 @@ impl DirectXRenderer {
                 scene.subpixel_sprites.len(),
                 scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
+                scene.cutouts.len(),
             ))?;
         }
         self.present()
@@ -614,6 +624,66 @@ impl DirectXRenderer {
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
         )
+    }
+
+    /// FORK: alpha-clear rectangles to fully transparent, bypassing
+    /// blend state. Used by `browser_viewer` so the WebView2 underlay
+    /// visual shows through GPUI's swap chain in the browser viewport
+    /// region. `ID3D11DeviceContext1::ClearView` writes the four
+    /// floats directly into the RTV pixels in each rect — it ignores
+    /// blend state, depth-stencil state, raster state, scissor, and
+    /// the pipeline state in general. Available on Direct3D 11.1+ and
+    /// guaranteed by Zed's feature-level baseline.
+    ///
+    /// Inserted into the scene at the painter's z-position via
+    /// `Window::paint_cutout`, so later primitives (modals, popovers,
+    /// drawing strokes) paint normally on top of the transparent
+    /// region and remain visible.
+    fn draw_cutouts(&mut self, cutouts: &[gpui::Cutout]) -> Result<()> {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext1;
+
+        if cutouts.is_empty() {
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let rtv = resources
+            .render_target_view
+            .as_ref()
+            .context("render target view missing")?;
+        let context_1: ID3D11DeviceContext1 = devices
+            .device_context
+            .cast()
+            .context("ID3D11DeviceContext1 not available")?;
+
+        // Clip each cutout to its content_mask so a cutout scrolled
+        // partially out of view doesn't erase pixels outside the
+        // current clip region. The renderer's RTV is the swap chain
+        // back buffer in device pixels — Cutout already carries
+        // ScaledPixels (device pixel space), so no rescale.
+        let rects: Vec<RECT> = cutouts
+            .iter()
+            .filter_map(|cutout| {
+                let clipped = cutout.bounds.intersect(&cutout.content_mask.bounds);
+                if clipped.is_empty() {
+                    return None;
+                }
+                Some(RECT {
+                    left: clipped.origin.x.0 as i32,
+                    top: clipped.origin.y.0 as i32,
+                    right: (clipped.origin.x.0 + clipped.size.width.0) as i32,
+                    bottom: (clipped.origin.y.0 + clipped.size.height.0) as i32,
+                })
+            })
+            .collect();
+        if rects.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            context_1.ClearView(rtv, &[0.0, 0.0, 0.0, 0.0], Some(rects.as_slice()));
+        }
+        Ok(())
     }
 
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
@@ -907,11 +977,20 @@ impl DirectComposition {
     pub fn new(dxgi_device: &IDXGIDevice, hwnd: HWND) -> Result<Self> {
         let comp_device = get_comp_device(dxgi_device)?;
         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
+        // `comp_container` is the new root. Its purpose is to host
+        // both the GPUI swap-chain visual (`comp_visual`) and any
+        // host-managed children — including underlays (children of
+        // the container that paint *before* `comp_visual` and so
+        // appear below GPUI's pixels). Without the container,
+        // `comp_visual` was the root and any AddVisual'd child painted
+        // on top of GPUI's content. Now we get true z-control.
+        let comp_container = unsafe { comp_device.CreateVisual() }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
 
         Ok(Self {
             comp_device,
             comp_target,
+            comp_container,
             comp_visual,
         })
     }
@@ -919,7 +998,21 @@ impl DirectComposition {
     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
         unsafe {
             self.comp_visual.SetContent(swap_chain)?;
-            self.comp_target.SetRoot(&self.comp_visual)?;
+            // `comp_visual` becomes a child of `comp_container`. With
+            // `referenceVisual = NULL`, IDCompositionVisual::AddVisual
+            // semantics are:
+            //   insertAbove=TRUE  → add at BEGINNING of child list
+            //                       (rendered FIRST = back of z-order)
+            //   insertAbove=FALSE → add at END   of child list
+            //                       (rendered LAST  = front of z-order)
+            // We want GPUI's swap chain on TOP of any underlay, so
+            // insertAbove=FALSE. Underlays get insertAbove=TRUE.
+            self.comp_container.AddVisual(
+                &self.comp_visual,
+                false,
+                None::<&IDCompositionVisual>,
+            )?;
+            self.comp_target.SetRoot(&self.comp_container)?;
             self.comp_device.Commit()?;
         }
         Ok(())

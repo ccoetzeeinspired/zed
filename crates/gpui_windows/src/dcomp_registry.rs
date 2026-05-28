@@ -48,6 +48,10 @@ fn lookup(hwnd: HWND) -> Option<Arc<DirectComposition>> {
 pub struct HostedVisual {
     dcomp: Arc<DirectComposition>,
     visual: IDCompositionVisual,
+    /// Parent visual this child was inserted under. Stored so `Drop`
+    /// can call `RemoveVisual` on the same parent — overlays attach
+    /// to `comp_visual`, underlays attach to `comp_container`.
+    parent: IDCompositionVisual,
 }
 
 impl HostedVisual {
@@ -73,10 +77,10 @@ impl HostedVisual {
 
 impl Drop for HostedVisual {
     fn drop(&mut self) {
-        // Remove the visual from the root visual's child list and commit.
+        // Remove the visual from its parent's child list and commit.
         // Failures are logged but not propagated — drop must not panic.
         unsafe {
-            if let Err(err) = self.dcomp.comp_visual.RemoveVisual(&self.visual) {
+            if let Err(err) = self.parent.RemoveVisual(&self.visual) {
                 log::warn!("HostedVisual.drop: RemoveVisual failed: {err}");
             }
             if let Err(err) = self.dcomp.comp_device.Commit() {
@@ -86,16 +90,17 @@ impl Drop for HostedVisual {
     }
 }
 
-/// Create a new child visual attached to the root visual of the GPUI window
-/// identified by `hwnd`. The visual starts at offset (0, 0) and renders no
-/// content until the caller sets content (e.g., via WebView2's
-/// `SetRootVisualTarget`) and commits.
+/// Create a new child visual attached *above* GPUI's swap chain — the
+/// "overlay" position. Anything painted here covers GPUI's UI. Use the
+/// underlay variant ([`create_underlay_visual_for_hwnd`]) for hosted
+/// content like WebView2 that should sit *under* GPUI overlays.
 ///
 /// Fails if the window's DComp tree is not registered (DComp disabled, or
 /// the renderer was dropped).
 pub fn create_child_visual_for_hwnd(hwnd: HWND) -> Result<HostedVisual> {
     let dcomp = lookup(hwnd)
         .with_context(|| format!("no DirectComposition registered for HWND {:?}", hwnd.0))?;
+    let parent = dcomp.comp_visual.clone();
     let visual = unsafe {
         dcomp
             .comp_device
@@ -103,12 +108,50 @@ pub fn create_child_visual_for_hwnd(hwnd: HWND) -> Result<HostedVisual> {
             .context("IDCompositionDevice::CreateVisual")?
     };
     unsafe {
-        dcomp
-            .comp_visual
+        parent
             .AddVisual(&visual, true, None::<&IDCompositionVisual>)
             .context("AddVisual")?;
-        // Do NOT commit here; the caller will configure transform and content
-        // first, then call `HostedVisual::commit()` for an atomic appearance.
     }
-    Ok(HostedVisual { dcomp, visual })
+    Ok(HostedVisual {
+        dcomp,
+        visual,
+        parent,
+    })
+}
+
+/// Create a new child visual attached as an *underlay* — sits below
+/// GPUI's swap chain in the composition tree. GPUI's UI paints on top;
+/// pixels GPUI leaves transparent (alpha = 0) let this visual show
+/// through. Used by `browser_viewer` so the WebView2 page renders
+/// under the address bar / floating panels / drawing strokes.
+///
+/// Requires the host window's swap chain to be alpha-premultiplied —
+/// which GPUI's composition swap chain already is (see
+/// `directx_renderer.rs` — `DXGI_ALPHA_MODE_PREMULTIPLIED`).
+pub fn create_underlay_visual_for_hwnd(hwnd: HWND) -> Result<HostedVisual> {
+    let dcomp = lookup(hwnd)
+        .with_context(|| format!("no DirectComposition registered for HWND {:?}", hwnd.0))?;
+    let parent = dcomp.comp_container.clone();
+    let visual = unsafe {
+        dcomp
+            .comp_device
+            .CreateVisual()
+            .context("IDCompositionDevice::CreateVisual")?
+    };
+    unsafe {
+        // `insertAbove = TRUE` with referenceVisual = NULL → BEGINNING
+        // of the child list, which renders FIRST (= back of z-order).
+        // `comp_visual` (the GPUI swap-chain holder) is added with
+        // `insertAbove = FALSE` in `set_swap_chain` → END of list → front.
+        // So the underlay ends up beneath GPUI's UI in z-order: page
+        // shows where GPUI is transparent, GPUI overlays show on top.
+        parent
+            .AddVisual(&visual, true, None::<&IDCompositionVisual>)
+            .context("AddVisual (underlay)")?;
+    }
+    Ok(HostedVisual {
+        dcomp,
+        visual,
+        parent,
+    })
 }

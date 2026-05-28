@@ -36,6 +36,13 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// FORK: rectangular regions to wipe to transparent (alpha = 0)
+    /// at this primitive's z-position. Used by `browser_viewer` so
+    /// the WebView2 underlay shows through GPUI's otherwise-opaque
+    /// swap chain while still allowing later primitives (modals,
+    /// popovers, drawing strokes) to render on top.
+    /// Windows-only effect; other renderers treat this batch as a no-op.
+    pub cutouts: Vec<Cutout>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +59,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.cutouts.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -119,6 +127,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::Cutout(cutout) => {
+                cutout.order = order;
+                self.cutouts.push(*cutout);
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -146,6 +158,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.cutouts.sort_by_key(|cutout| cutout.order);
     }
 
     #[cfg_attr(
@@ -173,6 +186,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            cutouts_start: 0,
+            cutouts_iter: self.cutouts.iter().peekable(),
         }
     }
 }
@@ -195,6 +210,8 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    /// FORK: alpha-clear rect — see [`Cutout`].
+    Cutout,
 }
 
 pub(crate) enum PaintOperation {
@@ -214,6 +231,8 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    /// FORK: see [`Cutout`].
+    Cutout(Cutout),
 }
 
 #[expect(missing_docs)]
@@ -228,6 +247,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::Cutout(cutout) => &cutout.bounds,
         }
     }
 
@@ -241,6 +261,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::Cutout(cutout) => &cutout.content_mask,
         }
     }
 }
@@ -269,6 +290,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    cutouts_start: usize,
+    cutouts_iter: Peekable<slice::Iter<'a, Cutout>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -301,6 +324,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.cutouts_iter.peek().map(|c| c.order),
+                PrimitiveKind::Cutout,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -447,6 +474,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::Cutout => {
+                let cutouts_start = self.cutouts_start;
+                let mut cutouts_end = cutouts_start + 1;
+                self.cutouts_iter.next();
+                while self
+                    .cutouts_iter
+                    .next_if(|cutout| (cutout.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    cutouts_end += 1;
+                }
+                self.cutouts_start = cutouts_end;
+                Some(PrimitiveBatch::Cutouts(cutouts_start..cutouts_end))
+            }
         }
     }
 }
@@ -479,6 +520,10 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    /// FORK: alpha-clear rects to wipe to transparent. Currently only
+    /// implemented by the Windows D3D11 renderer (`ClearView`); other
+    /// renderers treat this as a no-op.
+    Cutouts(Range<usize>),
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -517,6 +562,28 @@ pub struct Underline {
 impl From<Underline> for Primitive {
     fn from(underline: Underline) -> Self {
         Primitive::Underline(underline)
+    }
+}
+
+/// FORK: an axis-aligned rect that gets wiped to transparent
+/// (alpha = 0, all channels) at its z-position in the scene.
+/// Inserted via [`Window::paint_cutout`]; only the Windows
+/// `directx_renderer` actually performs the clear (via
+/// `ID3D11DeviceContext1::ClearView`, which bypasses blend state).
+/// Used by `crates/browser_viewer` so the WebView2 underlay shows
+/// through GPUI's swap chain while later primitives (modals,
+/// drawing strokes) render on top.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct Cutout {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+impl From<Cutout> for Primitive {
+    fn from(cutout: Cutout) -> Self {
+        Primitive::Cutout(cutout)
     }
 }
 
