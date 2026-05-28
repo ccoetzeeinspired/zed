@@ -30,8 +30,14 @@ corresponding feature.
 
 - **`main`** — tracks `origin/main`, which mirrors `upstream/main`. No local
   modifications. Only used as a rebase base when syncing.
-- **`pdf-viewer`** — the working branch. Carries the PDF viewer crate, the
-  msvc_spectre_libs build stub, and this CLAUDE.md addition.
+- **`pdf-viewer`** — carries the PDF viewer crate, the msvc_spectre_libs
+  build stub, and this CLAUDE.md addition.
+- **`claude-only`** — built on top of `pdf-viewer`; gates the agent panel
+  to claude-acp and vendors the ACP bridge.
+- **`browser-viewer`** — built on top of `claude-only`; adds the in-editor
+  WebView2 browser tab with composition-mode rendering, CDP keyboard,
+  design-mode element picker + drawing overlay + screenshot bundle,
+  and the GPUI scene `Cutout` primitive (see below).
 
 ## What this fork adds, and why
 
@@ -148,6 +154,157 @@ beyond the ACP-bridge surface itself. Any future fork-specific patches
 go in `src/acp-agent.ts` and similar; use a comment marker like
 `// FORK:` so they're easy to find on rebases.
 
+### `crates/browser_viewer/` — in-editor WebView2 browser tab (Windows only)
+
+The motivating feature: render real Chromium pages inside a Zed tab via
+WebView2 in composition mode, with GPUI overlays (modals, popovers,
+freehand drawing) painting *above* the page, and a "design mode" that
+captures element + screenshot + scribbles + prompt and (eventually,
+phase 4.F) dispatches them through the claude-acp panel.
+
+Full design lives in `plans/browser-viewer.md`. **Read it first**
+before touching any of the surfaces below — it documents the why for
+every non-obvious choice.
+
+#### Architecture cheat sheet (the load-bearing bits)
+
+1. **Composition mode, never child-HWND.** WebView2 is created via
+   `ICoreWebView2Environment3.CreateCoreWebView2CompositionController`
+   and bound to a fresh `IDCompositionVisual` via
+   `SetRootVisualTarget`. Zed already uses DirectComposition for its
+   own swap chain, and a child HWND draws *behind* DComp's swap-chain
+   visual on the same window — not what we want. Composition mode
+   gives us proper inter-visual compositing.
+
+2. **DComp tree (`crates/gpui_windows/src/directx_renderer.rs` +
+   `dcomp_registry.rs`).** Restructured so the IDCompositionTarget root
+   is a `comp_container` visual with two kinds of children:
+   - `comp_visual` (GPUI's swap-chain holder), added with
+     `AddVisual(_, false, NULL)` → END of list → **FRONT** of z-order.
+   - "Underlay" visuals from external crates, added via
+     `gpui_windows::create_underlay_visual_for_hwnd` with
+     `AddVisual(_, true, NULL)` → BEGINNING → **BACK** of z-order.
+   - The old `create_child_visual_for_hwnd` still exists for visuals
+     that should sit *above* GPUI's swap chain (currently unused).
+   - `IDCompositionVisual::AddVisual` semantics with `referenceVisual = NULL`:
+     `insertAbove = TRUE` → beginning of list (painted first = back);
+     `insertAbove = FALSE` → end of list (painted last = front). The
+     docs phrasing is confusing; this fork uses the exact opposite
+     convention from what "above" linguistically suggests.
+
+3. **Cutout primitive (`crates/gpui/src/scene.rs` + `window.rs`).** A
+   GPUI scene primitive added by this fork. `Window::paint_cutout(bounds)`
+   inserts a `Cutout` at the calling element's z-position. The Windows
+   D3D11 renderer handles the `PrimitiveBatch::Cutouts` arm by calling
+   `ID3D11DeviceContext1::ClearView(rtv, [0,0,0,0], &rects)` — the
+   *only* GPUI primitive that can decrease destination alpha
+   (everything else uses src-over blend which can't). `ClearView`
+   bypasses blend state, depth-stencil, raster state, scissor, and the
+   pipeline state in general, writing raw `[0, 0, 0, 0]` into the RTV
+   pixels. Other renderers (Metal, wgpu) treat the batch as a no-op —
+   browser_viewer is Windows-only anyway.
+
+4. **`BrowserViewportElement::paint` emits the cutout** when its
+   session is live. Paint order in a browser tab: workspace bg paints
+   opaque → cutout punches alpha=0 in viewport rect → WebView2
+   underlay shows through that hole → modals/popovers/drawing strokes
+   painted afterwards stay opaque on top. This is the "all GPUI on top
+   of the page" effect.
+
+5. **CDP for page keyboard** (`crates/browser_viewer/src/browser_view.rs` +
+   `webview2_host.rs`). `ICoreWebView2CompositionController` has *no*
+   `SendKeyEvent` method in any released or prerelease SDK including
+   1.0.4015-prerelease (verified during Phase 3 SDK research).
+   Microsoft has never shipped keyboard injection for composition
+   mode. We use Chrome DevTools Protocol via
+   `webview.CallDevToolsProtocolMethod("Input.dispatchKeyEvent", json, handler)`
+   instead — works on our current `webview2-com 0.38`, survives all
+   future SDK upgrades, dispatches at the renderer level so it bypasses
+   Win32 focus entirely. Covers ASCII / arrows / F-keys / modifiers /
+   hold-to-repeat. Does *not* cover IME (CJK) or Win32 dead-key
+   accents — explicit non-goals for the dogfood target.
+
+6. **Win32 SetFocus trick** (`forward_mouse_event` in `browser_view.rs`).
+   WebView2 in composition mode creates internal HWNDs and steals
+   Win32 keyboard focus on every mouse-down. From then on,
+   `GetMessageW` routes WM_KEYDOWN to the WebView2 HWND, and
+   `gpui_windows::platform.rs::translate_accelerator` never sees the
+   keys — so global shortcuts like Ctrl+Shift+P / Ctrl+P stop reaching
+   Zed. After each forwarded mouse event we call
+   `SetFocus(zed_hwnd)` to yank Win32 focus back. Side-effect-neutral
+   because the page receives its own keystrokes via the CDP path, not
+   via the OS message pump.
+
+7. **Design-mode JS bus** (`design_mode_script.rs` + `design.rs`). A
+   script is injected via `AddScriptToExecuteOnDocumentCreated` on
+   every navigation. It handles hover highlighting + element selection
+   + scroll-tracking; communicates with the host via JSON over
+   `chrome.webview.postMessage`. The host registers
+   `add_WebMessageReceived` and forwards messages to BrowserItem as
+   `NavigationEvent::DesignModeMessage(raw_json)`, which is parsed
+   into typed `DesignInbound` variants. The script intercepts
+   pointerdown / mousedown / click / touchstart / contextmenu in the
+   capture phase, calling `preventDefault + stopImmediatePropagation`
+   on all of them — many sites navigate on pointerdown well before
+   click fires, so only capturing click leaks navigation.
+
+#### Build / sync conflict surface this fork now owns
+
+Because Phase 4's Cutout primitive lives in `crates/gpui/`, the
+following upstream-tracked files are now part of the fork-vs-upstream
+diff and **will cause merge conflicts on upstream rebases:**
+
+- `crates/gpui/src/scene.rs` — new `Cutout` struct,
+  `Primitive::Cutout` variant, `PrimitiveKind::Cutout`,
+  `PrimitiveBatch::Cutouts`, plus `Scene::cutouts` field and
+  matching updates to `clear/finish/insert_primitive/batches()`.
+- `crates/gpui/src/window.rs` — new `Window::paint_cutout` method.
+- `crates/gpui_windows/src/directx_renderer.rs` — `comp_container`
+  field, `set_swap_chain` restructure, `draw_cutouts` method.
+- `crates/gpui_windows/src/dcomp_registry.rs` —
+  `create_underlay_visual_for_hwnd`.
+- `crates/gpui_windows/src/window.rs` — none directly, but the
+  background-appearance code may collide.
+- `crates/gpui_macos/src/metal_renderer.rs` and
+  `crates/gpui_wgpu/src/wgpu_renderer.rs` — no-op `Cutouts` arm in
+  the batch match.
+- `assets/keymaps/default-windows.json` — `BrowserView` context with
+  `browser::OpenDevTools` / `browser::FocusAddressBar`.
+- `crates/zed/src/main.rs` and `Cargo.toml` — `browser_viewer` init
+  + workspace member entry.
+
+For rebases, search the diff for `FORK:` markers — most non-obvious
+changes are tagged. Where there's a clean re-insertion slot in an
+upstream-reordered list, just put the line back; for substantive
+collisions, prefer the fork's behaviour and re-read this section.
+
+#### User-facing surfaces
+
+- `browser: new tab` action — opens the configured homepage in a
+  tab. Default URL settable via `browser.homepage` in settings.
+- Address bar: URL editor, back/forward/reload, Ctrl+L to focus +
+  select-all. Search fallback uses `browser.search_url` with
+  `{query}` placeholder.
+- DevTools: Ctrl+Shift+I / F12 when a browser tab has focus.
+- Design mode: crosshair icon in address bar (or `browser: toggle
+  design mode`). Click an element → floating "Describe the change"
+  panel anchored next to it. Submit → bundle written to
+  `%TEMP%\zed-browser-design\<unix-ms>\` (screenshot.png +
+  drawing.svg + bundle.json). **Phase 4.F (next-session priority)
+  will replace the disk write with an actual ACP dispatch into the
+  claude-acp panel — that's the loop-closing feature.**
+- Drawing mode: pencil icon → freehand strokes over the page; eraser
+  icon clears.
+
+#### Known limits / parked work
+
+- IME (CJK / Arabic) and dead-key accents — CDP doesn't cover these.
+- Multi-browser-tab in same pane — z-order glitch when switching
+  between them; active tab's underlay needs reordering. Single-tab
+  case (the dogfood path) works fine. Task #28.
+- ACP submission pipeline — design-mode bundle currently lands in
+  `%TEMP%` instead of the agent panel. Task #29 (highest priority).
+
 ### `stubs/msvc_spectre_libs/` — build workaround
 
 A local no-op crate that replaces the crates.io `msvc_spectre_libs` via
@@ -208,7 +365,9 @@ error: only metadata stub found for `dylib` dependency `std` ...
 
 ## Sync workflow — pulling upstream changes into this fork
 
-Run this whenever you want to incorporate new upstream Zed commits:
+Run this whenever you want to incorporate new upstream Zed commits.
+The branch chain is `main` → `pdf-viewer` → `claude-only` →
+`browser-viewer`; each rebases onto its predecessor.
 
 ```powershell
 # 1. Update local main from upstream
@@ -220,30 +379,65 @@ git push origin main                  # keep the fork's main current too
 # 2. Rebase pdf-viewer onto the new main
 git checkout pdf-viewer
 git rebase main
-#    ...resolve conflicts if any (likely Cargo.toml / Cargo.lock /
-#    crates/zed/src/main.rs / crates/zed/src/zed.rs — see below)...
-cargo build -j 4                      # verify it still compiles (see Build notes for why -j 4)
+#    ...resolve conflicts if any...
+cargo build -j 4                      # verify (see Build notes for why -j 4)
 git push --force-with-lease origin pdf-viewer
+
+# 3. Rebase claude-only onto the new pdf-viewer
+git checkout claude-only
+git rebase pdf-viewer
+cargo build -j 4
+git push --force-with-lease origin claude-only
+
+# 4. Rebase browser-viewer onto the new claude-only
+git checkout browser-viewer
+git rebase claude-only
+cargo build -j 4
+git push --force-with-lease origin browser-viewer
 ```
 
 ### Conflict hot spots
 
-Three files in the `pdf-viewer` diff sit in code paths upstream churns
-frequently:
+Files this fork modifies in code paths upstream churns frequently:
 
-- **`Cargo.toml`** — the `members = [...]` insertion and the
+- **`Cargo.toml`** — `members = [...]` insertion and
   `[workspace.dependencies]` entry sit in alphabetically-sorted lists.
   Re-insert in the right alphabetical slot if upstream reorders.
 - **`Cargo.lock`** — usually easiest to take upstream's version
   (`git checkout --theirs Cargo.lock`) then re-run `cargo build` to
   regenerate with our deps included.
-- **`crates/zed/src/main.rs`** and **`crates/zed/src/zed.rs`** — our
-  `pdf_viewer::init(cx)` call sits in the init list that gets reordered.
-  Just re-add the line after upstream's version of the list.
+- **`crates/zed/src/main.rs`** and **`crates/zed/src/zed.rs`** —
+  `pdf_viewer::init(cx)` and `browser_viewer::init(cx)` sit in init
+  lists that get reordered. Re-add after upstream's version of the
+  list.
+- **`crates/gpui/src/scene.rs`** — fork adds a new `Cutout`
+  primitive (struct + enum variants + Scene field + BatchIterator
+  updates). Touches several distinct spots in the file; upstream may
+  add other primitives in the same locations. See
+  "Build / sync conflict surface" in the browser_viewer section.
+- **`crates/gpui/src/window.rs`** — fork adds `Window::paint_cutout`
+  near `paint_quad`.
+- **`crates/gpui_windows/src/directx_renderer.rs`** — fork's
+  `comp_container` field on `DirectComposition`, the `set_swap_chain`
+  restructure, and the new `draw_cutouts` method.
+- **`crates/gpui_macos/src/metal_renderer.rs`** and
+  **`crates/gpui_wgpu/src/wgpu_renderer.rs`** — no-op `Cutouts` arm
+  in the `match batch` block; if upstream adds variants there, just
+  put ours back next to `Surfaces`.
+- **`agent_panel.rs`** / **`agent_configuration.rs`** etc. (on
+  `claude-only` branch) — the claude-acp gating points. See "Agent
+  panel — gated to Claude Code only" section.
+- **`crates/settings_content/src/settings_content.rs`** and
+  **`crates/settings/src/vscode_import.rs`** — `browser` field added
+  alongside other settings. Re-add in the right position.
 
-`assets/keymaps/default-windows.json` and everything under
-`crates/pdf_viewer/` and `stubs/` won't conflict — upstream doesn't touch
-them.
+`assets/keymaps/default-windows.json` has fork-only additions
+(`BrowserView` context block; pdf_viewer keys). Conflicts when
+upstream reorders sibling rules — search for `FORK:` markers.
+
+Everything under `crates/pdf_viewer/`, `crates/browser_viewer/`,
+`vendor/claude-agent-acp/`, and `stubs/` won't conflict — upstream
+doesn't touch them.
 
 ### Rebase vs. merge
 
