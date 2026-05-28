@@ -2244,10 +2244,12 @@ name = "browser_viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "editor",
  "futures 0.3.32",
  "gpui",
  "gpui_windows",
+ "image",
  "log",
  "menu",
  "project",
@@ -2260,6 +2262,7 @@ dependencies = [
  "webview2-com",
  "windows 0.61.3",
  "workspace",
+ "zed_actions",
 ]
 
 [[package]]

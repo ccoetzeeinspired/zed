@@ -894,7 +894,14 @@ freehand drawing, and submission to claude-acp.
   `controller.CapturePreviewAsync(PreviewKindPng, stream)`.
 - Implement the submission pipeline: bundle artifacts and call into
   the agent panel via `claude-acp` ACP `prompt` with image content
-  blocks.
+  blocks. **DONE (Phase 4.F).** `on_design_submit` composites the
+  selected-element outline + freehand strokes onto the screenshot,
+  base64-encodes it (≤2 MB), and dispatches
+  `zed_actions::agent::SendDesignBundleToAgent`; `agent_ui` builds the
+  ACP prompt (text + image + embedded-HTML resource) and sends it into
+  the active claude-acp thread, or opens a new one if none is live.
+  The drawing rides as a burned-in annotation on the screenshot rather
+  than a standalone SVG, so Claude sees the scribble in context.
 - React `_debugSource` detection.
 - `data-source-*` and `data-component`/`data-testid` fallbacks.
 - Visual indicator (e.g., a green status pill) showing design mode
@@ -908,11 +915,16 @@ freehand drawing, and submission to claude-acp.
   input next to it.
 - [ ] AC-P4-3: Drawing strokes appears on top of the page without
   affecting the page's own pointer events when drawing mode is on.
-- [ ] AC-P4-4: Submitting sends an ACP message to the agent panel
-  containing: screenshot (PNG ≤ 2MB), drawing (SVG), element
-  selector, outerHTML excerpt, source hint, prompt text. Verify via
-  the claude-acp `[fork-debug]` logging we built earlier (re-enable
-  it as needed for this verification).
+- [x] AC-P4-4: Submitting sends an ACP message to the agent panel
+  containing: screenshot (PNG ≤ 2MB), drawing, element selector,
+  outerHTML excerpt, source hint, prompt text. **Done & verified
+  (Phase 4.F)** — the drawing is composited onto the screenshot rather
+  than sent as standalone SVG. Verified end-to-end against a Next.js
+  dev app: the agent received the request text + selector + embedded
+  outerHTML resource + screenshot and edited the correct source file.
+  `ZED_BROWSER_DESIGN_DEBUG_BUNDLE=1` dumps the annotated PNG to
+  `%TEMP%` for inspection. (`source_hint` requires React DevTools
+  `_debugSource`; absent on prod-ish builds — that's AC-P4-5's path.)
 - [ ] AC-P4-5: For a Vite + React dev server with React DevTools
   installed, the `source_hint` correctly identifies the source
   file:line of a clicked component.

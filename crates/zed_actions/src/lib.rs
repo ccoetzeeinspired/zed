@@ -560,6 +560,29 @@ pub mod agent {
         /// File paths with unresolved conflicts (for project-wide resolution).
         pub conflicted_file_paths: Vec<String>,
     }
+
+    /// Opens or continues a claude-acp thread with a design-mode change
+    /// request captured from the in-editor browser (browser_viewer 4.F).
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendDesignBundleToAgent {
+        /// The user's typed "Describe the change" text.
+        pub prompt: SharedString,
+        /// CSS selector path of the clicked element.
+        pub selector: SharedString,
+        /// URL of the page the element lives on.
+        pub page_url: SharedString,
+        /// outerHTML of the clicked element (already truncated by the page script).
+        pub outer_html: SharedString,
+        /// Best-effort "file:line" source hint, when detected.
+        pub source_hint: Option<SharedString>,
+        /// Annotated screenshot (selected-element outline + freehand strokes
+        /// composited onto the page capture), base64-encoded PNG.
+        pub annotated_png_base64: SharedString,
+        /// Whether the user drew freehand annotations.
+        pub has_drawing: bool,
+    }
 }
 
 pub mod assistant {

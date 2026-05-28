@@ -25,7 +25,7 @@ use zed_actions::{
     agent::{
         AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
         ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
-        ResolveConflictsWithAgent, ReviewBranchDiff,
+        ResolveConflictsWithAgent, ReviewBranchDiff, SendDesignBundleToAgent,
     },
     assistant::{
         CreateSkillFromUrl, FocusAgent, OpenRulesLibrary, OpenSkillCreator, Toggle, ToggleFocus,
@@ -523,6 +523,48 @@ pub fn init(cx: &mut App) {
                         });
                     },
                 )
+                .register_action(|workspace, action: &SendDesignBundleToAgent, window, cx| {
+                    // FORK: browser_viewer 4.F — route a design-mode change
+                    // request from the in-editor browser into the claude-acp
+                    // agent panel. Mirrors the ReviewBranchDiff handler above.
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+
+                    let content_blocks = build_design_bundle_blocks(action);
+
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+
+                    // Continue the active conversation if one is open so
+                    // iterative design tweaks accumulate context; otherwise
+                    // open a fresh claude-acp thread and auto-submit.
+                    if let Some(thread_view) = panel.read(cx).active_thread_view(cx) {
+                        thread_view.update(cx, |view, cx| {
+                            view.send_content(
+                                gpui::Task::ready(anyhow::Ok(Some((content_blocks, Vec::new())))),
+                                window,
+                                cx,
+                            );
+                        });
+                    } else {
+                        panel.update(cx, |panel, cx| {
+                            panel.external_thread(
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(AgentInitialContent::ContentBlock {
+                                    blocks: content_blocks,
+                                    auto_submit: true,
+                                }),
+                                true,
+                                AgentThreadSource::AgentPanel,
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                })
                 .register_action(
                     |workspace: &mut Workspace, _: &AddSelectionToThread, window, cx| {
                         let active_editor = workspace
@@ -618,6 +660,63 @@ fn conflict_resource_block(conflict: &ConflictContent) -> acp::ContentBlock {
             mention_uri.to_uri().to_string(),
         )),
     ))
+}
+
+/// Build the ACP prompt blocks for a browser design-mode submission: a
+/// human-readable request, the annotated screenshot, and the element's
+/// markup as embedded context. (FORK: browser_viewer 4.F)
+fn build_design_bundle_blocks(action: &SendDesignBundleToAgent) -> Vec<acp::ContentBlock> {
+    let mut text = String::new();
+    text.push_str(
+        "I'm reviewing the live page in the in-editor browser and want to change a \
+         specific element.\n\n",
+    );
+    if !action.prompt.is_empty() {
+        text.push_str("**Requested change**\n");
+        text.push_str(action.prompt.as_ref());
+        text.push_str("\n\n");
+    }
+    text.push_str("**Target element**\n");
+    text.push_str(&format!("- Page: {}\n", action.page_url));
+    text.push_str(&format!("- Selector: `{}`\n", action.selector));
+    if let Some(source) = action.source_hint.as_ref() {
+        text.push_str(&format!("- Source: {source}\n"));
+    }
+    if action.has_drawing {
+        text.push_str(
+            "\nThe attached screenshot shows the page with the selected element \
+             outlined and the user's freehand annotation drawn on top.\n",
+        );
+    } else {
+        text.push_str(
+            "\nThe attached screenshot shows the page with the selected element \
+             outlined.\n",
+        );
+    }
+
+    let mut blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
+
+    if !action.annotated_png_base64.is_empty() {
+        blocks.push(acp::ContentBlock::Image(
+            acp::ImageContent::new(
+                action.annotated_png_base64.to_string(),
+                "image/png".to_string(),
+            )
+            .uri(Some("zed:///agent/browser-design-screenshot.png".to_string())),
+        ));
+    }
+
+    if !action.outer_html.is_empty() {
+        let uri = format!("{}#selected-element", action.page_url);
+        blocks.push(acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
+                action.outer_html.to_string(),
+                uri,
+            )),
+        )));
+    }
+
+    blocks
 }
 
 fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::ContentBlock> {

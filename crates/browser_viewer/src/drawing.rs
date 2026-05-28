@@ -159,3 +159,190 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
         hue_to_rgb(h - 1.0 / 3.0),
     )
 }
+
+/// Windows-only: composite the design annotations (selected-element
+/// outline + freehand strokes) onto a page screenshot so the agent
+/// receives a single self-documenting image.
+///
+/// The design overlay's coordinates are in window-space *logical*
+/// pixels; the screenshot from WebView2 `CapturePreview` is in *device*
+/// pixels. We derive the scale from the decoded image dimensions vs.
+/// the logical viewport size, so no DPI query is needed.
+#[cfg(target_os = "windows")]
+mod annotate {
+    use super::{DrawingCanvas, Stroke, hsla_to_rgba};
+    use anyhow::{Context as _, Result};
+    use gpui::{Pixels, Point, Size};
+    use image::{ImageEncoder, Rgba, RgbaImage};
+
+    /// Byte budget for the dispatched PNG (AC-P4-4: screenshot <= 2 MB).
+    const MAX_PNG_BYTES: usize = 2 * 1024 * 1024;
+    /// Cap the longest edge so a 4K hi-DPI capture doesn't blow the budget.
+    const MAX_EDGE: u32 = 2000;
+    /// Outline color for the selected element — orange, pops on most pages.
+    const OUTLINE: Rgba<u8> = Rgba([255, 106, 0, 255]);
+
+    /// Decode `png`, draw the element outline (viewport-local CSS px) and
+    /// the freehand strokes (window-space logical px) onto it, and return
+    /// a re-encoded PNG no larger than [`MAX_PNG_BYTES`].
+    pub fn annotate_screenshot(
+        png: &[u8],
+        element_rect: Option<(f32, f32, f32, f32)>,
+        drawing: &DrawingCanvas,
+        viewport_origin: Point<Pixels>,
+        viewport_size: Size<Pixels>,
+    ) -> Result<Vec<u8>> {
+        let decoded = image::load_from_memory(png).context("decode screenshot png")?;
+        let mut img = decoded.to_rgba8();
+
+        // Pre-shrink very large captures before drawing so the
+        // annotations stay crisp relative to the final image.
+        if img.width().max(img.height()) > MAX_EDGE {
+            let (w, h) = scaled_dims(img.width(), img.height(), MAX_EDGE);
+            img = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
+        }
+
+        let vp_w = f32::from(viewport_size.width).max(1.0);
+        let vp_h = f32::from(viewport_size.height).max(1.0);
+        let scale_x = img.width() as f32 / vp_w;
+        let scale_y = img.height() as f32 / vp_h;
+
+        if let Some((rx, ry, rw, rh)) = element_rect {
+            let thickness = (2.5 * scale_y).round().max(2.0) as i32;
+            draw_rect_outline(
+                &mut img,
+                rx * scale_x,
+                ry * scale_y,
+                rw * scale_x,
+                rh * scale_y,
+                thickness,
+                OUTLINE,
+            );
+        }
+
+        let ox = f32::from(viewport_origin.x);
+        let oy = f32::from(viewport_origin.y);
+        for stroke in drawing.strokes.iter().chain(drawing.current.iter()) {
+            draw_stroke(&mut img, stroke, ox, oy, scale_x, scale_y);
+        }
+
+        encode_capped(img)
+    }
+
+    fn scaled_dims(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
+        if w >= h {
+            let nh = ((h as f32) * (max_edge as f32) / (w as f32)).round().max(1.0) as u32;
+            (max_edge, nh)
+        } else {
+            let nw = ((w as f32) * (max_edge as f32) / (h as f32)).round().max(1.0) as u32;
+            (nw, max_edge)
+        }
+    }
+
+    fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut buf)
+            .write_image(
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .context("encode annotated png")?;
+        Ok(buf)
+    }
+
+    fn encode_capped(mut img: RgbaImage) -> Result<Vec<u8>> {
+        for _ in 0..4 {
+            let buf = encode_png(&img)?;
+            if buf.len() <= MAX_PNG_BYTES || img.width() <= 320 || img.height() <= 320 {
+                return Ok(buf);
+            }
+            let w = (img.width() as f32 * 0.8).round().max(1.0) as u32;
+            let h = (img.height() as f32 * 0.8).round().max(1.0) as u32;
+            img = image::imageops::resize(&img, w, h, image::imageops::FilterType::Triangle);
+        }
+        encode_png(&img)
+    }
+
+    fn draw_stroke(img: &mut RgbaImage, stroke: &Stroke, ox: f32, oy: f32, sx: f32, sy: f32) {
+        if stroke.points.len() < 2 {
+            return;
+        }
+        let (r, g, b, a) = hsla_to_rgba(stroke.color);
+        let alpha = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let color = Rgba([r, g, b, alpha]);
+        let half = ((f32::from(stroke.width) * sy) / 2.0).round().max(1.0) as i32;
+        let mut prev: Option<(f32, f32)> = None;
+        for p in &stroke.points {
+            let x = (f32::from(p.x) - ox) * sx;
+            let y = (f32::from(p.y) - oy) * sy;
+            if let Some((px, py)) = prev {
+                draw_thick_line(img, px, py, x, y, half, color);
+            }
+            prev = Some((x, y));
+        }
+    }
+
+    fn draw_rect_outline(
+        img: &mut RgbaImage,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        thickness: i32,
+        color: Rgba<u8>,
+    ) {
+        let half = (thickness / 2).max(1);
+        draw_thick_line(img, x, y, x + w, y, half, color);
+        draw_thick_line(img, x, y + h, x + w, y + h, half, color);
+        draw_thick_line(img, x, y, x, y + h, half, color);
+        draw_thick_line(img, x + w, y, x + w, y + h, half, color);
+    }
+
+    fn draw_thick_line(
+        img: &mut RgbaImage,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        half: i32,
+        color: Rgba<u8>,
+    ) {
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as i32;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let cx = (x0 + dx * t).round() as i32;
+            let cy = (y0 + dy * t).round() as i32;
+            stamp(img, cx, cy, half, color);
+        }
+    }
+
+    fn stamp(img: &mut RgbaImage, cx: i32, cy: i32, half: i32, color: Rgba<u8>) {
+        let (w, h) = (img.width() as i32, img.height() as i32);
+        for yy in (cy - half)..=(cy + half) {
+            for xx in (cx - half)..=(cx + half) {
+                if xx >= 0 && yy >= 0 && xx < w && yy < h {
+                    blend_pixel(img.get_pixel_mut(xx as u32, yy as u32), color);
+                }
+            }
+        }
+    }
+
+    fn blend_pixel(dst: &mut Rgba<u8>, src: Rgba<u8>) {
+        let sa = src.0[3] as f32 / 255.0;
+        if sa >= 1.0 {
+            *dst = src;
+            return;
+        }
+        for i in 0..3 {
+            dst.0[i] = (src.0[i] as f32 * sa + dst.0[i] as f32 * (1.0 - sa)).round() as u8;
+        }
+        dst.0[3] = 255;
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub use annotate::annotate_screenshot;

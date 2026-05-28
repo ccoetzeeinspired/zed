@@ -1,8 +1,10 @@
 //! Design-mode submission bundle: everything captured when the user
-//! clicks "Submit" in the floating panel. Phase 4.E persists these to
-//! disk under `%TEMP%/zed-browser-design/<timestamp>/`; Phase 4.F (not
-//! yet shipped) will replace the disk write with an ACP dispatch into
-//! the agent panel.
+//! clicks "Submit" in the floating panel. As of Phase 4.F submit
+//! dispatches an ACP prompt into the claude-acp agent panel (see
+//! `BrowserView::on_design_submit`). `write_bundle` is retained as a
+//! debug-only fallback that persists the bundle to disk under
+//! `%TEMP%/zed-browser-design/<timestamp>/` when the
+//! `ZED_BROWSER_DESIGN_DEBUG_BUNDLE` environment variable is set.
 
 use anyhow::{Context as _, Result};
 use serde::Serialize;

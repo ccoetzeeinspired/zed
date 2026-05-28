@@ -159,8 +159,9 @@ go in `src/acp-agent.ts` and similar; use a comment marker like
 The motivating feature: render real Chromium pages inside a Zed tab via
 WebView2 in composition mode, with GPUI overlays (modals, popovers,
 freehand drawing) painting *above* the page, and a "design mode" that
-captures element + screenshot + scribbles + prompt and (eventually,
-phase 4.F) dispatches them through the claude-acp panel.
+captures element + screenshot + scribbles + prompt and dispatches
+them into the claude-acp agent panel as a multimodal prompt
+(phase 4.F — shipped; see the Design mode surface below).
 
 Full design lives in `plans/browser-viewer.md`. **Read it first**
 before touching any of the surfaces below — it documents the why for
@@ -272,6 +273,20 @@ diff and **will cause merge conflicts on upstream rebases:**
   `browser::OpenDevTools` / `browser::FocusAddressBar`.
 - `crates/zed/src/main.rs` and `Cargo.toml` — `browser_viewer` init
   + workspace member entry.
+- `crates/zed_actions/src/lib.rs` — `agent::SendDesignBundleToAgent`
+  action (the Phase 4.F dispatch payload). Leaf crate, low conflict
+  risk; re-add inside `mod agent` next to `ReviewBranchDiff`.
+- `crates/agent_ui/src/agent_panel.rs` — a `register_action` arm for
+  `SendDesignBundleToAgent` plus the `build_design_bundle_blocks`
+  helper. **This file churns heavily upstream.** The arm sits next to
+  the `ReviewBranchDiff` / `ResolveConflictsWithAgent` git arms in the
+  `init` `register_action` chain, and the helper next to
+  `build_conflict_resolution_prompt`. Both tagged
+  `// FORK: browser_viewer 4.F` — re-add on conflict.
+- `crates/browser_viewer/{Cargo.toml, src/browser_view.rs, src/drawing.rs}`
+  — new `zed_actions` / `base64` / `image` (png-only) deps, the dispatch
+  in `on_design_submit`, and the `annotate_screenshot` compositor.
+  Fork-owned crate, so these won't conflict.
 
 For rebases, search the diff for `FORK:` markers — most non-obvious
 changes are tagged. Where there's a clean re-insertion slot in an
@@ -288,11 +303,17 @@ collisions, prefer the fork's behaviour and re-read this section.
 - DevTools: Ctrl+Shift+I / F12 when a browser tab has focus.
 - Design mode: crosshair icon in address bar (or `browser: toggle
   design mode`). Click an element → floating "Describe the change"
-  panel anchored next to it. Submit → bundle written to
-  `%TEMP%\zed-browser-design\<unix-ms>\` (screenshot.png +
-  drawing.svg + bundle.json). **Phase 4.F (next-session priority)
-  will replace the disk write with an actual ACP dispatch into the
-  claude-acp panel — that's the loop-closing feature.**
+  panel anchored next to it. Submit → composites the selected-element
+  outline + freehand strokes onto the page screenshot, then dispatches
+  a `zed_actions::agent::SendDesignBundleToAgent` action carrying the
+  typed prompt, element context (selector, page URL, source file:line,
+  outerHTML) and the annotated PNG (base64, capped ≤2 MB). `agent_ui`
+  handles it: builds an ACP prompt (text + image + embedded-HTML
+  resource) and sends it into the claude-acp panel — continuing the
+  active thread if one is open, else opening a fresh one (so iterative
+  tweaks accumulate context). Set `ZED_BROWSER_DESIGN_DEBUG_BUNDLE=1`
+  to also dump the bundle to `%TEMP%\zed-browser-design\<unix-ms>\`
+  for debugging. (Phase 4.F — the loop-closing feature; shipped.)
 - Drawing mode: pencil icon → freehand strokes over the page; eraser
   icon clears.
 
@@ -302,8 +323,19 @@ collisions, prefer the fork's behaviour and re-read this section.
 - Multi-browser-tab in same pane — z-order glitch when switching
   between them; active tab's underlay needs reordering. Single-tab
   case (the dogfood path) works fine. Task #28.
-- ACP submission pipeline — design-mode bundle currently lands in
-  `%TEMP%` instead of the agent panel. Task #29 (highest priority).
+- ACP submission pipeline (Task #29) — **done & verified (Phase 4.F).**
+  Submit dispatches the bundle into the claude-acp panel and Claude
+  edits the targeted source (verified end-to-end against a Next.js dev
+  app). A required fix landed alongside: the design panel now calls
+  `.occlude()` so Submit/Cancel clicks don't leak through to the page
+  and re-select the next element (the panel sits over the WebView2
+  mouse-forwarding region; without occlude, GPUI fired both the button
+  click and the viewport's forward handler). Remaining polish: confirm
+  the element-outline lands exactly on the selected element on hi-DPI
+  pages; exercise the pencil-drawing composite path; and validate
+  reuse-active-thread vs new-thread in the wild. A per-browser-tab
+  "owned thread" model is a possible future refinement (deferred —
+  needs async thread-handle capture).
 
 ### `stubs/msvc_spectre_libs/` — build workaround
 
@@ -322,9 +354,21 @@ personal build, not appropriate to upstream.
 - An older out-of-tree target dir at `D:\zt\` exists from a previous
   shell session that had `CARGO_TARGET_DIR=D:\zt` set. **Don't run
   binaries from `D:\zt\` — they're stale.** Safe to delete the whole
-  `D:\zt\` tree to reclaim ~16 GB. The current shell has no
-  `CARGO_TARGET_DIR` set and no project `.cargo/config.toml`
-  override, so cargo uses the in-tree default.
+  `D:\zt\` tree to reclaim ~16 GB. No `CARGO_TARGET_DIR` is set, so
+  cargo uses the in-tree default `target/`.
+- **Always run cargo from `D:\src\zed` (the project dir) — never from
+  a parent like `D:\` with `--manifest-path`.** Cargo resolves both
+  `.cargo/config.toml` and `rust-toolchain.toml` from the *current
+  directory*, not the manifest path. Running from elsewhere silently
+  drops both, with two non-obvious failure modes: (1) you get the
+  default toolchain instead of the pinned `1.95.0`, surfacing as a
+  spurious `error[E0658]: use of unstable library feature 'cfg_select'`
+  in `crates/client`; (2) you lose the `target-feature=+crt-static`
+  from `.cargo/config.toml`'s `[target.'cfg(target_os = "windows")']`
+  block, surfacing as `LNK1169: one or more multiply defined symbols`
+  at the final link (the static-CRT `webrtc_sys`/livekit objects clash
+  with the dynamic CRT). That crt-static flag is load-bearing for
+  linking on Windows.
 - Runtime dependency: poppler's `pdftoppm.exe`. Install via
   `winget install oschwartz10612.Poppler`, or ensure it's on PATH.
 

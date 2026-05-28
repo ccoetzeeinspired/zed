@@ -868,7 +868,7 @@ impl Render for BrowserView {
                 div()
                     .absolute()
                     .inset_0()
-                    .child(DrawingPaintElement::new(item.clone())),
+                    .child(DrawingPaintElement::new(item)),
             );
         }
         if drawing_on {
@@ -945,6 +945,7 @@ impl BrowserView {
             .unwrap_or_else(|| selection.selector.clone());
 
         let panel = div()
+            .occlude()
             .w(px(340.))
             .p_2()
             .bg(theme.elevated_surface_background)
@@ -1028,13 +1029,15 @@ impl BrowserView {
 
     #[cfg(target_os = "windows")]
     fn on_design_submit(&mut self, selector: &str, window: &mut Window, cx: &mut Context<Self>) {
+        use base64::Engine as _;
+
         let prompt_text = self.design_prompt_editor.read(cx).text(cx);
         let selector_owned = selector.to_string();
 
         // Snapshot everything the bundle needs *now*, before the
         // async screenshot completes — `BrowserItem.design_selection`
         // may be cleared by the user before the callback fires.
-        let (outer_html, source, strokes_svg, viewport_origin, viewport_size, page_url) = {
+        let (outer_html, source, drawing_snapshot, element_rect, viewport_origin, viewport_size, page_url) = {
             let item = self.item.read(cx);
             let Some(sel) = item.design_selection.as_ref() else {
                 log::warn!("browser_viewer: submit fired without a selection");
@@ -1044,19 +1047,28 @@ impl BrowserView {
             (
                 sel.outer_html.clone(),
                 sel.source.clone(),
-                item.drawing.to_svg(bounds.origin, bounds.size),
+                item.drawing.clone(),
+                (sel.rect.x, sel.rect.y, sel.rect.w, sel.rect.h),
                 bounds.origin,
                 bounds.size,
                 item.url.to_string(),
             )
         };
-        let _ = (viewport_origin, viewport_size); // packaged into svg already
+        let has_drawing = !drawing_snapshot.is_empty();
+        // "file:line" hint when the page script detected a React source.
+        let source_hint = source.as_ref().and_then(|s| {
+            s.file_name.as_ref().map(|f| match s.line_number {
+                Some(line) => format!("{f}:{line}"),
+                None => f.clone(),
+            })
+        });
 
         // Capture is async — the PNG arrives on the GPUI foreground
-        // thread via this oneshot. We chain into a foreground task
-        // that writes the bundle to a per-submit temp dir and logs
-        // the path. 4.F will replace the temp-dir write with an ACP
-        // dispatch into the agent panel.
+        // thread via this oneshot. We then composite the design
+        // annotations onto it, base64-encode it, and dispatch a
+        // `SendDesignBundleToAgent` action that the agent panel turns
+        // into a claude-acp prompt (4.F). The `write_bundle` to %TEMP%
+        // remains a debug-only fallback gated on an env var.
         let (tx, rx) = futures::channel::oneshot::channel::<anyhow::Result<Vec<u8>>>();
         let mut tx_slot = Some(tx);
         let dispatch = move |result: anyhow::Result<Vec<u8>>| {
@@ -1081,13 +1093,7 @@ impl BrowserView {
             return;
         }
 
-        let prompt_for_task = prompt_text.clone();
-        let selector_for_task = selector_owned.clone();
-        let outer_html_for_task = outer_html.clone();
-        let source_for_task = source.clone();
-        let strokes_svg_for_task = strokes_svg.clone();
-        let page_url_for_task = page_url.clone();
-        cx.spawn(async move |_view, _cx| {
+        cx.spawn_in(window, async move |view, cx| {
             let png = match rx.await {
                 Ok(Ok(bytes)) => bytes,
                 Ok(Err(err)) => {
@@ -1099,27 +1105,83 @@ impl BrowserView {
                     return;
                 }
             };
-            let bundle = crate::bundle::DesignBundle {
-                prompt: prompt_for_task,
-                selector: selector_for_task,
-                outer_html: outer_html_for_task,
-                source: source_for_task,
-                drawing_svg: strokes_svg_for_task,
-                page_url: page_url_for_task,
-                screenshot_png: png,
+
+            // Composite the element outline + freehand strokes onto the
+            // capture, off the UI thread.
+            let annotated = {
+                let png = png.clone();
+                let drawing = drawing_snapshot.clone();
+                cx.background_spawn(async move {
+                    crate::drawing::annotate_screenshot(
+                        &png,
+                        Some(element_rect),
+                        &drawing,
+                        viewport_origin,
+                        viewport_size,
+                    )
+                })
+                .await
             };
-            match crate::bundle::write_bundle(&bundle) {
-                Ok(dir) => {
-                    log::info!(
-                        "browser_viewer: design bundle written to {} ({} bytes screenshot)",
-                        dir.display(),
-                        bundle.screenshot_png.len()
-                    );
-                }
+            let annotated_png = match annotated {
+                Ok(bytes) => bytes,
                 Err(err) => {
-                    log::warn!("browser_viewer: failed to persist bundle: {err:?}");
+                    log::warn!("browser_viewer: annotate failed, sending raw capture: {err:?}");
+                    png
+                }
+            };
+
+            // Debug-only fallback: persist the bundle to %TEMP%.
+            if std::env::var_os("ZED_BROWSER_DESIGN_DEBUG_BUNDLE").is_some() {
+                let bundle = crate::bundle::DesignBundle {
+                    prompt: prompt_text.clone(),
+                    selector: selector_owned.clone(),
+                    outer_html: outer_html.clone(),
+                    source: source.clone(),
+                    drawing_svg: drawing_snapshot.to_svg(viewport_origin, viewport_size),
+                    page_url: page_url.clone(),
+                    screenshot_png: annotated_png.clone(),
+                };
+                match crate::bundle::write_bundle(&bundle) {
+                    Ok(dir) => log::info!(
+                        "browser_viewer: [fork-debug] design bundle written to {}",
+                        dir.display()
+                    ),
+                    Err(err) => log::warn!(
+                        "browser_viewer: [fork-debug] failed to persist bundle: {err:?}"
+                    ),
                 }
             }
+
+            let annotated_png_base64 =
+                base64::engine::general_purpose::STANDARD.encode(&annotated_png);
+            log::info!(
+                "browser_viewer: [fork-debug] dispatching design bundle to agent — \
+                 selector={}, png={} bytes ({} b64 chars), has_drawing={}, source={:?}",
+                selector_owned,
+                annotated_png.len(),
+                annotated_png_base64.len(),
+                has_drawing,
+                source_hint,
+            );
+
+            let action = zed_actions::agent::SendDesignBundleToAgent {
+                prompt: prompt_text.into(),
+                selector: selector_owned.into(),
+                page_url: page_url.into(),
+                outer_html: outer_html.into(),
+                source_hint: source_hint.map(Into::into),
+                annotated_png_base64: annotated_png_base64.into(),
+                has_drawing,
+            };
+
+            let _ = view.update_in(cx, |this, window, cx| {
+                window.dispatch_action(Box::new(action), cx);
+                // The drawing has been consumed into the dispatched image.
+                this.item.update(cx, |item, cx| {
+                    item.drawing.clear();
+                    cx.notify();
+                });
+            });
         })
         .detach();
 
