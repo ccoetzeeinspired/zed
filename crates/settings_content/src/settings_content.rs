@@ -247,6 +247,9 @@ pub struct SettingsContent {
     /// Settings for the which-key popup.
     pub which_key: Option<WhichKeySettingsContent>,
 
+    /// Settings for the in-editor browser tab (Windows only).
+    pub browser: Option<BrowserSettingsContent>,
+
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
 
@@ -1232,6 +1235,25 @@ pub struct ReplSettingsContent {
     ///
     /// Default: 0
     pub output_max_height_lines: Option<usize>,
+}
+
+/// Settings for the in-editor browser tab (fork-only; Windows-only).
+///
+/// All fields are optional in the on-disk JSON and resolved to defaults
+/// in `assets/settings/default.json`. The crate that consumes these is
+/// `crates/browser_viewer`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct BrowserSettingsContent {
+    /// URL the `browser: new tab` action opens.
+    ///
+    /// Default: "https://example.com"
+    pub homepage: Option<String>,
+    /// URL template used when address-bar input doesn't look like a URL.
+    /// The literal substring `{query}` is replaced with the form-encoded
+    /// query. If absent, the bar falls back to a Google search.
+    ///
+    /// Default: "https://www.google.com/search?q={query}"
+    pub search_url: Option<String>,
 }
 
 /// Settings for configuring the which-key popup behaviour.

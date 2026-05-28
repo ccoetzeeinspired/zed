@@ -8,44 +8,42 @@
 //! cross-compiles cleanly.
 
 use gpui::{App, actions};
+use settings::Settings as _;
 use ui::SharedString;
 use workspace::Workspace;
 
+pub mod browser_settings;
 pub mod browser_view;
 
 #[cfg(target_os = "windows")]
 mod webview2_host;
 
+pub use browser_settings::BrowserSettings;
 pub use browser_view::{BrowserItem, BrowserView, open_new_tab};
 
 actions!(
     browser,
     [
-        /// Open a new browser tab navigating to the default URL.
+        /// Open a new browser tab navigating to the configured homepage.
         NewTab
     ]
 );
 
-/// Default URL the `NewTab` action opens. Real configurable homepage lands
-/// in Phase 1.B settings; for now this proves end-to-end navigation.
-const DEFAULT_NEW_TAB_URL: &str = "https://example.com";
-
 /// Register the browser-viewer feature with the application.
 pub fn init(cx: &mut App) {
+    BrowserSettings::register(cx);
     #[cfg(target_os = "windows")]
     {
         cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-            workspace.register_action(
-                |workspace, _: &NewTab, window, cx| {
-                    open_new_tab(workspace, SharedString::new(DEFAULT_NEW_TAB_URL), window, cx);
-                },
-            );
+            workspace.register_action(|workspace, _: &NewTab, window, cx| {
+                let homepage = BrowserSettings::get_global(cx).homepage.clone();
+                open_new_tab(workspace, SharedString::new(homepage), window, cx);
+            });
         })
         .detach();
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = cx;
         log::info!("browser_viewer: skipping init (not supported on this platform)");
     }
 }

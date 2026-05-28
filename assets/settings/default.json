@@ -2538,6 +2538,15 @@
       "insert": "inherit",
     },
   },
+  // In-editor browser tab (fork-only; Windows-only).
+  "browser": {
+    // URL the `browser: new tab` action opens.
+    "homepage": "https://example.com",
+    // URL template for address-bar input that doesn't parse as a URL.
+    // The literal substring "{query}" is replaced with the form-encoded
+    // search query.
+    "search_url": "https://www.google.com/search?q={query}"
+  },
   // Which-key popup settings
   "which_key": {
     // Whether to show the which-key popup when holding down key combinations.

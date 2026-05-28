@@ -262,8 +262,10 @@ impl BrowserView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        use settings::Settings as _;
         let input = self.url_editor.read(cx).text(cx);
-        let target = parse_address_bar_input(&input);
+        let search_url = crate::BrowserSettings::get_global(cx).search_url.clone();
+        let target = parse_address_bar_input(&input, &search_url);
         #[cfg(target_os = "windows")]
         self.navigate_to(target, cx);
         #[cfg(not(target_os = "windows"))]
@@ -1090,8 +1092,9 @@ pub fn open_new_tab(
 
 /// Best-effort parsing of address-bar input: if it parses as a URL with a
 /// scheme, use as-is; if it looks like a host (contains a `.` and no spaces),
-/// prepend `https://`; otherwise treat as a Google search query.
-fn parse_address_bar_input(input: &str) -> String {
+/// prepend `https://`; otherwise treat as a search query against
+/// `search_url_template` (with `{query}` substituted).
+fn parse_address_bar_input(input: &str, search_url_template: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return "about:blank".to_string();
@@ -1125,7 +1128,13 @@ fn parse_address_bar_input(input: &str) -> String {
     }
     // Fall through to search.
     let encoded = url_encode_query(trimmed);
-    format!("https://www.google.com/search?q={encoded}")
+    if search_url_template.contains("{query}") {
+        search_url_template.replace("{query}", &encoded)
+    } else {
+        // Template without `{query}` — append as a query parameter so the
+        // user still gets a search rather than navigating to the bare URL.
+        format!("{search_url_template}{encoded}")
+    }
 }
 
 /// Tiny URL form-encoder for the search-query fallback. Replaces spaces

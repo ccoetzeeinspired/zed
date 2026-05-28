@@ -221,6 +221,7 @@ impl VsCodeSettings {
             vim_mode: None,
             workspace: self.workspace_settings_content(),
             which_key: None,
+            browser: None,
             modeline_lines: None,
             feature_flags: None,
             instrumentation: None,
