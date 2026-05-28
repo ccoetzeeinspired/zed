@@ -131,6 +131,19 @@ impl WebView2Session {
     /// local space (origin at the visual's top-left). `mouse_data` carries
     /// the wheel delta for wheel events (signed WHEEL_DELTA units), 0
     /// otherwise.
+    /// Show or hide the WebView. Hidden WebViews still hold their
+    /// composition visual in the DComp tree, but the controller stops
+    /// painting into it, so the inactive tab's contents don't bleed
+    /// through when a sibling tab is active.
+    pub fn set_visible(&self, visible: bool) -> Result<()> {
+        unsafe {
+            self.controller
+                .SetIsVisible(visible.into())
+                .map_err(|err| anyhow!("controller.SetIsVisible({visible}): {err}"))?;
+        }
+        Ok(())
+    }
+
     pub fn send_mouse_input(
         &self,
         kind: COREWEBVIEW2_MOUSE_EVENT_KIND,

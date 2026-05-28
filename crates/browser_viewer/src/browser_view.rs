@@ -25,7 +25,7 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NavigationDirection, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    Style, Window, div, relative, size,
+    Style, WeakEntity, Window, div, relative, size,
 };
 use ui::Tooltip;
 use ui::prelude::*;
@@ -37,6 +37,7 @@ use workspace::{
 #[cfg(target_os = "windows")]
 mod windows_imports {
     pub use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    pub use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     pub use webview2_com::Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_MOUSE_EVENT_KIND, COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
         COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK,
@@ -91,6 +92,11 @@ pub struct BrowserItem {
     /// `session`. Prevents re-triggering init on every prepaint.
     init_started: bool,
     last_bounds: Option<Bounds<Pixels>>,
+    /// Tracks whether the WebView is currently shown. Mirrors the last
+    /// value passed to `controller.SetIsVisible`. Drives Phase 1.E
+    /// tab-switch hide/show so an inactive browser tab's contents don't
+    /// bleed through behind the active tab in the same pane.
+    is_visible: bool,
 }
 
 impl BrowserItem {
@@ -105,6 +111,7 @@ impl BrowserItem {
             session: None,
             init_started: false,
             last_bounds: None,
+            is_visible: true,
         }
     }
 
@@ -144,6 +151,16 @@ pub struct BrowserView {
     item: Entity<BrowserItem>,
     focus_handle: FocusHandle,
     url_editor: Entity<Editor>,
+    /// Weak ref to the owning workspace, set in `added_to_workspace`.
+    /// Used to query `has_active_modal()` so the browser visual can hide
+    /// while a modal (command palette, file finder, etc.) is open —
+    /// otherwise it draws on top of every GPUI-rendered overlay because
+    /// WebView2's DComp visual sits above the Zed swap chain in the
+    /// composition tree.
+    workspace: Option<WeakEntity<Workspace>>,
+    /// Cached "is a modal currently open" so we only call `SetIsVisible`
+    /// when the state actually changes.
+    modal_open: bool,
 }
 
 impl BrowserView {
@@ -169,6 +186,8 @@ impl BrowserView {
             item,
             focus_handle: cx.focus_handle(),
             url_editor,
+            workspace: None,
+            modal_open: false,
         }
     }
 
@@ -256,23 +275,33 @@ impl BrowserView {
         root.on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                window.focus(&this.focus_handle, cx);
+                // Deliberately do NOT call `window.focus(&this.focus_handle, cx)`
+                // here. Doing so retargets the keymap context chain to
+                // `BrowserView`, but the `key_context("BrowserView")` we set
+                // doesn't inherit the Workspace bindings the way we expected —
+                // and Ctrl+Shift+P / Ctrl+P stop dispatching as a result.
+                // Until proper Phase 3 keyboard wiring (host-HWND subclass +
+                // SendKeyboardInput on a newer SDK) lets the page have real
+                // input focus, keeping Zed's existing focus untouched is the
+                // right call: page keyboard doesn't work either way, and the
+                // command palette / file finder stay reachable.
                 let kind = if ev.click_count >= 2 {
                     COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK
                 } else {
                     COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN
                 };
                 let vk = virtual_keys(&ev.modifiers, Some(MouseButton::Left));
-                forward_mouse_event(this, cx, ev.position, kind, vk, 0);
+                forward_mouse_event(this, cx, window, ev.position, kind, vk, 0);
             }),
         )
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+            cx.listener(|this, ev: &MouseUpEvent, window, cx| {
                 let vk = virtual_keys(&ev.modifiers, None);
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
                     vk,
@@ -282,23 +311,24 @@ impl BrowserView {
         )
         .on_mouse_down(
             MouseButton::Middle,
-            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 let kind = if ev.click_count >= 2 {
                     COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOUBLE_CLICK
                 } else {
                     COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN
                 };
                 let vk = virtual_keys(&ev.modifiers, Some(MouseButton::Middle));
-                forward_mouse_event(this, cx, ev.position, kind, vk, 0);
+                forward_mouse_event(this, cx, window, ev.position, kind, vk, 0);
             }),
         )
         .on_mouse_up(
             MouseButton::Middle,
-            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+            cx.listener(|this, ev: &MouseUpEvent, window, cx| {
                 let vk = virtual_keys(&ev.modifiers, None);
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP,
                     vk,
@@ -308,23 +338,24 @@ impl BrowserView {
         )
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 let kind = if ev.click_count >= 2 {
                     COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOUBLE_CLICK
                 } else {
                     COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOWN
                 };
                 let vk = virtual_keys(&ev.modifiers, Some(MouseButton::Right));
-                forward_mouse_event(this, cx, ev.position, kind, vk, 0);
+                forward_mouse_event(this, cx, window, ev.position, kind, vk, 0);
             }),
         )
         .on_mouse_up(
             MouseButton::Right,
-            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+            cx.listener(|this, ev: &MouseUpEvent, window, cx| {
                 let vk = virtual_keys(&ev.modifiers, None);
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_UP,
                     vk,
@@ -342,11 +373,12 @@ impl BrowserView {
         // browser becoming unresponsive.
         .on_mouse_down(
             MouseButton::Navigate(NavigationDirection::Back),
-            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 let vk = virtual_keys(&ev.modifiers, Some(ev.button));
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN,
                     vk,
@@ -357,11 +389,12 @@ impl BrowserView {
         )
         .on_mouse_up(
             MouseButton::Navigate(NavigationDirection::Back),
-            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+            cx.listener(|this, ev: &MouseUpEvent, window, cx| {
                 let vk = virtual_keys(&ev.modifiers, None);
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP,
                     vk,
@@ -372,11 +405,12 @@ impl BrowserView {
         )
         .on_mouse_down(
             MouseButton::Navigate(NavigationDirection::Forward),
-            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 let vk = virtual_keys(&ev.modifiers, Some(ev.button));
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN,
                     vk,
@@ -387,11 +421,12 @@ impl BrowserView {
         )
         .on_mouse_up(
             MouseButton::Navigate(NavigationDirection::Forward),
-            cx.listener(|this, ev: &MouseUpEvent, _, cx| {
+            cx.listener(|this, ev: &MouseUpEvent, window, cx| {
                 let vk = virtual_keys(&ev.modifiers, None);
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP,
                     vk,
@@ -400,18 +435,19 @@ impl BrowserView {
                 cx.stop_propagation();
             }),
         )
-        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
             let vk = virtual_keys(&ev.modifiers, ev.pressed_button);
             forward_mouse_event(
                 this,
                 cx,
+                window,
                 ev.position,
                 COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
                 vk,
                 0,
             );
         }))
-        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, cx| {
             let (delta_x, delta_y) = match ev.delta {
                 ScrollDelta::Lines(p) => (p.x * WHEEL_DELTA, p.y * WHEEL_DELTA),
                 ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
@@ -427,6 +463,7 @@ impl BrowserView {
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
                     vk,
@@ -438,6 +475,7 @@ impl BrowserView {
                 forward_mouse_event(
                     this,
                     cx,
+                    window,
                     ev.position,
                     COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
                     vk,
@@ -479,6 +517,7 @@ fn virtual_keys(
 fn forward_mouse_event(
     view: &mut BrowserView,
     cx: &mut Context<BrowserView>,
+    window: &mut Window,
     position: Point<Pixels>,
     kind: COREWEBVIEW2_MOUSE_EVENT_KIND,
     vk: COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS,
@@ -497,6 +536,22 @@ fn forward_mouse_event(
             log::debug!("send_mouse_input failed: {err}");
         }
     });
+
+    // WebView2, even in composition mode, creates internal child HWNDs
+    // and shifts Win32 keyboard focus to one of them on mouse-down. From
+    // then on, `GetMessageW` delivers WM_KEYDOWN to the WebView2 HWND
+    // (which knows nothing about gpui_windows' WM_GPUI_KEYDOWN
+    // accelerator translation), so global shortcuts like Ctrl+Shift+P
+    // and Ctrl+P stop reaching Zed. Re-assert Win32 focus on the host
+    // HWND so the message pump keeps routing keystrokes to GPUI.
+    // Side-effect-neutral until Phase 3: the page wouldn't receive
+    // keystrokes either way, since we don't forward via
+    // `SendKeyboardInput`.
+    if let Some(hwnd) = hwnd_from_window(window) {
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
 }
 
 impl EventEmitter<BrowserViewEvent> for BrowserView {}
@@ -509,6 +564,36 @@ impl Focusable for BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Render runs only when this tab is the active item in its pane,
+        // so reaching here is the "activation" signal — sync visibility
+        // against the current modal state (which can have changed while
+        // this tab was inactive, or which was the original reason for
+        // hiding). `deactivated` handles the symmetric "going inactive"
+        // path.
+        #[cfg(target_os = "windows")]
+        {
+            let workspace = self.workspace.as_ref().and_then(|w| w.upgrade());
+            let modal_open = workspace
+                .map(|w| w.update(cx, |ws, cx| ws.has_active_modal(window, cx)))
+                .unwrap_or(false);
+            let desired_visible = !modal_open;
+            let needs_change = self.item.read(cx).is_visible != desired_visible
+                || self.modal_open != modal_open;
+            if needs_change {
+                self.modal_open = modal_open;
+                self.item.update(cx, |item, _| {
+                    if let Some(session) = &item.session {
+                        if let Err(err) = session.set_visible(desired_visible) {
+                            log::warn!(
+                                "BrowserItem: render set_visible({desired_visible}) failed: {err:?}"
+                            );
+                        }
+                    }
+                    item.is_visible = desired_visible;
+                });
+            }
+        }
+
         // Sync the address bar editor text from the model when (a) the model
         // URL has changed and (b) the user isn't typing into the input.
         let model_url = self.item.read(cx).url.clone();
@@ -657,6 +742,55 @@ impl Item for BrowserView {
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         Some(self.item.read(cx).url().clone())
+    }
+
+    /// Capture a weak ref to the workspace + subscribe so we re-render
+    /// across modal open/close transitions. Workspace re-emits the
+    /// modal-open event from its `ModalLayer`; there is no `ModalClosed`
+    /// event, but `ModalLayer::hide_modal` calls `cx.notify()`, which the
+    /// `cx.observe(&workspace)` subscription picks up — so the same
+    /// re-render path handles both transitions.
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = workspace.weak_handle();
+        self.workspace = Some(weak.clone());
+        if let Some(entity) = weak.upgrade() {
+            cx.subscribe(&entity, |_, _, event: &workspace::Event, cx| {
+                if matches!(event, workspace::Event::ModalOpened) {
+                    cx.notify();
+                }
+            })
+            .detach();
+            cx.observe(&entity, |_, _, cx| {
+                cx.notify();
+            })
+            .detach();
+        }
+    }
+
+    /// Called by `workspace::pane` when this item stops being the active
+    /// item in its pane. Hide the WebView so its composition visual stops
+    /// painting — otherwise the inactive tab's contents show through
+    /// behind the newly active tab in the same pane.
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "windows")]
+        self.item.update(cx, |item, _| {
+            if !item.is_visible {
+                return;
+            }
+            if let Some(session) = &item.session {
+                if let Err(err) = session.set_visible(false) {
+                    log::warn!("BrowserItem: set_visible(false) failed: {err:?}");
+                }
+            }
+            item.is_visible = false;
+        });
+        #[cfg(not(target_os = "windows"))]
+        let _ = cx;
     }
 }
 
