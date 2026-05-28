@@ -605,6 +605,17 @@
       "ctrl-g": "go_to_line::Toggle",
     },
   },
+  // FORK: in-editor browser tab. Scoped to BrowserView so the Editor
+  // bindings for the same keys (edit_prediction::ToggleMenu on
+  // ctrl-shift-i, editor::GoToDefinition on f12) still win elsewhere.
+  {
+    "context": "BrowserView",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-shift-i": "browser::OpenDevTools",
+      "f12": "browser::OpenDevTools",
+    },
+  },
   {
     "context": "Workspace",
     "use_key_equivalents": true,

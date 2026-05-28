@@ -256,6 +256,26 @@ impl BrowserView {
         });
     }
 
+    fn on_open_devtools(
+        &mut self,
+        _: &crate::OpenDevTools,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "windows")]
+        self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                unsafe {
+                    if let Err(err) = session.webview.OpenDevToolsWindow() {
+                        log::warn!("browser_viewer: OpenDevToolsWindow failed: {err}");
+                    }
+                }
+            }
+        });
+        #[cfg(not(target_os = "windows"))]
+        let _ = cx;
+    }
+
     fn on_submit_url(
         &mut self,
         _: &menu::Confirm,
@@ -629,6 +649,7 @@ impl Render for BrowserView {
             .track_focus(&self.focus_handle)
             .key_context("BrowserView")
             .on_action(cx.listener(Self::on_submit_url))
+            .on_action(cx.listener(Self::on_open_devtools))
             .size_full()
             .child(self.render_address_bar(can_back, can_fwd, is_loading, cx))
             .child(viewport)

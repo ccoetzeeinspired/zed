@@ -25,7 +25,9 @@ actions!(
     browser,
     [
         /// Open a new browser tab navigating to the configured homepage.
-        NewTab
+        NewTab,
+        /// Open WebView2 DevTools on the active browser tab.
+        OpenDevTools
     ]
 );
 
