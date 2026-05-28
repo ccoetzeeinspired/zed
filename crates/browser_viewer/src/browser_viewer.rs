@@ -14,7 +14,12 @@ use workspace::Workspace;
 
 pub mod browser_settings;
 pub mod browser_view;
+pub mod bundle;
+pub mod design;
+pub mod drawing;
 
+#[cfg(target_os = "windows")]
+mod design_mode_script;
 #[cfg(target_os = "windows")]
 mod webview2_host;
 
@@ -29,7 +34,13 @@ actions!(
         /// Open WebView2 DevTools on the active browser tab.
         OpenDevTools,
         /// Focus the address bar (Ctrl+L convention from real browsers).
-        FocusAddressBar
+        FocusAddressBar,
+        /// Toggle design mode on the active browser tab.
+        ToggleDesignMode,
+        /// Toggle drawing mode — freehand strokes over the page.
+        ToggleDrawingMode,
+        /// Clear all drawn strokes on the active browser tab.
+        ClearDrawing
     ]
 );
 

@@ -23,17 +23,17 @@ use anyhow::{Result, anyhow};
 use futures::channel::mpsc;
 use gpui_windows::HostedVisual;
 use webview2_com::{
-    CallDevToolsProtocolMethodCompletedHandler,
-    CreateCoreWebView2CompositionControllerCompletedHandler,
+    AddScriptToExecuteOnDocumentCreatedCompletedHandler, CallDevToolsProtocolMethodCompletedHandler,
+    CapturePreviewCompletedHandler, CreateCoreWebView2CompositionControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
     HistoryChangedEventHandler,
     Microsoft::Web::WebView2::Win32::{
-        COREWEBVIEW2_MOUSE_EVENT_KIND, COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS,
-        CreateCoreWebView2Environment, ICoreWebView2, ICoreWebView2CompositionController,
-        ICoreWebView2Controller, ICoreWebView2Environment3,
+        COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, COREWEBVIEW2_MOUSE_EVENT_KIND,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS, CreateCoreWebView2Environment, ICoreWebView2,
+        ICoreWebView2CompositionController, ICoreWebView2Controller, ICoreWebView2Environment3,
     },
     NavigationCompletedEventHandler, NavigationStartingEventHandler, SourceChangedEventHandler,
-    take_pwstr,
+    WebMessageReceivedEventHandler, take_pwstr,
 };
 use windows::{
     Win32::Foundation::{HWND, POINT, RECT},
@@ -59,6 +59,11 @@ pub(crate) enum NavigationEvent {
     NavigationStarting,
     /// Top-level navigation finished, successfully or not.
     NavigationCompleted { is_success: bool },
+    /// Phase 4: a Design-mode JSON message arrived from the injected
+    /// script. The raw JSON string is passed through unparsed — the
+    /// BrowserItem layer owns the shape so this module doesn't need
+    /// to know the protocol.
+    DesignModeMessage(String),
 }
 
 /// Tokens returned by `add_*` handlers, kept so we can `remove_*` on drop.
@@ -69,6 +74,7 @@ struct EventTokens {
     history: Option<i64>,
     navigation_starting: Option<i64>,
     navigation_completed: Option<i64>,
+    web_message: Option<i64>,
 }
 
 pub(crate) struct WebView2Session {
@@ -132,6 +138,68 @@ impl WebView2Session {
     /// local space (origin at the visual's top-left). `mouse_data` carries
     /// the wheel delta for wheel events (signed WHEEL_DELTA units), 0
     /// otherwise.
+    /// Phase 4.E: capture a PNG screenshot of the page via
+    /// `CapturePreview`. The PNG bytes land in `on_done` on the GPUI
+    /// foreground thread. Implemented over `IStream` backed by
+    /// `HGLOBAL` (Windows-managed memory buffer): we allocate the
+    /// stream, hand it to WebView2, and on completion `Seek` it back
+    /// to start + `Read` the full payload.
+    pub fn capture_preview_png(
+        &self,
+        on_done: Box<dyn FnOnce(Result<Vec<u8>>) + 'static>,
+    ) -> Result<()> {
+        use windows::Win32::Foundation::HGLOBAL;
+        use windows::Win32::System::Com::{IStream, STREAM_SEEK_SET};
+        use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
+        // Stream takes ownership of the HGLOBAL — pass null + true
+        // for `fdeleteonrelease` so Windows frees it when the stream
+        // refcount hits zero.
+        let stream: IStream = unsafe {
+            CreateStreamOnHGlobal(HGLOBAL(std::ptr::null_mut()), true)
+                .map_err(|e| anyhow!("CreateStreamOnHGlobal: {e}"))?
+        };
+        let stream_for_handler = stream.clone();
+        let mut done_slot: Option<Box<dyn FnOnce(Result<Vec<u8>>) + 'static>> = Some(on_done);
+        let handler = CapturePreviewCompletedHandler::create(Box::new(move |hr| {
+            let on_done = done_slot
+                .take()
+                .expect("CapturePreviewCompletedHandler called twice");
+            if let Err(err) = hr {
+                on_done(Err(anyhow!("CapturePreview failed: {err}")));
+                return Ok(());
+            }
+            let result = read_stream_to_vec(&stream_for_handler);
+            on_done(result);
+            Ok(())
+        }));
+        unsafe {
+            self.webview
+                .CapturePreview(
+                    COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                    &stream,
+                    &handler,
+                )
+                .map_err(|err| anyhow!("CapturePreview: {err}"))?;
+        }
+        // Pre-seek not needed before CapturePreview; the seek happens
+        // in the handler before reading.
+        let _ = STREAM_SEEK_SET;
+        Ok(())
+    }
+
+    /// Post a string message to the page via `PostWebMessageAsString`.
+    /// The design-mode script listens for `"activate"`, `"deactivate"`,
+    /// and `"clear_selection"`.
+    pub fn post_message_string(&self, msg: &str) -> Result<()> {
+        let msg_h = HSTRING::from(msg);
+        unsafe {
+            self.webview
+                .PostWebMessageAsString(PCWSTR(msg_h.as_ptr()))
+                .map_err(|err| anyhow!("PostWebMessageAsString: {err}"))?;
+        }
+        Ok(())
+    }
+
     /// Send a `Input.dispatchKeyEvent` over the WebView2 CDP channel.
     /// Phase 3 uses CDP for keyboard because
     /// `ICoreWebView2CompositionController` has no public
@@ -233,6 +301,9 @@ impl Drop for WebView2Session {
             if let Some(t) = self.event_tokens.navigation_completed.take() {
                 let _ = self.webview.remove_NavigationCompleted(t);
             }
+            if let Some(t) = self.event_tokens.web_message.take() {
+                let _ = self.webview.remove_WebMessageReceived(t);
+            }
             if let Err(err) = self.controller.Close() {
                 log::warn!("WebView2Session: controller.Close() failed: {err}");
             }
@@ -332,7 +403,7 @@ fn register_navigation_events(
     tokens.navigation_starting = Some(token);
 
     // --- Navigation completed ----------------------------------------
-    let tx = events_tx;
+    let tx = events_tx.clone();
     let handler = NavigationCompletedEventHandler::create(Box::new(move |_, args| {
         let is_success = args
             .as_ref()
@@ -353,7 +424,66 @@ fn register_navigation_events(
     }
     tokens.navigation_completed = Some(token);
 
+    // --- Design-mode JS messages (Phase 4) ----------------------------
+    // The injected `design_mode_script` posts JSON strings via
+    // `chrome.webview.postMessage`. We pull the raw string out via
+    // `TryGetWebMessageAsString` (works for any string the page sends,
+    // including JSON.stringify output) and forward it to the host
+    // unparsed — BrowserItem owns the protocol shape.
+    let tx = events_tx;
+    let handler = WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            let mut msg = PWSTR::null();
+            unsafe {
+                if args.TryGetWebMessageAsString(&mut msg).is_ok() && !msg.is_null() {
+                    let s = take_pwstr(msg);
+                    let _ = tx.unbounded_send(NavigationEvent::DesignModeMessage(s));
+                }
+            }
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    unsafe {
+        webview
+            .add_WebMessageReceived(&handler, &mut token)
+            .map_err(|e| anyhow!("add_WebMessageReceived: {e}"))?;
+    }
+    tokens.web_message = Some(token);
+
     Ok(tokens)
+}
+
+/// Pull every byte out of an `IStream` into a `Vec<u8>`. Seeks to the
+/// start first (CapturePreview leaves the cursor at end-of-data), then
+/// reads in 64KB chunks until `Read` reports zero bytes.
+fn read_stream_to_vec(stream: &windows::Win32::System::Com::IStream) -> Result<Vec<u8>> {
+    use windows::Win32::System::Com::STREAM_SEEK_SET;
+    let mut out: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut buf = vec![0u8; 64 * 1024];
+    unsafe {
+        stream
+            .Seek(0, STREAM_SEEK_SET, None)
+            .map_err(|e| anyhow!("IStream.Seek: {e}"))?;
+        loop {
+            let mut bytes_read: u32 = 0;
+            // IStream::Read returns S_OK or S_FALSE (at EOF). Both
+            // pass through `ok()`; we only stop when bytes_read is 0.
+            stream
+                .Read(
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len() as u32,
+                    Some(&mut bytes_read),
+                )
+                .ok()
+                .map_err(|e| anyhow!("IStream.Read: {e}"))?;
+            if bytes_read == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..bytes_read as usize]);
+        }
+    }
+    Ok(out)
 }
 
 /// Build the CDP `Input.dispatchKeyEvent` JSON payload by hand to avoid
@@ -499,6 +629,28 @@ pub(crate) fn initialize(
                             // so even the initial load fires title/source events.
                             let event_tokens =
                                 register_navigation_events(&webview, events_tx)?;
+
+                            // Phase 4: inject the design-mode script before
+                            // the first navigation. `AddScriptToExecuteOnDocumentCreated`
+                            // runs the script on every navigation, including
+                            // the initial one. The script is idempotent —
+                            // re-evaluating it on the same document just emits
+                            // a `ready` message and exits.
+                            let script_h = HSTRING::from(crate::design_mode_script::SCRIPT);
+                            let install_handler =
+                                AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(
+                                    Box::new(|_hr, _id| Ok(())),
+                                );
+                            unsafe {
+                                if let Err(err) = webview.AddScriptToExecuteOnDocumentCreated(
+                                    PCWSTR(script_h.as_ptr()),
+                                    &install_handler,
+                                ) {
+                                    log::warn!(
+                                        "browser_viewer: AddScriptToExecuteOnDocumentCreated failed: {err}"
+                                    );
+                                }
+                            }
 
                             let url_h = HSTRING::from(&url);
                             unsafe {

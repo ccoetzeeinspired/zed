@@ -21,11 +21,12 @@ use futures::{
     channel::{mpsc, oneshot},
 };
 use gpui::{
-    App, AppContext as _, Bounds, Context, Div, Element, ElementId, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
-    KeyDownEvent, KeyUpEvent, Keystroke, LayoutId, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, Style, WeakEntity, Window, div, relative, size,
+    Anchor, AnchoredPositionMode, AnyElement, App, AppContext as _, Bounds, Context, Div, Element,
+    ElementId, Entity, EntityId, EventEmitter, FocusHandle, Focusable, GlobalElementId,
+    InspectorElementId, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, LayoutId, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, Style, WeakEntity, Window, anchored,
+    deferred, div, point, px, relative, size,
 };
 use ui::Tooltip;
 use ui::prelude::*;
@@ -97,6 +98,24 @@ pub struct BrowserItem {
     /// tab-switch hide/show so an inactive browser tab's contents don't
     /// bleed through behind the active tab in the same pane.
     is_visible: bool,
+    /// Phase 4: whether design-mode is armed on this tab. The injected
+    /// script tracks the same flag client-side; this mirror lets the
+    /// host render the indicator and decide whether to forward
+    /// `clear_selection` / dispatch the bundle.
+    pub design_mode_enabled: bool,
+    /// The element selected by the last design-mode click. Cleared on
+    /// deactivate, on navigation, and on explicit clear-selection.
+    pub design_selection: Option<crate::design::ElementSelection>,
+    /// User-entered prompt text in the "Describe the change" input.
+    /// Persisted on the item so it survives Render() recreations of
+    /// the input widget.
+    pub design_prompt: String,
+    /// Phase 4.D: freehand drawing overlay state — see `drawing.rs`.
+    /// Independent toggle from design mode so the user can draw without
+    /// having picked an element, or pick an element and add scribbles
+    /// pointing at it before submitting.
+    pub drawing_mode_enabled: bool,
+    pub drawing: crate::drawing::DrawingCanvas,
 }
 
 impl BrowserItem {
@@ -112,6 +131,11 @@ impl BrowserItem {
             init_started: false,
             last_bounds: None,
             is_visible: true,
+            design_mode_enabled: false,
+            design_selection: None,
+            design_prompt: String::new(),
+            drawing_mode_enabled: false,
+            drawing: crate::drawing::DrawingCanvas::default(),
         }
     }
 
@@ -151,6 +175,11 @@ pub struct BrowserView {
     item: Entity<BrowserItem>,
     focus_handle: FocusHandle,
     url_editor: Entity<Editor>,
+    /// Phase 4.C: editor for the "Describe the change" floating input.
+    /// Always lives — we render it only when the item has a selection
+    /// and design mode is on, but keeping the entity persistent avoids
+    /// dropping in-flight text on a notify-driven re-render.
+    design_prompt_editor: Entity<Editor>,
     /// Weak ref to the owning workspace, set in `added_to_workspace`.
     /// Used to query `has_active_modal()` so the browser visual can hide
     /// while a modal (command palette, file finder, etc.) is open —
@@ -173,6 +202,12 @@ impl BrowserView {
             editor
         });
 
+        let design_prompt_editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_placeholder_text("Describe the change…", window, cx);
+            editor
+        });
+
         // Re-emit + re-render on every BrowserItem change. The tab strip
         // picks up the UpdateTab event; the render pass syncs the URL
         // editor from the model when needed (it has &mut Window).
@@ -186,6 +221,7 @@ impl BrowserView {
             item,
             focus_handle: cx.focus_handle(),
             url_editor,
+            design_prompt_editor,
             workspace: None,
             modal_open: false,
         }
@@ -254,6 +290,57 @@ impl BrowserView {
                 }
             }
         });
+    }
+
+    fn on_toggle_drawing_mode(
+        &mut self,
+        _: &crate::ToggleDrawingMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.item.update(cx, |item, cx| {
+            item.drawing_mode_enabled = !item.drawing_mode_enabled;
+            cx.notify();
+        });
+    }
+
+    fn on_clear_drawing(
+        &mut self,
+        _: &crate::ClearDrawing,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.item.update(cx, |item, cx| {
+            item.drawing.clear();
+            cx.notify();
+        });
+    }
+
+    fn on_toggle_design_mode(
+        &mut self,
+        _: &crate::ToggleDesignMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "windows")]
+        self.item.update(cx, |item, cx| {
+            item.design_mode_enabled = !item.design_mode_enabled;
+            let msg = if item.design_mode_enabled {
+                "activate"
+            } else {
+                item.design_selection = None;
+                item.design_prompt.clear();
+                "deactivate"
+            };
+            if let Some(session) = &item.session {
+                if let Err(err) = session.post_message_string(msg) {
+                    log::warn!("browser_viewer: design-mode toggle post failed: {err}");
+                }
+            }
+            cx.notify();
+        });
+        #[cfg(not(target_os = "windows"))]
+        let _ = cx;
     }
 
     fn on_focus_address_bar(
@@ -371,6 +458,43 @@ impl BrowserView {
         self.navigate_to(target, cx);
         #[cfg(not(target_os = "windows"))]
         let _ = target;
+    }
+
+    /// Phase 4.D: capture mouse drag into `BrowserItem.drawing`.
+    /// Coordinates land in window-space (same frame the WebView2 visual
+    /// uses); the paint element draws them directly without translation.
+    fn attach_drawing_handlers(&self, root: Div, cx: &mut Context<Self>) -> Div {
+        let stroke_color = gpui::hsla(0.36, 1.0, 0.5, 1.0);
+        let stroke_width = px(3.0);
+        root.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                this.item.update(cx, |item, cx| {
+                    item.drawing.begin(ev.position, stroke_color, stroke_width);
+                    cx.notify();
+                });
+            }),
+        )
+        .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+            if ev.pressed_button != Some(MouseButton::Left) {
+                return;
+            }
+            this.item.update(cx, |item, cx| {
+                if item.drawing.current.is_some() {
+                    item.drawing.extend(ev.position);
+                    cx.notify();
+                }
+            });
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.item.update(cx, |item, cx| {
+                    item.drawing.finish();
+                    cx.notify();
+                });
+            }),
+        )
     }
 
     #[cfg(target_os = "windows")]
@@ -714,15 +838,37 @@ impl Render for BrowserView {
         let is_loading = self.item.read(cx).is_loading;
         let item = self.item.clone();
 
+        let drawing_on = self.item.read(cx).drawing_mode_enabled;
+        let has_strokes_any = !self.item.read(cx).drawing.is_empty();
+
         let mut viewport = div()
+            .relative()
             .flex_1()
             .min_h_0()
             .bg(cx.theme().colors().editor_background)
-            .child(BrowserViewportElement::new(item));
+            .child(BrowserViewportElement::new(item.clone()));
 
         #[cfg(target_os = "windows")]
         {
-            viewport = self.attach_mouse_handlers(viewport, cx);
+            if !drawing_on {
+                viewport = self.attach_mouse_handlers(viewport, cx);
+            }
+        }
+
+        // Always paint the strokes layer (read-only) so previously
+        // drawn marks stay visible while design-mode picker is active
+        // or drawing mode is off. The interactive capture layer only
+        // attaches when drawing mode is on.
+        if has_strokes_any || drawing_on {
+            viewport = viewport.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(DrawingPaintElement::new(item.clone())),
+            );
+        }
+        if drawing_on {
+            viewport = self.attach_drawing_handlers(viewport, cx);
         }
 
         let root = v_flex()
@@ -730,20 +876,254 @@ impl Render for BrowserView {
             .key_context("BrowserView")
             .on_action(cx.listener(Self::on_submit_url))
             .on_action(cx.listener(Self::on_open_devtools))
-            .on_action(cx.listener(Self::on_focus_address_bar));
+            .on_action(cx.listener(Self::on_focus_address_bar))
+            .on_action(cx.listener(Self::on_toggle_design_mode))
+            .on_action(cx.listener(Self::on_toggle_drawing_mode))
+            .on_action(cx.listener(Self::on_clear_drawing));
 
         #[cfg(target_os = "windows")]
         let root = root
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up));
 
-        root.size_full()
+        let mut tree = root
+            .size_full()
             .child(self.render_address_bar(can_back, can_fwd, is_loading, cx))
-            .child(viewport)
+            .child(viewport);
+
+        #[cfg(target_os = "windows")]
+        if let Some(panel) = self.render_design_panel(cx) {
+            tree = tree.child(panel);
+        }
+
+        tree
     }
 }
 
 impl BrowserView {
+    /// Phase 4.C: float a "Describe the change" panel near the selected
+    /// page element. Returns `None` when there's nothing to show
+    /// (design mode off, no selection, or no recorded viewport bounds).
+    ///
+    /// Positioning math: the JS gives us the element rect in CSS pixels
+    /// relative to the page viewport. The page viewport's top-left in
+    /// Zed window coords is `item.last_bounds.origin` (we track this
+    /// every prepaint, so it stays accurate through resize / scroll /
+    /// sidebar toggle). Add the two together and we anchor in window
+    /// space — `Anchored::position` then handles overflow-flipping if
+    /// the panel would fall off the right or bottom edge of the window.
+    #[cfg(target_os = "windows")]
+    fn render_design_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let item = self.item.read(cx);
+        if !item.design_mode_enabled {
+            return None;
+        }
+        let selection = item.design_selection.as_ref()?;
+        let viewport_bounds = item.last_bounds?;
+        let viewport_origin = viewport_bounds.origin;
+        let theme = cx.theme().colors().clone();
+
+        // Anchor at the bottom-left corner of the selection rect, with
+        // a small offset so the panel doesn't kiss the element border.
+        let anchor_x = px(f32::from(viewport_origin.x) + selection.rect.x);
+        let anchor_y = px(f32::from(viewport_origin.y) + selection.rect.y + selection.rect.h);
+
+        let selector = selection.selector.clone();
+        let source_hint = selection
+            .source
+            .as_ref()
+            .and_then(|s| {
+                s.file_name.as_ref().map(|f| match s.line_number {
+                    Some(line) => format!("{f}:{line}"),
+                    None => f.clone(),
+                })
+            })
+            .unwrap_or_else(|| selection.selector.clone());
+
+        let panel = div()
+            .w(px(340.))
+            .p_2()
+            .bg(theme.elevated_surface_background)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .shadow_md()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new(SharedString::new(format!("Selected: {source_hint}")))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .p_1()
+                            .min_h(px(64.))
+                            .rounded_sm()
+                            .bg(theme.editor_background)
+                            .border_1()
+                            .border_color(theme.border_variant)
+                            .child(self.design_prompt_editor.clone()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .justify_end()
+                            .child(
+                                Button::new("design-cancel", "Cancel")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_design_cancel(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("design-submit", "Submit")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.on_design_submit(&selector, window, cx);
+                                    })),
+                            ),
+                    ),
+            );
+
+        // `anchored` does its own positioning at paint time, but it
+        // still paints in document order — so wrapping in `deferred`
+        // bumps it onto the late-paint pass with priority, putting it
+        // over the viewport + drawing overlay. Same pattern Zed uses
+        // for context menus and right-click menus.
+        Some(
+            deferred(
+                anchored()
+                    .anchor(Anchor::TopLeft)
+                    .position_mode(AnchoredPositionMode::Window)
+                    .position(point(anchor_x, anchor_y + px(4.)))
+                    .snap_to_window()
+                    .child(panel),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_design_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.design_prompt_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+        });
+        self.item.update(cx, |item, cx| {
+            item.design_selection = None;
+            item.design_prompt.clear();
+            if let Some(session) = &item.session {
+                let _ = session.post_message_string("clear_selection");
+            }
+            cx.notify();
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_design_submit(&mut self, selector: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt_text = self.design_prompt_editor.read(cx).text(cx);
+        let selector_owned = selector.to_string();
+
+        // Snapshot everything the bundle needs *now*, before the
+        // async screenshot completes — `BrowserItem.design_selection`
+        // may be cleared by the user before the callback fires.
+        let (outer_html, source, strokes_svg, viewport_origin, viewport_size, page_url) = {
+            let item = self.item.read(cx);
+            let Some(sel) = item.design_selection.as_ref() else {
+                log::warn!("browser_viewer: submit fired without a selection");
+                return;
+            };
+            let bounds = item.last_bounds.unwrap_or_default();
+            (
+                sel.outer_html.clone(),
+                sel.source.clone(),
+                item.drawing.to_svg(bounds.origin, bounds.size),
+                bounds.origin,
+                bounds.size,
+                item.url.to_string(),
+            )
+        };
+        let _ = (viewport_origin, viewport_size); // packaged into svg already
+
+        // Capture is async — the PNG arrives on the GPUI foreground
+        // thread via this oneshot. We chain into a foreground task
+        // that writes the bundle to a per-submit temp dir and logs
+        // the path. 4.F will replace the temp-dir write with an ACP
+        // dispatch into the agent panel.
+        let (tx, rx) = futures::channel::oneshot::channel::<anyhow::Result<Vec<u8>>>();
+        let mut tx_slot = Some(tx);
+        let dispatch = move |result: anyhow::Result<Vec<u8>>| {
+            if let Some(tx) = tx_slot.take() {
+                let _ = tx.send(result);
+            }
+        };
+        let dispatch_box: Box<dyn FnOnce(anyhow::Result<Vec<u8>>) + 'static> = Box::new(dispatch);
+
+        let kicked_off = self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                if let Err(err) = session.capture_preview_png(dispatch_box) {
+                    log::warn!("browser_viewer: capture_preview_png dispatch failed: {err}");
+                    return false;
+                }
+                return true;
+            }
+            false
+        });
+        if !kicked_off {
+            log::warn!("browser_viewer: submit dropped — no live session");
+            return;
+        }
+
+        let prompt_for_task = prompt_text.clone();
+        let selector_for_task = selector_owned.clone();
+        let outer_html_for_task = outer_html.clone();
+        let source_for_task = source.clone();
+        let strokes_svg_for_task = strokes_svg.clone();
+        let page_url_for_task = page_url.clone();
+        cx.spawn(async move |_view, _cx| {
+            let png = match rx.await {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(err)) => {
+                    log::warn!("browser_viewer: capture_preview err: {err:?}");
+                    return;
+                }
+                Err(_) => {
+                    log::debug!("browser_viewer: capture_preview channel dropped");
+                    return;
+                }
+            };
+            let bundle = crate::bundle::DesignBundle {
+                prompt: prompt_for_task,
+                selector: selector_for_task,
+                outer_html: outer_html_for_task,
+                source: source_for_task,
+                drawing_svg: strokes_svg_for_task,
+                page_url: page_url_for_task,
+                screenshot_png: png,
+            };
+            match crate::bundle::write_bundle(&bundle) {
+                Ok(dir) => {
+                    log::info!(
+                        "browser_viewer: design bundle written to {} ({} bytes screenshot)",
+                        dir.display(),
+                        bundle.screenshot_png.len()
+                    );
+                }
+                Err(err) => {
+                    log::warn!("browser_viewer: failed to persist bundle: {err:?}");
+                }
+            }
+        })
+        .detach();
+
+        // Clear selection + prompt now so the user sees an immediate
+        // response. The async write proceeds in the background.
+        self.on_design_cancel(window, cx);
+    }
+
     fn render_address_bar(
         &self,
         can_back: bool,
@@ -751,6 +1131,9 @@ impl BrowserView {
         is_loading: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let design_on = self.item.read(cx).design_mode_enabled;
+        let drawing_on = self.item.read(cx).drawing_mode_enabled;
+        let has_strokes = !self.item.read(cx).drawing.is_empty();
         h_flex()
             .h_8()
             .flex_none()
@@ -819,6 +1202,50 @@ impl BrowserView {
                     .border_color(cx.theme().colors().border_variant)
                     .child(self.url_editor.clone()),
             )
+            .child(
+                IconButton::new("browser-design-mode", IconName::Crosshair)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(design_on)
+                    .tooltip(Tooltip::text(if design_on {
+                        "Design Mode: ON (click to disable)"
+                    } else {
+                        "Design Mode: OFF (click to enable element picker)"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_design_mode(
+                            &crate::ToggleDesignMode,
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                IconButton::new("browser-drawing-mode", IconName::Pencil)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(drawing_on)
+                    .tooltip(Tooltip::text(if drawing_on {
+                        "Drawing Mode: ON (click to disable)"
+                    } else {
+                        "Drawing Mode: OFF (click to draw on the page)"
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_toggle_drawing_mode(
+                            &crate::ToggleDrawingMode,
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .when(has_strokes, |b| {
+                b.child(
+                    IconButton::new("browser-drawing-clear", IconName::Eraser)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Clear strokes"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.on_clear_drawing(&crate::ClearDrawing, window, cx);
+                        })),
+                )
+            })
     }
 }
 
@@ -983,6 +1410,96 @@ impl Element for BrowserViewportElement {
         _cx: &mut App,
     ) {
         // The WebView2 visual draws itself via the DComp tree; nothing to do.
+    }
+}
+
+/// Renders all committed strokes plus the currently-in-progress one as
+/// GPUI `paint_path` calls. Owns no input — the overlay div above it
+/// handles mouse capture and pushes points into
+/// `BrowserItem.drawing`.
+struct DrawingPaintElement {
+    item: Entity<BrowserItem>,
+}
+
+impl DrawingPaintElement {
+    fn new(item: Entity<BrowserItem>) -> Self {
+        Self { item }
+    }
+}
+
+impl IntoElement for DrawingPaintElement {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for DrawingPaintElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let style = Style {
+            size: size(relative(1.).into(), relative(1.).into()),
+            ..Default::default()
+        };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let canvas = self.item.read(cx).drawing.clone();
+        let stroke_color = gpui::hsla(0.36, 1.0, 0.5, 1.0); // bright green
+        for stroke in canvas
+            .strokes
+            .iter()
+            .chain(canvas.current.as_ref().into_iter())
+        {
+            if stroke.points.len() < 2 {
+                continue;
+            }
+            let mut builder = gpui::PathBuilder::stroke(stroke.width);
+            builder.move_to(stroke.points[0]);
+            for p in stroke.points.iter().skip(1) {
+                builder.line_to(*p);
+            }
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, stroke_color);
+            }
+        }
     }
 }
 
@@ -1177,11 +1694,51 @@ fn apply_navigation_event(item: &mut BrowserItem, event: NavigationEvent) {
         }
         NavigationEvent::NavigationStarting => {
             item.is_loading = true;
+            // Stale selection from the previous document is no longer
+            // meaningful — clear so the floating "Describe" input
+            // disappears for the duration of the load. The script
+            // re-injects on every navigation and the user picks anew.
+            item.design_selection = None;
         }
         NavigationEvent::NavigationCompleted { is_success } => {
             item.is_loading = false;
             if !is_success {
                 log::debug!("browser_viewer: navigation completed without success");
+            }
+        }
+        NavigationEvent::DesignModeMessage(raw) => {
+            use crate::design::DesignInbound;
+            let Some(parsed) = DesignInbound::parse(&raw) else {
+                log::debug!("browser_viewer: dropping unparseable design msg: {raw}");
+                return;
+            };
+            match parsed {
+                DesignInbound::Ready => {
+                    // Script installed. If we already have design mode
+                    // enabled on the host (e.g. user toggled it before
+                    // first paint), push activate so the script catches up.
+                    if item.design_mode_enabled
+                        && let Some(session) = &item.session
+                    {
+                        let _ = session.post_message_string("activate");
+                    }
+                }
+                DesignInbound::ElementSelected(sel) => {
+                    log::info!(
+                        "browser_viewer: element selected — {} ({} chars HTML)",
+                        sel.selector,
+                        sel.outer_html.len()
+                    );
+                    item.design_selection = Some(sel);
+                }
+                DesignInbound::PageScrolled(scroll) => {
+                    // Update the selection's rect so the host can
+                    // re-anchor the floating input. Selector +
+                    // outerHTML stay stable.
+                    if let Some(sel) = item.design_selection.as_mut() {
+                        sel.rect = scroll.rect;
+                    }
+                }
             }
         }
     }
