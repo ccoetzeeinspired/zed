@@ -151,7 +151,7 @@ Files under `vendor/claude-agent-acp/`:
 The vendored source is a snapshot of upstream
 `agentclientprotocol/claude-agent-acp` at **v0.39.0** (which bundles
 `@anthropic-ai/claude-agent-sdk` 0.3.156 — this is what surfaces Opus 4.8
-in the panel, via the `default` model alias). It carries one fork patch:
+in the panel, via the `default` model alias). It carries two fork patches:
 
 - **Ultracode effort tier** (`src/acp-agent.ts`, tagged `// FORK:`).
   `ultracode` is *not* an SDK effort level (those are
@@ -165,6 +165,14 @@ in the panel, via the `default` model alias). It carries one fork patch:
   the vendored upstream effort tests assert exact `applyFlagSettings`
   payloads and will fail under this patch — the fork doesn't run the
   vendored test suite (build is `tsc`-only).
+- **Workflow visibility** (`src/acp-agent.ts`, tagged `// FORK:`). The
+  bridge swallows the SDK's `system` workflow-progress subtypes by
+  default, so an ultracode / dynamic-workflow run is invisible in the
+  panel. This patch forwards `task_started` (opens a tool-call keyed by
+  `task_id`) and `task_notification` (resolves it with the task summary)
+  as ACP tool-call updates, so each subagent surfaces as it runs.
+  `task_progress` / `task_updated` stay swallowed to avoid per-tick
+  thread spam.
 
 Any future fork-specific patches go in `src/acp-agent.ts` and similar;
 use a `// FORK:` comment marker so they're easy to find on rebases.

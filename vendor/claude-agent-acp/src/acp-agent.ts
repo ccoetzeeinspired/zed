@@ -939,12 +939,58 @@ export class ClaudeAcpAgent implements Agent {
                 });
                 break;
               }
+              // FORK: surface dynamic-workflow / subagent activity so an
+              // ultracode run is visible in the panel instead of silent. Each
+              // workflow task is rendered as a tool-call keyed by task_id: it
+              // opens when the task starts and resolves (with the task's
+              // summary) when it finishes. task_progress / task_updated stay
+              // swallowed below to avoid flooding the thread with per-tick
+              // updates — start + finish is enough to "watch the swarm".
+              case "task_started": {
+                const label = message.workflow_name
+                  ? `Workflow: ${message.workflow_name}`
+                  : message.subagent_type
+                    ? `Subagent (${message.subagent_type})`
+                    : "Subagent";
+                const title = (
+                  message.description ? `${label} — ${message.description}` : label
+                ).slice(0, 200);
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "tool_call",
+                    toolCallId: message.task_id,
+                    title,
+                    kind: "think",
+                    status: "pending",
+                  },
+                });
+                break;
+              }
+              case "task_notification": {
+                const content = message.summary
+                  ? [
+                      {
+                        type: "content" as const,
+                        content: { type: "text" as const, text: message.summary },
+                      },
+                    ]
+                  : [];
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: message.task_id,
+                    status: message.status === "completed" ? "completed" : "failed",
+                    ...(content.length > 0 && { content }),
+                  },
+                });
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
               case "task_progress":
               case "task_updated":
               case "elicitation_complete":
