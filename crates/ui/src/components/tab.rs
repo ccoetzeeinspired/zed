@@ -164,14 +164,17 @@ impl RenderOnce for Tab {
                 TabPosition::Middle(Ordering::Less) => this.border_l_1().pr_px().border_b_1(),
                 TabPosition::Middle(Ordering::Greater) => this.border_r_1().pl_px().border_b_1(),
             })
+            // FORK: round the active tab's top corners for a modern "lifted tab" look
+            .when(self.selected, |this| this.rounded_t_sm())
             .cursor_pointer()
             .child(
                 h_flex()
                     .group("")
                     .relative()
                     .h(Tab::content_height(cx))
-                    .px(DynamicSpacing::Base04.px(cx))
-                    .gap(DynamicSpacing::Base04.rems(cx))
+                    // FORK: a little more breathing room inside tabs
+                    .px(DynamicSpacing::Base06.px(cx))
+                    .gap(DynamicSpacing::Base06.rems(cx))
                     .text_color(text_color)
                     .child(start_slot)
                     .children(self.children)
