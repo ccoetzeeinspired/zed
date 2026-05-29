@@ -4,7 +4,7 @@
 
 **Goal:** Build an agent-controllable cursor for the embedded Zed browser so Codex can resolve, preview, and click selected or described page elements inside the active browser tab.
 
-**Architecture:** Extend the existing `browser_viewer` WebView2 composition browser with a typed automation protocol, page-side element resolver, GPUI cursor overlay, and native WebView2 click execution. Keep agent integration as a second stage after local browser actions prove the cursor loop works.
+**Architecture:** Extend the existing `browser_viewer` WebView2 composition browser with a typed automation protocol, page-side element resolver, GPUI cursor overlay, and native WebView2 click execution. Keep the browser cursor loop local first, then add a Zed-native agent context bridge so `@browser` refers to the active embedded `BrowserView`, not the external Codex Desktop Browser plugin.
 
 **Tech Stack:** Rust, GPUI, WebView2 composition controller, DirectComposition underlay, injected JavaScript via `AddScriptToExecuteOnDocumentCreated`, Zed workspace actions.
 
@@ -13,7 +13,7 @@
 ## File Structure
 
 - Create `crates/browser_viewer/src/browser_protocol.rs`: typed Rust protocol structs for browser automation messages and resolved targets.
-- Create `crates/browser_viewer/src/browser_automation_script.rs`: injected JavaScript string combining existing design-mode behavior with target resolution commands.
+- Extend `crates/browser_viewer/src/design_mode_script.rs`: injected JavaScript combining existing design-mode behavior with target resolution commands.
 - Create `crates/browser_viewer/src/agent_cursor.rs`: Rust state and overlay element helpers for the agent cursor.
 - Modify `crates/browser_viewer/src/browser_viewer.rs`: expose new modules and actions.
 - Modify `crates/browser_viewer/src/browser_view.rs`: handle automation messages, preview cursor state, render overlay, execute native clicks.
@@ -120,13 +120,13 @@ Expected: any failures should be limited to missing serde traits on reused desig
 ## Task 2: Automation Script
 
 **Files:**
-- Create: `crates/browser_viewer/src/browser_automation_script.rs`
+- Modify: `crates/browser_viewer/src/design_mode_script.rs`
 - Modify: `crates/browser_viewer/src/browser_viewer.rs`
 - Modify: `crates/browser_viewer/src/webview2_host.rs`
 
-- [ ] **Step 1: Copy existing design script behavior**
+- [x] **Step 1: Preserve existing design script behavior**
 
-Create `browser_automation_script.rs` with a `SCRIPT` constant. Start from the current `design_mode_script.rs` and preserve:
+Keep using `design_mode_script.rs` as the injected script and preserve:
 
 - `ready`
 - `element_selected`
@@ -207,26 +207,17 @@ function serializeTarget(el, confidence) {
 }
 ```
 
-- [ ] **Step 5: Swap script injection**
+- [x] **Step 5: Keep script injection on the generalized design-mode script**
 
-In `webview2_host.rs`, replace:
+The implementation keeps:
 
 ```rust
 let script_h = HSTRING::from(crate::design_mode_script::SCRIPT);
 ```
 
-with:
-
-```rust
-let script_h = HSTRING::from(crate::browser_automation_script::SCRIPT);
-```
-
-In `browser_viewer.rs`, add the Windows module:
-
-```rust
-#[cfg(target_os = "windows")]
-mod browser_automation_script;
-```
+and extends that script with the browser automation protocol. This avoids a
+second injected-script module while preserving the existing design-mode
+selection and drawing workflow.
 
 - [x] **Step 6: Run check**
 
@@ -576,4 +567,45 @@ Run:
 ```powershell
 git add crates/browser_viewer crates/agent_ui crates/zed_actions docs/superpowers
 git commit -m "feat: add agent browser cursor"
+```
+
+## Task 9: Zed-Native Browser Agent Context Bridge
+
+**Spec:** `docs/superpowers/specs/2026-05-30-browser-agent-context-bridge.md`
+
+- [ ] **Step 1: Add browser mention URI**
+
+Add a Zed-native mention URI such as `zed:///agent/browser/current` and render it
+as a compact `Browser` chip.
+
+- [ ] **Step 2: Add composer completion**
+
+Teach the agent composer that `@browser` means the active embedded Zed browser,
+not the external Codex Desktop Browser plugin.
+
+- [ ] **Step 3: Add active BrowserView context snapshot**
+
+Expose a concise snapshot from the active browser tab:
+
+- URL
+- title when available
+- selected design element when available
+- previewed agent cursor target when available
+
+- [ ] **Step 4: Send browser context to the model**
+
+When a prompt includes `@browser`, serialize the snapshot into the model context
+without expanding a giant wall of DOM text into the composer.
+
+- [ ] **Step 5: Route browser commands through Zed**
+
+Make agent browser commands use the active `BrowserView` resolve/preview/click
+actions instead of invoking the Codex Desktop Browser plugin.
+
+- [ ] **Step 6: Error clearly**
+
+If no active browser tab exists, show:
+
+```text
+No active Zed browser tab is open. Open one with browser::NewTab.
 ```

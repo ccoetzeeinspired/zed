@@ -134,11 +134,15 @@ If multiple candidates match, the resolver returns an ambiguous result with cand
 
 The current `design_mode_script.rs` should be generalized. The script should keep design selection behavior but add an agent cursor protocol.
 
-Proposed files:
+Implementation files:
 
 - `crates/browser_viewer/src/browser_protocol.rs`
-- `crates/browser_viewer/src/browser_automation_script.rs`
+- `crates/browser_viewer/src/design_mode_script.rs`
 - `crates/browser_viewer/src/agent_cursor.rs`
+
+The implementation keeps a single injected script in `design_mode_script.rs` and
+extends it with the browser automation protocol. That avoids loading competing
+page scripts while preserving the existing design-mode picker behavior.
 
 Host-to-page messages:
 
@@ -257,6 +261,12 @@ The first implementation slice can use browser-local actions before full agent t
 ## Agent Integration
 
 The agent path should route browser commands to the active browser tab.
+
+The follow-up context bridge is specified in
+`docs/superpowers/specs/2026-05-30-browser-agent-context-bridge.md`. The key
+lesson from testing is that `@browser` must be owned by Zed's agent composer for
+embedded browser tasks. It must not resolve to the external Codex Desktop
+Browser plugin.
 
 Resolution strategy:
 

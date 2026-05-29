@@ -555,10 +555,24 @@ impl BrowserView {
     #[cfg(target_os = "windows")]
     fn on_agent_click_resolved_element(
         &mut self,
-        _: &zed_actions::agent::BrowserClickResolvedElement,
+        action: &zed_actions::agent::BrowserClickResolvedElement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let request_id = action.request_id.as_ref().trim();
+        if !request_id.is_empty() {
+            let request_matches = self.item.read(cx).agent_cursor.as_ref().is_some_and(|cursor| {
+                cursor.request_id == request_id
+            });
+            if !request_matches {
+                self.item.update(cx, |item, cx| {
+                    item.agent_cursor =
+                        Some(failed_agent_cursor("agent", "No matching browser target preview"));
+                    cx.notify();
+                });
+                return;
+            }
+        }
         click_agent_cursor_target(self, cx, window);
     }
 
@@ -592,28 +606,10 @@ impl BrowserView {
         self.item.update(cx, |item, cx| {
             if let Some(session) = item.session.as_ref() {
                 if let Err(err) = session.post_message_string(&payload) {
-                    item.agent_cursor = Some(crate::agent_cursor::AgentCursorState {
-                        request_id: "agent".to_string(),
-                        target: crate::browser_protocol::BrowserResolvedElement {
-                            selector: "post-message-failed".to_string(),
-                            tag: Some("missing".to_string()),
-                            text: Some(err.to_string()),
-                            role: None,
-                            accessible_name: Some(err.to_string()),
-                            rect: crate::design::ElementRect {
-                                x: 0.,
-                                y: 0.,
-                                w: 0.,
-                                h: 0.,
-                            },
-                            source: None,
-                            confidence: crate::browser_protocol::BrowserTargetConfidence::Weak,
-                        },
-                        status: crate::agent_cursor::AgentCursorStatus::Failed(err.to_string()),
-                        label: "Browser command failed".to_string(),
-                        ambiguity: Vec::new(),
-                    });
+                    item.agent_cursor = Some(failed_agent_cursor("agent", err.to_string()));
                 }
+            } else {
+                item.agent_cursor = Some(failed_agent_cursor("agent", "Browser is not ready"));
             }
             cx.notify();
         });
@@ -1141,6 +1137,35 @@ fn browser_query_from_action(
             })
         }
         other => Err(format!("Unsupported browser query kind: {other}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn failed_agent_cursor(
+    request_id: impl Into<String>,
+    reason: impl Into<String>,
+) -> crate::agent_cursor::AgentCursorState {
+    let reason = reason.into();
+    crate::agent_cursor::AgentCursorState {
+        request_id: request_id.into(),
+        target: crate::browser_protocol::BrowserResolvedElement {
+            selector: "browser-command-failed".to_string(),
+            tag: Some("missing".to_string()),
+            text: Some(reason.clone()),
+            role: None,
+            accessible_name: Some(reason.clone()),
+            rect: crate::design::ElementRect {
+                x: 0.,
+                y: 0.,
+                w: 0.,
+                h: 0.,
+            },
+            source: None,
+            confidence: crate::browser_protocol::BrowserTargetConfidence::Weak,
+        },
+        status: crate::agent_cursor::AgentCursorStatus::Failed(reason.clone()),
+        label: reason,
+        ambiguity: Vec::new(),
     }
 }
 
