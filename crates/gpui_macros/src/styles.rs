@@ -1292,40 +1292,44 @@ fn corner_suffixes() -> Vec<CornerStyleSuffix> {
             radius_tokens: quote! { px(0.) },
             doc_string_suffix: "0px",
         },
+        // FORK: softer corner scale for the modern/comfortable look-and-feel
+        // pass. Every rounded_* call resolves through this one scale —
+        // buttons (sm), inputs (md), and all panels/popovers/menus/cards via
+        // elevation_1/2 (lg). Bumped roughly +50% across the ramp.
         CornerStyleSuffix {
             suffix: "xs",
-            radius_tokens: quote! { rems(0.125) },
-            doc_string_suffix: "2px (0.125rem)",
+            radius_tokens: quote! { rems(0.1875) },
+            doc_string_suffix: "3px (0.1875rem)",
         },
         CornerStyleSuffix {
             suffix: "sm",
-            radius_tokens: quote! { rems(0.25) },
-            doc_string_suffix: "4px (0.25rem)",
-        },
-        CornerStyleSuffix {
-            suffix: "md",
             radius_tokens: quote! { rems(0.375) },
             doc_string_suffix: "6px (0.375rem)",
         },
         CornerStyleSuffix {
-            suffix: "lg",
+            suffix: "md",
             radius_tokens: quote! { rems(0.5) },
             doc_string_suffix: "8px (0.5rem)",
         },
         CornerStyleSuffix {
-            suffix: "xl",
+            suffix: "lg",
             radius_tokens: quote! { rems(0.75) },
             doc_string_suffix: "12px (0.75rem)",
         },
         CornerStyleSuffix {
-            suffix: "2xl",
+            suffix: "xl",
             radius_tokens: quote! { rems(1.) },
             doc_string_suffix: "16px (1rem)",
         },
         CornerStyleSuffix {
+            suffix: "2xl",
+            radius_tokens: quote! { rems(1.25) },
+            doc_string_suffix: "20px (1.25rem)",
+        },
+        CornerStyleSuffix {
             suffix: "3xl",
-            radius_tokens: quote! { rems(1.5) },
-            doc_string_suffix: "24px (1.5rem)",
+            radius_tokens: quote! { rems(1.75) },
+            doc_string_suffix: "28px (1.75rem)",
         },
         CornerStyleSuffix {
             suffix: "full",

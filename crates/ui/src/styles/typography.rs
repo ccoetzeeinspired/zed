@@ -136,7 +136,7 @@ impl TextSize {
 
         match self {
             Self::Large => rems_from_px(16.),
-            Self::Default => rems_from_px(14.),
+            Self::Default => rems_from_px(15.), // FORK: 14 -> 15, more comfortable UI text
             Self::Small => rems_from_px(12.),
             Self::XSmall => rems_from_px(10.),
             Self::Ui => rems_from_px(settings.ui_font_size(cx)),
@@ -149,7 +149,7 @@ impl TextSize {
 
         match self {
             Self::Large => px(16.),
-            Self::Default => px(14.),
+            Self::Default => px(15.), // FORK: 14 -> 15, more comfortable UI text
             Self::Small => px(12.),
             Self::XSmall => px(10.),
             Self::Ui => settings.ui_font_size(cx),
