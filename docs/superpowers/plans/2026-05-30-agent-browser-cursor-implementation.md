@@ -463,6 +463,11 @@ Verify:
 
 - `browser::NewTab` opens an embedded browser tab.
 - URL bar accepts input and navigates.
+- Navigate to `file:///D:/ccoetzeeinspired-zed/docs/superpowers/browser-agent-cursor-test.html`.
+- Target text `Sign in` previews the `Sign in` button.
+- Clicking the previewed target changes page output to `clicked: Sign in`.
+- Target selector `css:[data-testid="create-account-button"]` previews the `Create Account` button.
+- Clicking the previewed target changes page output to `clicked: Create Account`.
 - Design mode still selects elements.
 - Drawing mode still draws.
 - Preview selected element displays overlay.
