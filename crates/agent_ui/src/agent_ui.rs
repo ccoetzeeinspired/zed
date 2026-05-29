@@ -9,6 +9,7 @@ mod completion_provider;
 mod config_options;
 mod context;
 mod context_server_configuration;
+mod conversation_item;
 pub(crate) mod conversation_view;
 mod diagnostics;
 pub mod draft_prompt_store;
@@ -183,6 +184,8 @@ actions!(
     [
         /// Toggles the menu to create new agent threads.
         ToggleNewThreadMenu,
+        /// FORK: opens the active agent conversation as a tab in the center pane.
+        OpenAgentInCenter,
         /// Toggles the options menu for agent settings and preferences.
         ToggleOptionsMenu,
         /// Toggles the profile or mode selector for switching between agent profiles.

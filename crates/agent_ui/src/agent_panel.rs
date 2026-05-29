@@ -41,9 +41,10 @@ use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadata
 use crate::{
     AddContextServer, AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow,
     LoadThreadFromClipboard, NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown,
-    OpenAgentDiff, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    OpenAgentDiff, OpenAgentInCenter, ResetTrialEndUpsell, ResetTrialUpsell,
+    ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
+    conversation_item::ConversationItem,
     conversation_view::{AcpThreadViewEvent, ThreadView},
     ui::{AgentNotification, AgentNotificationEvent, EndTrialUpsell},
 };
@@ -332,6 +333,22 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|workspace, _: &Follow, window, cx| {
                     workspace.follow(CollaboratorId::Agent, window, cx);
+                })
+                // FORK: agent-in-center (Stage 1). Open the active conversation
+                // as a center-pane tab. The dock AgentPanel stays the owner;
+                // this shares the same ConversationView entity, so the two views
+                // stay in sync and closing the tab leaves the thread intact.
+                .register_action(|workspace, _: &OpenAgentInCenter, window, cx| {
+                    let Some(conversation) = workspace
+                        .panel::<AgentPanel>(cx)
+                        .and_then(|panel| panel.read(cx).active_conversation_view().cloned())
+                    else {
+                        return;
+                    };
+                    let workspace_handle = workspace.weak_handle();
+                    let item =
+                        cx.new(|_| ConversationItem::new(conversation, workspace_handle));
+                    workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
                 })
                 .register_action(|workspace, _: &OpenAgentDiff, window, cx| {
                     let thread = workspace
