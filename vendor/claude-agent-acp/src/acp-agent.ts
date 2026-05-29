@@ -753,6 +753,13 @@ export class ClaudeAcpAgent implements Agent {
     // forward it to clients as structured `data`, sparing them from
     // pattern-matching on the human-readable message text.
     let lastAssistantError: SDKAssistantMessageError | undefined;
+    // Tracks whether we're inside a compaction. The SDK emits the terminal
+    // `status` (compact_result success/failed) twice for a single failed
+    // compaction, and the two messages are indistinguishable — so we report the
+    // outcome only while a compaction is in progress, then clear this. A fresh
+    // `compacting` status sets it again, so every distinct compaction (e.g.
+    // repeated auto-compactions in a long turn) is still shown.
+    let compactionInProgress = false;
 
     const userMessage = promptToClaude(params);
 
@@ -812,11 +819,34 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               case "status": {
                 if (message.status === "compacting") {
+                  compactionInProgress = true;
                   await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
                       sessionUpdate: "agent_message_chunk",
                       content: { type: "text", text: "Compacting..." },
+                    },
+                  });
+                } else if (message.compact_result === "success" && compactionInProgress) {
+                  // The SDK signals manual `/compact` completion with a status
+                  // message carrying `compact_result`, not the `compact_boundary`
+                  // message (which only fires when there's content to compact).
+                  compactionInProgress = false;
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: "\n\nCompacting completed." },
+                    },
+                  });
+                } else if (message.compact_result === "failed" && compactionInProgress) {
+                  compactionInProgress = false;
+                  const reason = message.compact_error ? `: ${message.compact_error}` : ".";
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: `\n\nCompacting failed${reason}` },
                     },
                   });
                 }
@@ -834,6 +864,10 @@ export class ClaudeAcpAgent implements Agent {
                 // The alternative (no update) leaves the client showing e.g.
                 // "944k/1m" right after the user sees "Compacting completed",
                 // which is confusing and wrong.
+                //
+                // The "Compacting completed." text is emitted from the `status`
+                // handler (keyed on `compact_result`), not here, so the failure
+                // path gets a message too.
                 lastAssistantTotalUsage = 0;
                 lastAssistantUsage = null;
                 await this.client.sessionUpdate({
@@ -842,13 +876,6 @@ export class ClaudeAcpAgent implements Agent {
                     sessionUpdate: "usage_update",
                     used: 0,
                     size: session.contextWindowSize,
-                  },
-                });
-                await this.client.sessionUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: "\n\nCompacting completed." },
                   },
                 });
                 break;
@@ -926,6 +953,7 @@ export class ClaudeAcpAgent implements Agent {
               case "api_retry":
               case "mirror_error":
               case "permission_denied":
+              case "thinking_tokens":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -1171,6 +1199,7 @@ export class ClaudeAcpAgent implements Agent {
             // payloads (e.g. /compact's malformed output) strip to null and are
             // skipped. Mirrors the replay path at replaySessionHistory.
             if (
+              message.message.role !== "system" &&
               typeof message.message.content === "string" &&
               message.message.content.includes("<local-command-stdout>")
             ) {
@@ -1213,6 +1242,9 @@ export class ClaudeAcpAgent implements Agent {
                   message.message.content.length === 1 &&
                   message.message.content[0].type === "text"))
             ) {
+              break;
+            }
+            if (message.message.role === "system") {
               break;
             }
 
@@ -1821,9 +1853,9 @@ export class ClaudeAcpAgent implements Agent {
       const newEffort =
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
       if (newEffort !== currentEffort) {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(newEffort),
-        });
+        // FORK: route through effortFlagSettings so "ultracode" toggles the
+        // ultracode flag (and is cleared when a model switch clamps it away).
+        await session.query.applyFlagSettings(effortFlagSettings(newEffort));
       }
 
       // Emit current_mode_update only after session.modes AND
@@ -1846,9 +1878,8 @@ export class ClaudeAcpAgent implements Agent {
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
       if (configId === "effort") {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(value),
-        });
+        // FORK: effortFlagSettings handles the synthetic "ultracode" tier.
+        await session.query.applyFlagSettings(effortFlagSettings(value));
       }
     }
   }
@@ -2228,9 +2259,9 @@ export class ClaudeAcpAgent implements Agent {
       typeof initialEffort.currentValue === "string" &&
       initialEffort.currentValue !== "default"
     ) {
-      await q.applyFlagSettings({
-        effortLevel: initialEffort.currentValue as Settings["effortLevel"],
-      });
+      // FORK: effortFlagSettings handles the synthetic "ultracode" tier so an
+      // `effort: "ultracode"` settings default applies on session start too.
+      await q.applyFlagSettings(effortFlagSettings(initialEffort.currentValue));
     }
 
     this.sessions[sessionId] = {
@@ -2433,6 +2464,24 @@ function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | 
   return value === undefined || value === "default" ? null : (value as Settings["effortLevel"]);
 }
 
+// FORK: ultracode. "ultracode" is NOT an SDK effort level (those are
+// low|medium|high|xhigh|max). It's a separate session-scoped flag
+// (`Settings.ultracode`) meaning "xhigh effort + standing dynamic-workflow
+// orchestration", normally toggled via apply_flag_settings and requiring an
+// xhigh-capable model. We surface it as a synthetic top entry in the Effort
+// dropdown (see buildConfigOptions) and translate the selection here: choosing
+// "ultracode" sets the flag (and lets it drive effort), while choosing any real
+// level clears the flag again.
+const ULTRACODE_EFFORT = "ultracode";
+function effortFlagSettings(value: string | undefined): {
+  effortLevel: Settings["effortLevel"] | null;
+  ultracode: boolean;
+} {
+  return value === ULTRACODE_EFFORT
+    ? { effortLevel: null, ultracode: true }
+    : { effortLevel: toSdkEffortLevel(value), ultracode: false };
+}
+
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
@@ -2475,6 +2524,10 @@ function buildConfigOptions(
     : [];
 
   if (supportedLevels.length > 0) {
+    // FORK: offer "Ultracode" (xhigh + dynamic workflows) as a synthetic top
+    // tier on xhigh-capable models. It's a session flag, not an effort level —
+    // selecting it is handled by effortFlagSettings, not toSdkEffortLevel.
+    const ultracodeCapable = (supportedLevels as string[]).includes("xhigh");
     const effortOptions = [
       { value: "default", name: "Default" },
       ...supportedLevels.map((level) => ({
@@ -2484,9 +2537,13 @@ function buildConfigOptions(
           .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
           .join(" "),
       })),
+      ...(ultracodeCapable ? [{ value: ULTRACODE_EFFORT, name: "Ultracode" }] : []),
     ];
 
-    const includes = (l: string) => l === "default" || (supportedLevels as string[]).includes(l);
+    const includes = (l: string) =>
+      l === "default" ||
+      (supportedLevels as string[]).includes(l) ||
+      (ultracodeCapable && l === ULTRACODE_EFFORT);
     const validEffort =
       currentEffortLevel && includes(currentEffortLevel) ? currentEffortLevel : "default";
 
@@ -3140,6 +3197,7 @@ export function toAcpNotifications(
       case "compaction":
       case "compaction_delta":
       case "advisor_tool_result":
+      case "mid_conv_system":
         break;
 
       default:

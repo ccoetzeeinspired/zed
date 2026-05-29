@@ -148,11 +148,36 @@ Files under `vendor/claude-agent-acp/`:
 - `node_modules/` — Dependencies (gitignored, locally installed by `npm install`).
 - `package.json`, `tsconfig.json`, etc. — Build config (committed).
 
-The vendored source is currently a snapshot of upstream
-`agentclientprotocol/claude-agent-acp` at v0.37.0 with no local patches
-beyond the ACP-bridge surface itself. Any future fork-specific patches
-go in `src/acp-agent.ts` and similar; use a comment marker like
-`// FORK:` so they're easy to find on rebases.
+The vendored source is a snapshot of upstream
+`agentclientprotocol/claude-agent-acp` at **v0.39.0** (which bundles
+`@anthropic-ai/claude-agent-sdk` 0.3.156 — this is what surfaces Opus 4.8
+in the panel, via the `default` model alias). It carries one fork patch:
+
+- **Ultracode effort tier** (`src/acp-agent.ts`, tagged `// FORK:`).
+  `ultracode` is *not* an SDK effort level (those are
+  low/medium/high/xhigh/max) — it's a session-scoped `Settings.ultracode`
+  flag meaning "xhigh effort + standing dynamic-workflow orchestration".
+  The patch adds a synthetic **"Ultracode"** option at the top of the
+  Effort dropdown on xhigh-capable models, plus an `effortFlagSettings()`
+  helper that routes the selection: choosing it calls
+  `applyFlagSettings({ ultracode: true })`; choosing any real level clears
+  the flag. All three effort-apply sites go through the helper. Caveat:
+  the vendored upstream effort tests assert exact `applyFlagSettings`
+  payloads and will fail under this patch — the fork doesn't run the
+  vendored test suite (build is `tsc`-only).
+
+Any future fork-specific patches go in `src/acp-agent.ts` and similar;
+use a `// FORK:` comment marker so they're easy to find on rebases.
+
+**Re-vendoring to a newer upstream release:** re-clone the matching git
+tag (`git clone --branch vX.Y.Z …`) and copy its `src/` + `package.json`
++ `tsconfig.json` over the vendored tree, then `npm install && npm run
+build` and re-apply the `// FORK:` patches above. The npm package ships
+only `dist/`, so the TypeScript `src/` must come from the GitHub tag.
+Do **not** bump only the SDK under an older bridge — the bridge code is
+written against a specific SDK's model API, and a mismatch silently
+mangles the model list (learned the hard way going 0.3.146→0.3.156 under
+the 0.37.0 bridge: the dropdown collapsed to bare `default/sonnet/haiku`).
 
 ### `crates/browser_viewer/` — in-editor WebView2 browser tab (Windows only)
 
