@@ -263,7 +263,8 @@ diff and **will cause merge conflicts on upstream rebases:**
 - `crates/gpui_windows/src/directx_renderer.rs` — `comp_container`
   field, `set_swap_chain` restructure, `draw_cutouts` method.
 - `crates/gpui_windows/src/dcomp_registry.rs` —
-  `create_underlay_visual_for_hwnd`.
+  `create_underlay_visual_for_hwnd` + `HostedVisual::bring_underlay_to_front`
+  (active-tab underlay reorder, Task #28).
 - `crates/gpui_windows/src/window.rs` — none directly, but the
   background-appearance code may collide.
 - `crates/gpui_macos/src/metal_renderer.rs` and
@@ -320,9 +321,14 @@ collisions, prefer the fork's behaviour and re-read this section.
 #### Known limits / parked work
 
 - IME (CJK / Arabic) and dead-key accents — CDP doesn't cover these.
-- Multi-browser-tab in same pane — z-order glitch when switching
-  between them; active tab's underlay needs reordering. Single-tab
-  case (the dogfood path) works fine. Task #28.
+- Multi-browser-tab in same pane — **fixed & verified (Task #28).**
+  Inactive browser tabs keep painting (no hide → no reactivation flash);
+  the active tab reorders its WebView2 underlay to the front of the
+  underlay group on activation and on new-tab session-ready, so only it
+  shows through its cutout. See `HostedVisual::bring_underlay_to_front`
+  (gpui_windows) + `WebView2Session::bring_underlay_to_front`, driven
+  from `BrowserView::render` / `deactivated` via the `is_visible` flag.
+  Verified with two tabs (localhost + google).
 - ACP submission pipeline (Task #29) — **done & verified (Phase 4.F).**
   Submit dispatches the bundle into the claude-acp panel and Claude
   edits the targeted source (verified end-to-end against a Next.js dev

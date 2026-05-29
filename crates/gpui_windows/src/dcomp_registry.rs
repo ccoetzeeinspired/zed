@@ -73,6 +73,31 @@ impl HostedVisual {
         }
         Ok(())
     }
+
+    /// Re-insert this underlay visual directly beneath GPUI's swap chain,
+    /// making it the front-most underlay. When several underlays share the
+    /// same screen region (e.g. multiple browser tabs in one pane), the
+    /// front-most one occludes the others — so call this on the active tab
+    /// to ensure its page (not a sibling's) shows through GPUI's transparent
+    /// regions. Intended for underlay visuals only (parent = comp_container).
+    pub fn bring_underlay_to_front(&self) -> Result<()> {
+        unsafe {
+            self.parent
+                .RemoveVisual(&self.visual)
+                .context("RemoveVisual (reorder underlay)")?;
+            // With a non-NULL reference, `insertAbove = false` places
+            // `visual` directly *behind* `comp_visual` (the swap chain) —
+            // i.e. in front of all other underlays, still under GPUI's UI.
+            self.parent
+                .AddVisual(&self.visual, false, Some(&self.dcomp.comp_visual))
+                .context("AddVisual (reorder underlay to front)")?;
+            self.dcomp
+                .comp_device
+                .Commit()
+                .context("Commit (reorder underlay)")?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for HostedVisual {

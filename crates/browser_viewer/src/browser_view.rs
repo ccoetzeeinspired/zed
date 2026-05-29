@@ -790,19 +790,15 @@ impl Focusable for BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Tab-switch show: `Item::deactivated` calls SetIsVisible(false)
-        // when this tab leaves focus, because multiple browser tabs in
-        // the same pane share the underlay sibling slot — if an
-        // inactive tab kept painting, its pixels could leak through a
-        // sibling's cutout. On reactivation, Render runs again here,
-        // so flip SetIsVisible(true) so the WebView paints into its
-        // underlay visual again. Without this, the cutout would reveal
-        // the empty underlay → the comp_target's blank backing → the
-        // Windows desktop showing through Zed.
-        //
-        // We don't gate this on `modal_open` anymore — Phase 4's
-        // cutout-based architecture means modals naturally render
-        // above the WebView via z-order; no need to hide the page.
+        // Multi-tab z-order: when several browser tabs share a pane, all
+        // their WebView2 underlays stay attached (we don't hide inactive
+        // ones — that caused a one-frame desktop flash on reactivation).
+        // `Item::deactivated` marks this tab not-fronted (`is_visible =
+        // false`); on (re)activation Render runs here and reorders this
+        // tab's underlay to the front of the underlay group, so the active
+        // tab's page — not a sibling's — shows through GPUI's transparent
+        // regions. Gated on `is_visible` so we reorder only on the
+        // activation transition, not every frame.
         #[cfg(target_os = "windows")]
         {
             self.item.update(cx, |item, _| {
@@ -810,8 +806,10 @@ impl Render for BrowserView {
                     return;
                 }
                 if let Some(session) = &item.session {
-                    if let Err(err) = session.set_visible(true) {
-                        log::warn!("BrowserItem: re-show on activate failed: {err:?}");
+                    if let Err(err) = session.bring_underlay_to_front() {
+                        log::warn!(
+                            "BrowserItem: reorder underlay to front on activate failed: {err:?}"
+                        );
                     }
                 }
                 item.is_visible = true;
@@ -1376,26 +1374,20 @@ impl Item for BrowserView {
     }
 
     /// Called by `workspace::pane` when this item stops being the active
-    /// item in its pane. Phase 4 architectural fix made the original
-    /// SetIsVisible(false) call unnecessary AND harmful:
-    ///
-    /// - Unnecessary: WebView2 is now an underlay below GPUI's swap
-    ///   chain. When the tab is inactive, our `BrowserViewportElement`
-    ///   doesn't paint, so no cutout is emitted, so the workspace bg
-    ///   covers the underlay — WebView2's pixels aren't visible
-    ///   anyway. No need to stop it from painting.
-    ///
-    /// - Harmful: calling SetIsVisible(false) here and SetIsVisible(true)
-    ///   on the next `Render` produces a one-frame compositor latency
-    ///   where the cutout is emitted before the WebView has resumed
-    ///   painting, exposing the window's blank backing (the desktop)
-    ///   for ~16 ms. By leaving the WebView always painting, the
-    ///   transition is seamless.
-    ///
-    /// The cost is that inactive browser tabs continue running their
-    /// renderer, but Chromium tabs are already cheap when not visible
-    /// on-screen — Chromium throttles offscreen rendering internally.
-    fn deactivated(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// item in its pane. We do NOT hide the WebView2 (`SetIsVisible(false)`)
+    /// — that produced a one-frame desktop flash on reactivation (the
+    /// cutout was emitted before the WebView resumed painting). Instead we
+    /// mark this tab not-fronted; when it next becomes active, `Render`
+    /// reorders its underlay to the front of the underlay group so it
+    /// occludes any other browser tab sharing the pane. Inactive tabs keep
+    /// painting (cheap — Chromium throttles offscreen rendering) but sit
+    /// behind the active tab's underlay, so they no longer leak through its
+    /// cutout (the multi-tab bug from Task #28).
+    fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            item.is_visible = false;
+        });
+    }
 }
 
 /// Custom element whose `prepaint` snapshots the window-relative bounds and
@@ -1723,6 +1715,12 @@ fn start_session(
             match result {
                 Ok(session) => {
                     log::info!("browser_viewer: session ready for {}", item.url);
+                    // A freshly-opened tab is the active one — front its
+                    // underlay so it shows over any existing browser tab in
+                    // the same pane (rather than appearing behind it).
+                    if let Err(err) = session.bring_underlay_to_front() {
+                        log::warn!("browser_viewer: initial underlay front failed: {err:?}");
+                    }
                     item.session = Some(session);
                     cx.notify();
                     true

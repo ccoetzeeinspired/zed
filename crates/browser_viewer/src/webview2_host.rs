@@ -250,17 +250,14 @@ impl WebView2Session {
         Ok(())
     }
 
-    /// Show or hide the WebView. Hidden WebViews still hold their
-    /// composition visual in the DComp tree, but the controller stops
-    /// painting into it, so the inactive tab's contents don't bleed
-    /// through when a sibling tab is active.
-    pub fn set_visible(&self, visible: bool) -> Result<()> {
-        unsafe {
-            self.controller
-                .SetIsVisible(visible.into())
-                .map_err(|err| anyhow!("controller.SetIsVisible({visible}): {err}"))?;
-        }
-        Ok(())
+    /// Reorder this session's WebView2 underlay to the front of the
+    /// underlay group, so it occludes other browser tabs' underlays
+    /// sharing the same pane. Called when the tab becomes active (or when
+    /// a freshly-opened tab's session becomes ready). We reorder rather
+    /// than toggling `SetIsVisible`, because hiding/showing the controller
+    /// caused a one-frame desktop flash on reactivation.
+    pub fn bring_underlay_to_front(&self) -> Result<()> {
+        self.visual.bring_underlay_to_front()
     }
 
     pub fn send_mouse_input(
