@@ -196,6 +196,10 @@ pub struct BrowserView {
     /// WebView2's DComp visual sits above the Zed swap chain in the
     /// composition tree.
     workspace: Option<WeakEntity<Workspace>>,
+    /// Selector the prompt editor was last focused for. Lets us re-focus on
+    /// each new element selection so the panel's Esc / Ctrl+Enter shortcuts
+    /// fire and those keys don't leak to the page.
+    design_prompt_focused_for: Option<SharedString>,
 }
 
 impl BrowserView {
@@ -234,6 +238,7 @@ impl BrowserView {
             url_editor,
             design_prompt_editor,
             workspace: None,
+            design_prompt_focused_for: None,
         }
     }
 
@@ -820,15 +825,40 @@ impl Render for BrowserView {
                 if item.is_visible {
                     return;
                 }
-                if let Some(session) = &item.session {
-                    if let Err(err) = session.bring_underlay_to_front() {
-                        log::warn!(
+                match item.session.as_ref() {
+                    Some(session) => match session.bring_underlay_to_front() {
+                        Ok(()) => item.is_visible = true,
+                        // Leave is_visible false so the next Render retries.
+                        Err(err) => log::warn!(
                             "BrowserItem: reorder underlay to front on activate failed: {err:?}"
-                        );
-                    }
+                        ),
+                    },
+                    // No session yet; mark fronted so the session-ready
+                    // callback fronts it once init completes.
+                    None => item.is_visible = true,
                 }
-                item.is_visible = true;
             });
+        }
+
+        // FORK: focus the prompt editor on each new element selection so the
+        // panel's Esc / Ctrl+Enter shortcuts fire and those keys don't leak
+        // to the page (selecting an element otherwise leaves focus on the
+        // browser root, which forwards keystrokes to the page over CDP).
+        #[cfg(target_os = "windows")]
+        {
+            let current_sel = self
+                .item
+                .read(cx)
+                .design_selection
+                .as_ref()
+                .map(|s| SharedString::from(s.selector.clone()));
+            if current_sel != self.design_prompt_focused_for {
+                if current_sel.is_some() {
+                    let handle = self.design_prompt_editor.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+                self.design_prompt_focused_for = current_sel;
+            }
         }
 
         // Sync the address bar editor text from the model when (a) the model
@@ -951,6 +981,20 @@ impl Render for BrowserView {
                                             cx.notify();
                                         });
                                     }),
+                                )
+                                // Release OUTSIDE the window: GPUI's on_mouse_up
+                                // is hitbox-gated and won't fire off-window, but
+                                // Win32 SetCapture still delivers the up — catch
+                                // it here so the drag can't get stuck (which
+                                // would leave the catcher occluding the window).
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                        this.item.update(cx, |item, cx| {
+                                            item.design_drag = None;
+                                            cx.notify();
+                                        });
+                                    }),
                                 ),
                         ),
                 )
@@ -1054,20 +1098,26 @@ impl BrowserView {
                     .justify_between()
                     .border_b_1()
                     .border_color(theme.border_variant)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                            this.item.update(cx, |item, cx| {
-                                item.design_drag = Some((ev.position, item.design_panel_offset));
-                                cx.notify();
-                            });
-                            cx.stop_propagation();
-                        }),
-                    )
                     .child(
                         h_flex()
+                            .flex_1()
                             .gap_1()
                             .items_center()
+                            // Drag handle = the title area ONLY, so the X
+                            // button stays clickable. (If the header itself
+                            // were the handle, clicking the X would start a
+                            // micro-drag whose catcher overlay eats the click.)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                                    this.item.update(cx, |item, cx| {
+                                        item.design_drag =
+                                            Some((ev.position, item.design_panel_offset));
+                                        cx.notify();
+                                    });
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .child(
                                 Icon::new(IconName::Crosshair)
                                     .size(IconSize::Small)
@@ -1186,6 +1236,11 @@ impl BrowserView {
             }
             cx.notify();
         });
+        // Move focus off the prompt editor — it stops rendering now that the
+        // selection is cleared, and an orphaned focus handle would drive a
+        // continuous re-render (visible as toolbar flicker). The browser root
+        // is always present, so focus it.
+        window.focus(&self.focus_handle, cx);
     }
 
     #[cfg(target_os = "windows")]
@@ -1887,11 +1942,15 @@ fn start_session(
             match result {
                 Ok(session) => {
                     log::info!("browser_viewer: session ready for {}", item.url);
-                    // A freshly-opened tab is the active one — front its
-                    // underlay so it shows over any existing browser tab in
-                    // the same pane (rather than appearing behind it).
-                    if let Err(err) = session.bring_underlay_to_front() {
-                        log::warn!("browser_viewer: initial underlay front failed: {err:?}");
+                    // Front the new tab's underlay only if it's STILL the
+                    // active tab — the user can switch away during the async
+                    // WebView2 init, and fronting an inactive tab would
+                    // occlude the active one (the Task #28 z-order class). An
+                    // inactive tab re-fronts itself via Render on reactivation.
+                    if item.is_visible {
+                        if let Err(err) = session.bring_underlay_to_front() {
+                            log::warn!("browser_viewer: initial underlay front failed: {err:?}");
+                        }
                     }
                     item.session = Some(session);
                     cx.notify();

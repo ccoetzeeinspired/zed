@@ -207,17 +207,23 @@ mod annotate {
         let scale_x = img.width() as f32 / vp_w;
         let scale_y = img.height() as f32 / vp_h;
 
+        // rx/ry/rw/rh come from the page's getBoundingClientRect and are
+        // untrusted — a hostile or buggy page can post Inf/NaN/huge values
+        // that would otherwise blow up the rasterizer. Only draw a finite
+        // outline (the line rasterizer also caps its step count).
         if let Some((rx, ry, rw, rh)) = element_rect {
-            let thickness = (2.5 * scale_y).round().max(2.0) as i32;
-            draw_rect_outline(
-                &mut img,
-                rx * scale_x,
-                ry * scale_y,
-                rw * scale_x,
-                rh * scale_y,
-                thickness,
-                OUTLINE,
-            );
+            if [rx, ry, rw, rh].iter().all(|v| v.is_finite()) {
+                let thickness = (2.5 * scale_y).round().max(2.0) as i32;
+                draw_rect_outline(
+                    &mut img,
+                    rx * scale_x,
+                    ry * scale_y,
+                    rw * scale_x,
+                    rh * scale_y,
+                    thickness,
+                    OUTLINE,
+                );
+            }
         }
 
         let ox = f32::from(viewport_origin.x);
@@ -311,7 +317,9 @@ mod annotate {
     ) {
         let dx = x1 - x0;
         let dy = y1 - y0;
-        let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as i32;
+        // Clamp the step count defensively so an out-of-range coordinate can
+        // never spin the loop for billions of iterations.
+        let steps = dx.abs().max(dy.abs()).ceil().clamp(1.0, 16384.0) as i32;
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
             let cx = (x0 + dx * t).round() as i32;
@@ -322,8 +330,8 @@ mod annotate {
 
     fn stamp(img: &mut RgbaImage, cx: i32, cy: i32, half: i32, color: Rgba<u8>) {
         let (w, h) = (img.width() as i32, img.height() as i32);
-        for yy in (cy - half)..=(cy + half) {
-            for xx in (cx - half)..=(cx + half) {
+        for yy in cy.saturating_sub(half)..=cy.saturating_add(half) {
+            for xx in cx.saturating_sub(half)..=cx.saturating_add(half) {
                 if xx >= 0 && yy >= 0 && xx < w && yy < h {
                     blend_pixel(img.get_pixel_mut(xx as u32, yy as u32), color);
                 }

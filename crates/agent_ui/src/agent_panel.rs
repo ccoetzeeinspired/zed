@@ -718,13 +718,15 @@ fn build_design_bundle_blocks(action: &SendDesignBundleToAgent) -> Vec<acp::Cont
     }
 
     if !action.outer_html.is_empty() {
-        let uri = format!("{}#selected-element", action.page_url);
-        blocks.push(acp::ContentBlock::Resource(acp::EmbeddedResource::new(
-            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
-                action.outer_html.to_string(),
-                uri,
-            )),
-        )));
+        // Plain text, NOT an embedded Resource: a Resource carries a URI that
+        // MessageEditor runs through MentionUri::parse when seeding a NEW
+        // thread, and `{page_url}#selected-element` parses to the wrong
+        // mention (or is dropped entirely for non-http(s) schemes). Text
+        // survives every dispatch path verbatim.
+        blocks.push(acp::ContentBlock::Text(acp::TextContent::new(format!(
+            "Selected element markup:\n```html\n{}\n```",
+            action.outer_html
+        ))));
     }
 
     blocks

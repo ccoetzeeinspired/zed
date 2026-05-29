@@ -90,13 +90,14 @@ pub const SCRIPT: &str = r#"
 
     // Resolve a fiber `type` to a component display name, unwrapping
     // forwardRef / memo. Returns null for host components (div, span…).
-    function componentName(type) {
-        if (!type || typeof type === 'string') return null;
+    function componentName(type, depth) {
+        depth = depth || 0;
+        if (depth > 5 || !type || typeof type === 'string') return null;
         if (typeof type === 'function') return type.displayName || type.name || null;
         if (typeof type === 'object') {
             if (type.displayName) return type.displayName;
             if (type.render) return type.render.displayName || type.render.name || null; // forwardRef
-            if (type.type) return componentName(type.type); // memo
+            if (type.type) return componentName(type.type, depth + 1); // memo
         }
         return null;
     }
@@ -110,6 +111,7 @@ pub const SCRIPT: &str = r#"
     //    versions — the React-19 path);
     //  - `data-source-*` / `data-component` / `data-testid` attributes.
     function detectReactSource(el) {
+      try {
         let component = null;
         for (let fiber = reactFiber(el), hops = 0; fiber && hops < 30; hops++, fiber = fiber.return) {
             if (fiber._debugSource) {
@@ -137,6 +139,10 @@ pub const SCRIPT: &str = r#"
             return { component: component || dataComp || null, testid: testid || null };
         }
         return null;
+      } catch (err) {
+        // Never let source detection break element selection / picking.
+        return null;
+      }
     }
 
     function paintOverlay(rect) {
