@@ -116,6 +116,13 @@ pub struct BrowserItem {
     /// pointing at it before submitting.
     pub drawing_mode_enabled: bool,
     pub drawing: crate::drawing::DrawingCanvas,
+    /// Phase 4.C: user drag offset for the "Describe the change" panel,
+    /// added to its element-anchored base position so it can be moved off
+    /// whatever it covers. Reset on new selection / panel close.
+    design_panel_offset: Point<Pixels>,
+    /// Active panel drag: (mouse position at drag start, panel offset at
+    /// drag start). `Some` while the panel header is held.
+    design_drag: Option<(Point<Pixels>, Point<Pixels>)>,
 }
 
 impl BrowserItem {
@@ -136,6 +143,8 @@ impl BrowserItem {
             design_prompt: String::new(),
             drawing_mode_enabled: false,
             drawing: crate::drawing::DrawingCanvas::default(),
+            design_panel_offset: point(px(0.), px(0.)),
+            design_drag: None,
         }
     }
 
@@ -203,8 +212,13 @@ impl BrowserView {
         });
 
         let design_prompt_editor = cx.new(|cx| {
-            let mut editor = Editor::multi_line(window, cx);
-            editor.set_placeholder_text("Describe the change…", window, cx);
+            // Gutter-less, soft-wrapping, auto-growing prompt input —
+            // configured like Zed's agent chat editor so it reads as a
+            // text box, not a code editor.
+            let mut editor = Editor::auto_height(3, 8, window, cx);
+            editor.set_placeholder_text("Describe the change you want…", window, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_soft_wrap();
             editor
         });
 
@@ -750,6 +764,11 @@ fn forward_mouse_event(
     mouse_data: u32,
 ) {
     view.item.update(cx, |item, _| {
+        // Don't forward to the page while the design panel is being
+        // dragged — avoids page hover flicker under the moving panel.
+        if item.design_drag.is_some() {
+            return;
+        }
         let Some(session) = item.session.as_ref() else {
             return;
         };
@@ -898,6 +917,51 @@ impl Render for BrowserView {
             tree = tree.child(panel);
         }
 
+        // While the design panel is being dragged, lay a transparent
+        // window-covering catcher on top so mouse-move/up are reliably
+        // captured anywhere (the panel header only starts the drag). This
+        // is the standard modal-backdrop pattern; GPUI does not otherwise
+        // route the release back to the element that began the drag.
+        #[cfg(target_os = "windows")]
+        if self.item.read(cx).design_drag.is_some() {
+            let win = window.viewport_size();
+            tree = tree.child(
+                deferred(
+                    anchored()
+                        .position_mode(AnchoredPositionMode::Window)
+                        .position(point(px(0.), px(0.)))
+                        .child(
+                            div()
+                                .occlude()
+                                .w(win.width)
+                                .h(win.height)
+                                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                                    this.item.update(cx, |item, cx| {
+                                        if let Some((start_mouse, start_offset)) = item.design_drag
+                                        {
+                                            item.design_panel_offset = point(
+                                                start_offset.x + (ev.position.x - start_mouse.x),
+                                                start_offset.y + (ev.position.y - start_mouse.y),
+                                            );
+                                            cx.notify();
+                                        }
+                                    });
+                                }))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                        this.item.update(cx, |item, cx| {
+                                            item.design_drag = None;
+                                            cx.notify();
+                                        });
+                                    }),
+                                ),
+                        ),
+                )
+                .with_priority(2),
+            );
+        }
+
         tree
     }
 }
@@ -923,15 +987,19 @@ impl BrowserView {
         let selection = item.design_selection.as_ref()?;
         let viewport_bounds = item.last_bounds?;
         let viewport_origin = viewport_bounds.origin;
+        let offset = item.design_panel_offset;
+        let has_strokes = !item.drawing.is_empty();
         let theme = cx.theme().colors().clone();
 
-        // Anchor at the bottom-left corner of the selection rect, with
-        // a small offset so the panel doesn't kiss the element border.
-        let anchor_x = px(f32::from(viewport_origin.x) + selection.rect.x);
-        let anchor_y = px(f32::from(viewport_origin.y) + selection.rect.y + selection.rect.h);
+        // Base anchor: just below the selected element, plus the user's
+        // drag offset. `snap_to_window` keeps it on-screen.
+        let anchor_x = px(f32::from(viewport_origin.x) + selection.rect.x) + offset.x;
+        let anchor_y =
+            px(f32::from(viewport_origin.y) + selection.rect.y + selection.rect.h + 8.) + offset.y;
 
-        let selector = selection.selector.clone();
-        let source_hint = selection
+        // Target chip: prefer source file:line, then the element tag,
+        // then the raw selector. Full selector shown on hover.
+        let target_label = selection
             .source
             .as_ref()
             .and_then(|s| {
@@ -940,39 +1008,133 @@ impl BrowserView {
                     None => f.clone(),
                 })
             })
+            .or_else(|| selection.tag.as_ref().map(|t| format!("<{t}>")))
             .unwrap_or_else(|| selection.selector.clone());
+        let full_selector = SharedString::new(selection.selector.clone());
+        let selector_for_key = selection.selector.clone();
+        let selector_for_submit = selection.selector.clone();
 
-        let panel = div()
+        let prompt_empty = self
+            .design_prompt_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .is_empty();
+        let attach_text = if has_strokes {
+            "Sends an annotated screenshot (with your drawing) + element context"
+        } else {
+            "Sends a screenshot + element context"
+        };
+
+        let panel = v_flex()
             .occlude()
-            .w(px(340.))
-            .p_2()
+            .w(px(380.))
             .bg(theme.elevated_surface_background)
             .border_1()
             .border_color(theme.border)
-            .rounded_md()
-            .shadow_md()
+            .rounded_lg()
+            .shadow_lg()
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                let ks = &ev.keystroke;
+                if ks.key == "enter" && (ks.modifiers.platform || ks.modifiers.control) {
+                    this.on_design_submit(&selector_for_key, window, cx);
+                    cx.stop_propagation();
+                } else if ks.key == "escape" {
+                    this.on_design_cancel(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            // Header — also the drag handle.
             .child(
-                v_flex()
+                h_flex()
+                    .px_2()
+                    .py_1()
                     .gap_1()
-                    .child(
-                        Label::new(SharedString::new(format!("Selected: {source_hint}")))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        div()
-                            .p_1()
-                            .min_h(px(64.))
-                            .rounded_sm()
-                            .bg(theme.editor_background)
-                            .border_1()
-                            .border_color(theme.border_variant)
-                            .child(self.design_prompt_editor.clone()),
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(theme.border_variant)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                            this.item.update(cx, |item, cx| {
+                                item.design_drag = Some((ev.position, item.design_panel_offset));
+                                cx.notify();
+                            });
+                            cx.stop_propagation();
+                        }),
                     )
                     .child(
                         h_flex()
                             .gap_1()
-                            .justify_end()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::Crosshair)
+                                    .size(IconSize::Small)
+                                    .color(Color::Accent),
+                            )
+                            .child(Label::new("Describe the change").size(LabelSize::Small)),
+                    )
+                    .child(
+                        IconButton::new("design-close", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Cancel (Esc)"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_design_cancel(window, cx);
+                            })),
+                    ),
+            )
+            // Target chip.
+            .child(
+                div().px_2().pt_2().child(
+                    h_flex()
+                        .id("design-target")
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .bg(theme.element_background)
+                        .tooltip(Tooltip::text(full_selector))
+                        .child(
+                            Label::new(target_label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                ),
+            )
+            // Prompt input.
+            .child(
+                div()
+                    .m_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.editor_background)
+                    .border_1()
+                    .border_color(theme.border_variant)
+                    .child(self.design_prompt_editor.clone()),
+            )
+            // Footer — what gets sent + actions.
+            .child(
+                h_flex()
+                    .px_2()
+                    .pb_2()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        Label::new(attach_text)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Label::new("Ctrl+Enter")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
                             .child(
                                 Button::new("design-cancel", "Cancel")
                                     .label_size(LabelSize::Small)
@@ -984,24 +1146,23 @@ impl BrowserView {
                                 Button::new("design-submit", "Submit")
                                     .label_size(LabelSize::Small)
                                     .style(ButtonStyle::Filled)
+                                    .disabled(prompt_empty)
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.on_design_submit(&selector, window, cx);
+                                        this.on_design_submit(&selector_for_submit, window, cx);
                                     })),
                             ),
                     ),
             );
 
-        // `anchored` does its own positioning at paint time, but it
-        // still paints in document order — so wrapping in `deferred`
-        // bumps it onto the late-paint pass with priority, putting it
-        // over the viewport + drawing overlay. Same pattern Zed uses
-        // for context menus and right-click menus.
+        // `anchored` positions at paint time but paints in document
+        // order — `deferred` bumps it onto the late-paint pass with
+        // priority so it sits over the viewport + drawing overlay.
         Some(
             deferred(
                 anchored()
                     .anchor(Anchor::TopLeft)
                     .position_mode(AnchoredPositionMode::Window)
-                    .position(point(anchor_x, anchor_y + px(4.)))
+                    .position(point(anchor_x, anchor_y))
                     .snap_to_window()
                     .child(panel),
             )
@@ -1018,6 +1179,8 @@ impl BrowserView {
         self.item.update(cx, |item, cx| {
             item.design_selection = None;
             item.design_prompt.clear();
+            item.design_panel_offset = point(px(0.), px(0.));
+            item.design_drag = None;
             if let Some(session) = &item.session {
                 let _ = session.post_message_string("clear_selection");
             }
@@ -1824,6 +1987,9 @@ fn apply_navigation_event(item: &mut BrowserItem, event: NavigationEvent) {
                         sel.outer_html.len()
                     );
                     item.design_selection = Some(sel);
+                    // Fresh selection re-anchors the panel at the new element.
+                    item.design_panel_offset = point(px(0.), px(0.));
+                    item.design_drag = None;
                 }
                 DesignInbound::PageScrolled(scroll) => {
                     // Update the selection's rect so the host can
