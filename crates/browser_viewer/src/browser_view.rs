@@ -196,9 +196,6 @@ pub struct BrowserView {
     /// WebView2's DComp visual sits above the Zed swap chain in the
     /// composition tree.
     workspace: Option<WeakEntity<Workspace>>,
-    /// Cached "is a modal currently open" so we only call `SetIsVisible`
-    /// when the state actually changes.
-    modal_open: bool,
 }
 
 impl BrowserView {
@@ -237,7 +234,6 @@ impl BrowserView {
             url_editor,
             design_prompt_editor,
             workspace: None,
-            modal_open: false,
         }
     }
 
@@ -1315,8 +1311,8 @@ impl BrowserView {
 
             let annotated_png_base64 =
                 base64::engine::general_purpose::STANDARD.encode(&annotated_png);
-            log::info!(
-                "browser_viewer: [fork-debug] dispatching design bundle to agent — \
+            log::debug!(
+                "browser_viewer: dispatching design bundle to agent — \
                  selector={}, png={} bytes ({} b64 chars), has_drawing={}, source={:?}",
                 selector_owned,
                 annotated_png.len(),
@@ -1731,7 +1727,7 @@ impl Element for DrawingPaintElement {
         for stroke in canvas
             .strokes
             .iter()
-            .chain(canvas.current.as_ref().into_iter())
+            .chain(canvas.current.as_ref())
         {
             if stroke.points.len() < 2 {
                 continue;

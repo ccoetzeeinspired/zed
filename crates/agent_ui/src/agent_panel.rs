@@ -702,7 +702,18 @@ fn build_design_bundle_blocks(action: &SendDesignBundleToAgent) -> Vec<acp::Cont
                 action.annotated_png_base64.to_string(),
                 "image/png".to_string(),
             )
-            .uri(Some("zed:///agent/browser-design-screenshot.png".to_string())),
+            // Must be a valid `MentionUri` — an arbitrary `zed://` path
+            // fails `MentionUri::parse`, and `MessageEditor::set_message`
+            // then `continue`s past the block, silently dropping the image
+            // when seeding a new thread. The canonical pasted-image URI
+            // round-trips cleanly.
+            .uri(Some(
+                MentionUri::PastedImage {
+                    name: "browser-design-screenshot.png".to_string(),
+                }
+                .to_uri()
+                .to_string(),
+            )),
         ));
     }
 
