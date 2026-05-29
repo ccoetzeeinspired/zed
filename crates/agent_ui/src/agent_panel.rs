@@ -23,7 +23,8 @@ use settings::{LanguageModelProviderSetting, LanguageModelSelection};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
+        AddSelectionToThread, BrowserClearAgentCursor, BrowserClickResolvedElement,
+        BrowserResolveElement, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
         ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SendDesignBundleToAgent,
     },
@@ -580,6 +581,23 @@ pub fn init(cx: &mut App) {
                                 cx,
                             );
                         });
+                    }
+                })
+                .register_action(|workspace, action: &BrowserResolveElement, window, cx| {
+                    if let Some(active_item) = workspace.active_item(cx) {
+                        active_item.relay_action(Box::new(action.clone()), window, cx);
+                    }
+                })
+                .register_action(
+                    |workspace, action: &BrowserClickResolvedElement, window, cx| {
+                        if let Some(active_item) = workspace.active_item(cx) {
+                            active_item.relay_action(Box::new(action.clone()), window, cx);
+                        }
+                    },
+                )
+                .register_action(|workspace, action: &BrowserClearAgentCursor, window, cx| {
+                    if let Some(active_item) = workspace.active_item(cx) {
+                        active_item.relay_action(Box::new(action.clone()), window, cx);
                     }
                 })
                 .register_action(

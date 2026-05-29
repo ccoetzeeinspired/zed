@@ -583,6 +583,32 @@ pub mod agent {
         /// Whether the user drew freehand annotations.
         pub has_drawing: bool,
     }
+
+    /// Resolve a target element in the active embedded browser tab.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct BrowserResolveElement {
+        /// Query kind: selected, selector, text_exact, text_contains, or role_and_name.
+        pub query_kind: SharedString,
+        /// Query payload. For role_and_name use "role|name".
+        pub query: SharedString,
+    }
+
+    /// Click the currently previewed element in the active embedded browser tab.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct BrowserClickResolvedElement {
+        /// Optional request id. Empty means click the current preview.
+        pub request_id: SharedString,
+    }
+
+    /// Clear the visible browser agent cursor in the active embedded browser tab.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct BrowserClearAgentCursor;
 }
 
 pub mod assistant {

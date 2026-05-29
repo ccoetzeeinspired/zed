@@ -159,6 +159,105 @@ pub const SCRIPT: &str = r#"
         if (overlay) overlay.style.display = 'none';
     }
 
+    function visible(el) {
+        if (!(el instanceof Element)) return false;
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 &&
+            style.visibility !== 'hidden' && style.display !== 'none';
+    }
+
+    function norm(s) {
+        return (s || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function elementText(el) {
+        return norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+    }
+
+    function roleOf(el) {
+        const explicit = el.getAttribute('role');
+        if (explicit) return explicit;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'button') return 'button';
+        if (tag === 'a' && el.hasAttribute('href')) return 'link';
+        if (tag === 'input') {
+            const type = (el.getAttribute('type') || 'text').toLowerCase();
+            if (type === 'submit' || type === 'button') return 'button';
+            return 'textbox';
+        }
+        return null;
+    }
+
+    function accessibleName(el) {
+        return norm(el.getAttribute('aria-label') || el.value || elementText(el));
+    }
+
+    function serializeAgentTarget(el, confidence) {
+        const rect = el.getBoundingClientRect();
+        return {
+            selector: cssPath(el),
+            tag: el.tagName.toLowerCase(),
+            text: elementText(el).slice(0, 500),
+            role: roleOf(el),
+            accessibleName: accessibleName(el).slice(0, 500),
+            rect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height },
+            source: detectReactSource(el),
+            confidence,
+        };
+    }
+
+    function allVisibleElements() {
+        return Array.from(document.querySelectorAll('body *')).filter(visible);
+    }
+
+    function resolveAgentTarget(requestId, query) {
+        try {
+            let candidates = [];
+            if (!query || !query.type) {
+                post({ kind: 'agent_target_not_found', requestId, reason: 'Missing query type' });
+                return;
+            }
+            if (query.type === 'selected') {
+                if (!selected || !visible(selected)) {
+                    post({ kind: 'agent_target_not_found', requestId, reason: 'No selected element' });
+                    return;
+                }
+                candidates = [serializeAgentTarget(selected, 'exact')];
+            } else if (query.type === 'selector') {
+                candidates = Array.from(document.querySelectorAll(query.selector || ''))
+                    .filter(visible)
+                    .map(el => serializeAgentTarget(el, 'exact'));
+            } else if (query.type === 'text_exact' || query.type === 'text_contains') {
+                const needle = norm(query.text).toLowerCase();
+                candidates = allVisibleElements().filter(el => {
+                    const hay = elementText(el).toLowerCase();
+                    return query.type === 'text_exact' ? hay === needle : hay.includes(needle);
+                }).map(el => serializeAgentTarget(el, query.type === 'text_exact' ? 'exact' : 'strong'));
+            } else if (query.type === 'role_and_name') {
+                const role = norm(query.role).toLowerCase();
+                const name = norm(query.name).toLowerCase();
+                candidates = allVisibleElements().filter(el => {
+                    return (roleOf(el) || '').toLowerCase() === role &&
+                        accessibleName(el).toLowerCase().includes(name);
+                }).map(el => serializeAgentTarget(el, 'strong'));
+            } else if (query.type === 'point') {
+                const el = document.elementFromPoint(query.x, query.y);
+                candidates = el && visible(el) ? [serializeAgentTarget(el, 'exact')] : [];
+            }
+
+            if (candidates.length === 0) {
+                post({ kind: 'agent_target_not_found', requestId, reason: 'No visible element matched' });
+            } else if (candidates.length === 1) {
+                post({ kind: 'agent_target_resolved', requestId, target: candidates[0] });
+            } else {
+                post({ kind: 'agent_target_ambiguous', requestId, candidates: candidates.slice(0, 8) });
+            }
+        } catch (err) {
+            post({ kind: 'agent_target_not_found', requestId, reason: String(err && err.message || err) });
+        }
+    }
+
     // Capture-phase swallow. Every event the page could navigate on,
     // we intercept first. preventDefault stops the default action
     // (form submit, anchor navigation); stopImmediatePropagation stops
@@ -228,7 +327,15 @@ pub const SCRIPT: &str = r#"
     window.chrome.webview.addEventListener('message', evt => {
         const msg = evt.data;
         console.log(TAG, 'host message:', msg);
-        if (msg === 'activate') {
+        let parsed = null;
+        if (typeof msg === 'string' && msg[0] === '{') {
+            try { parsed = JSON.parse(msg); } catch (_) {}
+        }
+        if (parsed && parsed.kind === 'find_element') {
+            resolveAgentTarget(parsed.requestId, parsed.query);
+        } else if (parsed && parsed.kind === 'clear_agent_cursor') {
+            post({ kind: 'agent_target_not_found', requestId: parsed.requestId, reason: 'cleared' });
+        } else if (msg === 'activate') {
             armed = true;
             ensureOverlay();
         } else if (msg === 'deactivate') {

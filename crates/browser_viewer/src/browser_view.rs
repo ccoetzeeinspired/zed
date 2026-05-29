@@ -38,11 +38,11 @@ use workspace::{
 #[cfg(target_os = "windows")]
 mod windows_imports {
     pub use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    pub use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     pub use webview2_com::Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_MOUSE_EVENT_KIND, COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
         COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK,
-        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN, COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
         COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOUBLE_CLICK,
         COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN,
         COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP, COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
@@ -59,6 +59,7 @@ mod windows_imports {
         COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_X_BUTTON2,
     };
     pub use windows::Win32::Foundation::HWND;
+    pub use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 }
 
 #[cfg(target_os = "windows")]
@@ -116,6 +117,9 @@ pub struct BrowserItem {
     /// pointing at it before submitting.
     pub drawing_mode_enabled: bool,
     pub drawing: crate::drawing::DrawingCanvas,
+    /// Agent-controlled cursor preview target. Rendered by GPUI and clicked
+    /// through native WebView2 mouse input.
+    pub agent_cursor: Option<crate::agent_cursor::AgentCursorState>,
     /// Phase 4.C: user drag offset for the "Describe the change" panel,
     /// added to its element-anchored base position so it can be moved off
     /// whatever it covers. Reset on new selection / panel close.
@@ -143,6 +147,7 @@ impl BrowserItem {
             design_prompt: String::new(),
             drawing_mode_enabled: false,
             drawing: crate::drawing::DrawingCanvas::default(),
+            agent_cursor: None,
             design_panel_offset: point(px(0.), px(0.)),
             design_drag: None,
         }
@@ -184,6 +189,7 @@ pub struct BrowserView {
     item: Entity<BrowserItem>,
     focus_handle: FocusHandle,
     url_editor: Entity<Editor>,
+    agent_target_editor: Entity<Editor>,
     /// Phase 4.C: editor for the "Describe the change" floating input.
     /// Always lives — we render it only when the item has a selection
     /// and design mode is on, but keeping the entity persistent avoids
@@ -212,6 +218,12 @@ impl BrowserView {
             editor
         });
 
+        let agent_target_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Target text or css:selector", window, cx);
+            editor
+        });
+
         let design_prompt_editor = cx.new(|cx| {
             // Gutter-less, soft-wrapping, auto-growing prompt input —
             // configured like Zed's agent chat editor so it reads as a
@@ -236,6 +248,7 @@ impl BrowserView {
             item,
             focus_handle: cx.focus_handle(),
             url_editor,
+            agent_target_editor,
             design_prompt_editor,
             workspace: None,
             design_prompt_focused_for: None,
@@ -331,6 +344,112 @@ impl BrowserView {
         });
     }
 
+    fn on_preview_selected_element(
+        &mut self,
+        _: &crate::PreviewSelectedElement,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.item.update(cx, |item, cx| {
+            let Some(selection) = item.design_selection.clone() else {
+                item.agent_cursor = Some(crate::agent_cursor::AgentCursorState {
+                    request_id: "selected".to_string(),
+                    target: crate::browser_protocol::BrowserResolvedElement {
+                        selector: "selected".to_string(),
+                        tag: Some("missing".to_string()),
+                        text: Some("No selected browser element".to_string()),
+                        role: None,
+                        accessible_name: Some("No selected browser element".to_string()),
+                        rect: crate::design::ElementRect {
+                            x: 0.,
+                            y: 0.,
+                            w: 0.,
+                            h: 0.,
+                        },
+                        source: None,
+                        confidence: crate::browser_protocol::BrowserTargetConfidence::Weak,
+                    },
+                    status: crate::agent_cursor::AgentCursorStatus::Failed(
+                        "No selected browser element".to_string(),
+                    ),
+                    label: "No selected browser element".to_string(),
+                    ambiguity: Vec::new(),
+                });
+                cx.notify();
+                return;
+            };
+
+            let target = crate::browser_protocol::BrowserResolvedElement {
+                selector: selection.selector,
+                tag: selection.tag,
+                text: Some(selection.outer_html.chars().take(120).collect()),
+                role: None,
+                accessible_name: None,
+                rect: selection.rect,
+                source: selection.source,
+                confidence: crate::browser_protocol::BrowserTargetConfidence::Exact,
+            };
+            item.agent_cursor = Some(crate::agent_cursor::AgentCursorState::preview(
+                "selected".to_string(),
+                target,
+            ));
+            cx.notify();
+        });
+    }
+
+    fn on_clear_agent_cursor(
+        &mut self,
+        _: &crate::ClearAgentCursor,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.item.update(cx, |item, cx| {
+            item.agent_cursor = None;
+            cx.notify();
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn preview_agent_target_from_editor(&self, cx: &mut Context<Self>) {
+        let input = self.agent_target_editor.read(cx).text(cx);
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let query = if let Some(selector) = trimmed
+            .strip_prefix("css:")
+            .or_else(|| trimmed.strip_prefix("selector:"))
+        {
+            crate::browser_protocol::BrowserElementQuery::Selector {
+                selector: selector.trim().to_string(),
+            }
+        } else {
+            crate::browser_protocol::BrowserElementQuery::TextContains {
+                text: trimmed.to_string(),
+            }
+        };
+        self.post_find_element("toolbar".to_string(), query, cx);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_click_previewed_element(
+        &mut self,
+        _: &crate::ClickPreviewedElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        click_agent_cursor_target(self, cx, window);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn on_click_previewed_element(
+        &mut self,
+        _: &crate::ClickPreviewedElement,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     fn on_toggle_design_mode(
         &mut self,
         _: &crate::ToggleDesignMode,
@@ -393,6 +512,113 @@ impl BrowserView {
         let _ = cx;
     }
 
+    #[cfg(target_os = "windows")]
+    fn on_agent_resolve_element(
+        &mut self,
+        action: &zed_actions::agent::BrowserResolveElement,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let query = match browser_query_from_action(action) {
+            Ok(query) => query,
+            Err(reason) => {
+                self.item.update(cx, |item, cx| {
+                    item.agent_cursor = Some(crate::agent_cursor::AgentCursorState {
+                        request_id: "agent".to_string(),
+                        target: crate::browser_protocol::BrowserResolvedElement {
+                            selector: "invalid-query".to_string(),
+                            tag: Some("missing".to_string()),
+                            text: Some(reason.clone()),
+                            role: None,
+                            accessible_name: Some(reason.clone()),
+                            rect: crate::design::ElementRect {
+                                x: 0.,
+                                y: 0.,
+                                w: 0.,
+                                h: 0.,
+                            },
+                            source: None,
+                            confidence: crate::browser_protocol::BrowserTargetConfidence::Weak,
+                        },
+                        status: crate::agent_cursor::AgentCursorStatus::Failed(reason.clone()),
+                        label: reason,
+                        ambiguity: Vec::new(),
+                    });
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        self.post_find_element("agent".to_string(), query, cx);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_agent_click_resolved_element(
+        &mut self,
+        _: &zed_actions::agent::BrowserClickResolvedElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        click_agent_cursor_target(self, cx, window);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_agent_clear_cursor(
+        &mut self,
+        _: &zed_actions::agent::BrowserClearAgentCursor,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.item.update(cx, |item, cx| {
+            item.agent_cursor = None;
+            cx.notify();
+        });
+    }
+
+    #[cfg(target_os = "windows")]
+    fn post_find_element(
+        &self,
+        request_id: String,
+        query: crate::browser_protocol::BrowserElementQuery,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(payload) = serde_json::to_string(&serde_json::json!({
+            "kind": "find_element",
+            "requestId": request_id,
+            "query": query,
+        })) else {
+            return;
+        };
+        self.item.update(cx, |item, cx| {
+            if let Some(session) = item.session.as_ref() {
+                if let Err(err) = session.post_message_string(&payload) {
+                    item.agent_cursor = Some(crate::agent_cursor::AgentCursorState {
+                        request_id: "agent".to_string(),
+                        target: crate::browser_protocol::BrowserResolvedElement {
+                            selector: "post-message-failed".to_string(),
+                            tag: Some("missing".to_string()),
+                            text: Some(err.to_string()),
+                            role: None,
+                            accessible_name: Some(err.to_string()),
+                            rect: crate::design::ElementRect {
+                                x: 0.,
+                                y: 0.,
+                                w: 0.,
+                                h: 0.,
+                            },
+                            source: None,
+                            confidence: crate::browser_protocol::BrowserTargetConfidence::Weak,
+                        },
+                        status: crate::agent_cursor::AgentCursorStatus::Failed(err.to_string()),
+                        label: "Browser command failed".to_string(),
+                        ambiguity: Vec::new(),
+                    });
+                }
+            }
+            cx.notify();
+        });
+    }
+
     /// Phase 3: forward GPUI key events that GPUI didn't bind to actions
     /// into WebView2 via CDP `Input.dispatchKeyEvent`. On focus only
     /// happens when the user has actually clicked the page (mouse_down
@@ -400,12 +626,7 @@ impl BrowserView {
     /// unaffected — that focus path routes through the editor's own
     /// key handlers first.
     #[cfg(target_os = "windows")]
-    fn on_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.dispatch_key("keyDown", &event.keystroke, cx);
     }
 
@@ -441,12 +662,13 @@ impl BrowserView {
         });
     }
 
-    fn on_submit_url(
-        &mut self,
-        _: &menu::Confirm,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_submit_url(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_target_editor.focus_handle(cx).is_focused(window) {
+            #[cfg(target_os = "windows")]
+            self.preview_agent_target_from_editor(cx);
+            return;
+        }
+
         // When the URL editor isn't focused, Enter came from the page
         // viewport (we focus BrowserView on click). GPUI counts the
         // action as consumed once dispatched here, so `on_key_down`
@@ -800,6 +1022,128 @@ fn forward_mouse_event(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn click_agent_cursor_target(
+    view: &mut BrowserView,
+    cx: &mut Context<BrowserView>,
+    window: &mut Window,
+) {
+    view.item.update(cx, |item, cx| {
+        let Some(cursor) = item.agent_cursor.as_mut() else {
+            return;
+        };
+        let Some(session) = item.session.as_ref() else {
+            cursor.status = crate::agent_cursor::AgentCursorStatus::Failed(
+                "Browser session is not ready".into(),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(bounds) = item.last_bounds else {
+            cursor.status = crate::agent_cursor::AgentCursorStatus::Failed(
+                "Browser viewport is not ready".into(),
+            );
+            cx.notify();
+            return;
+        };
+
+        cursor.status = crate::agent_cursor::AgentCursorStatus::Clicking;
+        let rect = &cursor.target.rect;
+        let max_x = f32::from(bounds.size.width).max(1.) - 1.;
+        let max_y = f32::from(bounds.size.height).max(1.) - 1.;
+        let local_x = (rect.x + rect.w / 2.).clamp(0., max_x) as i32;
+        let local_y = (rect.y + rect.h / 2.).clamp(0., max_y) as i32;
+
+        let none = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS(0);
+        let left = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON;
+        let result = session
+            .send_mouse_input(
+                COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
+                none,
+                0,
+                local_x,
+                local_y,
+            )
+            .and_then(|_| {
+                session.send_mouse_input(
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN,
+                    left,
+                    0,
+                    local_x,
+                    local_y,
+                )
+            })
+            .and_then(|_| {
+                session.send_mouse_input(
+                    COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+                    none,
+                    0,
+                    local_x,
+                    local_y,
+                )
+            });
+
+        match result {
+            Ok(()) => {
+                cursor.status = crate::agent_cursor::AgentCursorStatus::Clicked;
+                item.agent_cursor = None;
+            }
+            Err(err) => {
+                cursor.status = crate::agent_cursor::AgentCursorStatus::Failed(err.to_string());
+            }
+        }
+        cx.notify();
+    });
+
+    if let Some(hwnd) = hwnd_from_window(window) {
+        unsafe {
+            let _ = SetFocus(Some(hwnd));
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn browser_query_from_action(
+    action: &zed_actions::agent::BrowserResolveElement,
+) -> Result<crate::browser_protocol::BrowserElementQuery, String> {
+    let kind = action.query_kind.as_ref().trim().to_ascii_lowercase();
+    let query = action.query.as_ref().trim().to_string();
+    match kind.as_str() {
+        "selected" => Ok(crate::browser_protocol::BrowserElementQuery::Selected),
+        "selector" => {
+            if query.is_empty() {
+                Err("Selector query cannot be empty".to_string())
+            } else {
+                Ok(crate::browser_protocol::BrowserElementQuery::Selector { selector: query })
+            }
+        }
+        "text_exact" => {
+            if query.is_empty() {
+                Err("Text query cannot be empty".to_string())
+            } else {
+                Ok(crate::browser_protocol::BrowserElementQuery::TextExact { text: query })
+            }
+        }
+        "text_contains" | "text" => {
+            if query.is_empty() {
+                Err("Text query cannot be empty".to_string())
+            } else {
+                Ok(crate::browser_protocol::BrowserElementQuery::TextContains { text: query })
+            }
+        }
+        "role_and_name" => {
+            let Some((role, name)) = query.split_once('|') else {
+                return Err("Role query must use role|name".to_string());
+            };
+            Ok(crate::browser_protocol::BrowserElementQuery::RoleAndName {
+                role: role.trim().to_string(),
+                name: name.trim().to_string(),
+            })
+        }
+        other => Err(format!("Unsupported browser query kind: {other}")),
+    }
+}
+
 impl EventEmitter<BrowserViewEvent> for BrowserView {}
 
 impl Focusable for BrowserView {
@@ -914,6 +1258,9 @@ impl Render for BrowserView {
                     .child(DrawingPaintElement::new(item)),
             );
         }
+        if let Some(overlay) = self.render_agent_cursor_overlay(cx) {
+            viewport = viewport.child(overlay);
+        }
         if drawing_on {
             viewport = self.attach_drawing_handlers(viewport, cx);
         }
@@ -926,12 +1273,18 @@ impl Render for BrowserView {
             .on_action(cx.listener(Self::on_focus_address_bar))
             .on_action(cx.listener(Self::on_toggle_design_mode))
             .on_action(cx.listener(Self::on_toggle_drawing_mode))
-            .on_action(cx.listener(Self::on_clear_drawing));
+            .on_action(cx.listener(Self::on_clear_drawing))
+            .on_action(cx.listener(Self::on_preview_selected_element))
+            .on_action(cx.listener(Self::on_click_previewed_element))
+            .on_action(cx.listener(Self::on_clear_agent_cursor));
 
         #[cfg(target_os = "windows")]
         let root = root
             .on_key_down(cx.listener(Self::on_key_down))
-            .on_key_up(cx.listener(Self::on_key_up));
+            .on_key_up(cx.listener(Self::on_key_up))
+            .on_action(cx.listener(Self::on_agent_resolve_element))
+            .on_action(cx.listener(Self::on_agent_click_resolved_element))
+            .on_action(cx.listener(Self::on_agent_clear_cursor));
 
         let mut tree = root
             .size_full()
@@ -1007,6 +1360,64 @@ impl Render for BrowserView {
 }
 
 impl BrowserView {
+    fn render_agent_cursor_overlay(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let cursor = self.item.read(cx).agent_cursor.clone()?;
+        let rect = cursor.target.rect;
+        if rect.w <= 0. || rect.h <= 0. {
+            return None;
+        }
+
+        let colors = cx.theme().colors();
+        let border = colors.border_focused;
+        let marker_x = rect.x + rect.w / 2. - 4.;
+        let marker_y = rect.y + rect.h / 2. - 4.;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(rect.x))
+                        .top(px(rect.y))
+                        .w(px(rect.w))
+                        .h(px(rect.h))
+                        .border_2()
+                        .border_color(border)
+                        .rounded_sm(),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(marker_x))
+                        .top(px(marker_y))
+                        .w(px(8.))
+                        .h(px(8.))
+                        .rounded_full()
+                        .bg(border),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(rect.x))
+                        .top(px((rect.y - 24.).max(0.)))
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_md()
+                        .bg(colors.elevated_surface_background)
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            Label::new(cursor.label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Default),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Phase 4.C: float a "Describe the change" panel near the selected
     /// page element. Returns `None` when there's nothing to show
     /// (design mode off, no selection, or no recorded viewport bounds).
@@ -1253,7 +1664,15 @@ impl BrowserView {
         // Snapshot everything the bundle needs *now*, before the
         // async screenshot completes — `BrowserItem.design_selection`
         // may be cleared by the user before the callback fires.
-        let (outer_html, source, drawing_snapshot, element_rect, viewport_origin, viewport_size, page_url) = {
+        let (
+            outer_html,
+            source,
+            drawing_snapshot,
+            element_rect,
+            viewport_origin,
+            viewport_size,
+            page_url,
+        ) = {
             let item = self.item.read(cx);
             let Some(sel) = item.design_selection.as_ref() else {
                 log::warn!("browser_viewer: submit fired without a selection");
@@ -1371,9 +1790,9 @@ impl BrowserView {
                         "browser_viewer: [fork-debug] design bundle written to {}",
                         dir.display()
                     ),
-                    Err(err) => log::warn!(
-                        "browser_viewer: [fork-debug] failed to persist bundle: {err:?}"
-                    ),
+                    Err(err) => {
+                        log::warn!("browser_viewer: [fork-debug] failed to persist bundle: {err:?}")
+                    }
                 }
             }
 
@@ -1425,6 +1844,8 @@ impl BrowserView {
         let design_on = self.item.read(cx).design_mode_enabled;
         let drawing_on = self.item.read(cx).drawing_mode_enabled;
         let has_strokes = !self.item.read(cx).drawing.is_empty();
+        let has_selection = self.item.read(cx).design_selection.is_some();
+        let has_agent_cursor = self.item.read(cx).agent_cursor.is_some();
         h_flex()
             .h_8()
             .flex_none()
@@ -1494,6 +1915,28 @@ impl BrowserView {
                     .child(self.url_editor.clone()),
             )
             .child(
+                div()
+                    .w(px(190.))
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(self.agent_target_editor.clone()),
+            )
+            .child(
+                IconButton::new("browser-preview-target-query", IconName::Check)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Preview target text or css:selector"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        #[cfg(target_os = "windows")]
+                        this.preview_agent_target_from_editor(cx);
+                        #[cfg(not(target_os = "windows"))]
+                        let _ = (this, cx);
+                    })),
+            )
+            .child(
                 IconButton::new("browser-design-mode", IconName::Crosshair)
                     .icon_size(IconSize::Small)
                     .toggle_state(design_on)
@@ -1503,11 +1946,7 @@ impl BrowserView {
                         "Design Mode: OFF (click to enable element picker)"
                     }))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_toggle_design_mode(
-                            &crate::ToggleDesignMode,
-                            window,
-                            cx,
-                        );
+                        this.on_toggle_design_mode(&crate::ToggleDesignMode, window, cx);
                     })),
             )
             .child(
@@ -1520,11 +1959,7 @@ impl BrowserView {
                         "Drawing Mode: OFF (click to draw on the page)"
                     }))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_toggle_drawing_mode(
-                            &crate::ToggleDrawingMode,
-                            window,
-                            cx,
-                        );
+                        this.on_toggle_drawing_mode(&crate::ToggleDrawingMode, window, cx);
                     })),
             )
             .when(has_strokes, |b| {
@@ -1537,6 +1972,28 @@ impl BrowserView {
                         })),
                 )
             })
+            .child(
+                IconButton::new("browser-preview-selected", IconName::Crosshair)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_selection)
+                    .tooltip(Tooltip::text("Preview selected element for agent click"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_preview_selected_element(
+                            &crate::PreviewSelectedElement,
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                IconButton::new("browser-click-previewed", IconName::PlayFilled)
+                    .icon_size(IconSize::Small)
+                    .disabled(!has_agent_cursor)
+                    .tooltip(Tooltip::text("Click previewed browser target"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_click_previewed_element(&crate::ClickPreviewedElement, window, cx);
+                    })),
+            )
     }
 }
 
@@ -1792,11 +2249,7 @@ impl Element for DrawingPaintElement {
     ) {
         let canvas = self.item.read(cx).drawing.clone();
         let stroke_color = gpui::hsla(0.36, 1.0, 0.5, 1.0); // bright green
-        for stroke in canvas
-            .strokes
-            .iter()
-            .chain(canvas.current.as_ref())
-        {
+        for stroke in canvas.strokes.iter().chain(canvas.current.as_ref()) {
             if stroke.points.len() < 2 {
                 continue;
             }
@@ -2024,6 +2477,7 @@ fn apply_navigation_event(item: &mut BrowserItem, event: NavigationEvent) {
             // disappears for the duration of the load. The script
             // re-injects on every navigation and the user picks anew.
             item.design_selection = None;
+            item.agent_cursor = None;
         }
         NavigationEvent::NavigationCompleted { is_success } => {
             item.is_loading = false;
@@ -2033,8 +2487,12 @@ fn apply_navigation_event(item: &mut BrowserItem, event: NavigationEvent) {
         }
         NavigationEvent::DesignModeMessage(raw) => {
             use crate::design::DesignInbound;
+            if let Some(parsed) = crate::browser_protocol::BrowserAutomationInbound::parse(&raw) {
+                apply_browser_automation_event(item, parsed);
+                return;
+            }
             let Some(parsed) = DesignInbound::parse(&raw) else {
-                log::debug!("browser_viewer: dropping unparseable design msg: {raw}");
+                log::debug!("browser_viewer: dropping unparseable browser msg: {raw}");
                 return;
             };
             match parsed {
@@ -2067,6 +2525,59 @@ fn apply_navigation_event(item: &mut BrowserItem, event: NavigationEvent) {
                         sel.rect = scroll.rect;
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_browser_automation_event(
+    item: &mut BrowserItem,
+    event: crate::browser_protocol::BrowserAutomationInbound,
+) {
+    match event {
+        crate::browser_protocol::BrowserAutomationInbound::AgentTargetResolved {
+            request_id,
+            target,
+        } => {
+            item.agent_cursor = Some(crate::agent_cursor::AgentCursorState::preview(
+                request_id, target,
+            ));
+        }
+        crate::browser_protocol::BrowserAutomationInbound::AgentTargetNotFound {
+            request_id,
+            reason,
+        } => {
+            item.agent_cursor = Some(crate::agent_cursor::AgentCursorState {
+                request_id,
+                target: crate::browser_protocol::BrowserResolvedElement {
+                    selector: "not-found".to_string(),
+                    tag: Some("missing".to_string()),
+                    text: Some(reason.clone()),
+                    role: None,
+                    accessible_name: Some(reason.clone()),
+                    rect: crate::design::ElementRect {
+                        x: 0.,
+                        y: 0.,
+                        w: 0.,
+                        h: 0.,
+                    },
+                    source: None,
+                    confidence: crate::browser_protocol::BrowserTargetConfidence::Weak,
+                },
+                status: crate::agent_cursor::AgentCursorStatus::Failed(reason.clone()),
+                label: reason,
+                ambiguity: Vec::new(),
+            });
+        }
+        crate::browser_protocol::BrowserAutomationInbound::AgentTargetAmbiguous {
+            request_id,
+            candidates,
+        } => {
+            if let Some(first) = candidates.first().cloned() {
+                let mut cursor = crate::agent_cursor::AgentCursorState::preview(request_id, first);
+                cursor.ambiguity = candidates;
+                item.agent_cursor = Some(cursor);
             }
         }
     }

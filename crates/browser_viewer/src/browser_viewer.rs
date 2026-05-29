@@ -12,6 +12,8 @@ use settings::Settings as _;
 use ui::SharedString;
 use workspace::Workspace;
 
+pub mod agent_cursor;
+pub mod browser_protocol;
 pub mod browser_settings;
 pub mod browser_view;
 pub mod bundle;
@@ -40,7 +42,13 @@ actions!(
         /// Toggle drawing mode — freehand strokes over the page.
         ToggleDrawingMode,
         /// Clear all drawn strokes on the active browser tab.
-        ClearDrawing
+        ClearDrawing,
+        /// Preview the current design-mode selection as an agent click target.
+        PreviewSelectedElement,
+        /// Click the currently previewed agent cursor target.
+        ClickPreviewedElement,
+        /// Clear the visible agent cursor target.
+        ClearAgentCursor
     ]
 );
 
