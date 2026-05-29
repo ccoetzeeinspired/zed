@@ -999,10 +999,14 @@ impl BrowserView {
             .source
             .as_ref()
             .and_then(|s| {
-                s.file_name.as_ref().map(|f| match s.line_number {
-                    Some(line) => format!("{f}:{line}"),
-                    None => f.clone(),
-                })
+                if let Some(file) = s.file_name.as_ref() {
+                    Some(match s.line_number {
+                        Some(line) => format!("{file}:{line}"),
+                        None => file.clone(),
+                    })
+                } else {
+                    s.component.clone()
+                }
             })
             .or_else(|| selection.tag.as_ref().map(|t| format!("<{t}>")))
             .unwrap_or_else(|| selection.selector.clone());
@@ -1214,10 +1218,19 @@ impl BrowserView {
         let has_drawing = !drawing_snapshot.is_empty();
         // "file:line" hint when the page script detected a React source.
         let source_hint = source.as_ref().and_then(|s| {
-            s.file_name.as_ref().map(|f| match s.line_number {
-                Some(line) => format!("{f}:{line}"),
-                None => f.clone(),
-            })
+            if let Some(file) = s.file_name.as_ref() {
+                let loc = match s.line_number {
+                    Some(line) => format!("{file}:{line}"),
+                    None => file.clone(),
+                };
+                Some(match s.component.as_ref() {
+                    Some(component) => format!("{loc} ({component})"),
+                    None => loc,
+                })
+            } else {
+                // React 19 has no file:line — fall back to the component name.
+                s.component.clone()
+            }
         });
 
         // Capture is async — the PNG arrives on the GPUI foreground

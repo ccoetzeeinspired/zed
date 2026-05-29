@@ -78,25 +78,64 @@ pub const SCRIPT: &str = r#"
         return path.join(' > ');
     }
 
-    function detectReactSource(el) {
+    // The DOM node carries a `__reactFiber$…` key pointing at its fiber.
+    function reactFiber(el) {
         let node = el;
         for (let depth = 0; depth < 12 && node; depth++, node = node.parentElement) {
-            const fiberKey = Object.keys(node).find(k => k.startsWith('__reactFiber$'));
-            if (!fiberKey) continue;
-            let fiber = node[fiberKey];
-            for (let hops = 0; hops < 24 && fiber; hops++, fiber = fiber.return) {
-                if (fiber._debugSource) {
-                    const s = fiber._debugSource;
-                    return { fileName: s.fileName, lineNumber: s.lineNumber, columnNumber: s.columnNumber };
-                }
+            const key = Object.keys(node).find(k => k.startsWith('__reactFiber$'));
+            if (key) return node[key];
+        }
+        return null;
+    }
+
+    // Resolve a fiber `type` to a component display name, unwrapping
+    // forwardRef / memo. Returns null for host components (div, span…).
+    function componentName(type) {
+        if (!type || typeof type === 'string') return null;
+        if (typeof type === 'function') return type.displayName || type.name || null;
+        if (typeof type === 'object') {
+            if (type.displayName) return type.displayName;
+            if (type.render) return type.render.displayName || type.render.name || null; // forwardRef
+            if (type.type) return componentName(type.type); // memo
+        }
+        return null;
+    }
+
+    // Generic wrapper names that aren't useful to surface.
+    const SKIP_NAMES = /^(ForwardRef|Memo|Fragment|Suspense|StrictMode|Provider|Consumer|Profiler|Anonymous)$/;
+
+    // Best-effort source identity for the clicked element:
+    //  - `_debugSource` file:line on React < 19 (React 19 removed it);
+    //  - the nearest React component name (survives in dev on all
+    //    versions — the React-19 path);
+    //  - `data-source-*` / `data-component` / `data-testid` attributes.
+    function detectReactSource(el) {
+        let component = null;
+        for (let fiber = reactFiber(el), hops = 0; fiber && hops < 30; hops++, fiber = fiber.return) {
+            if (fiber._debugSource) {
+                const s = fiber._debugSource;
+                return {
+                    fileName: s.fileName,
+                    lineNumber: s.lineNumber,
+                    columnNumber: s.columnNumber,
+                    component: component || componentName(fiber.type),
+                };
+            }
+            if (!component) {
+                const name = componentName(fiber.type);
+                if (name && !SKIP_NAMES.test(name)) component = name;
             }
         }
         const file = el.closest('[data-source-file]')?.getAttribute('data-source-file');
         const line = el.closest('[data-source-line]')?.getAttribute('data-source-line');
-        if (file) return { fileName: file, lineNumber: line ? parseInt(line) : null, columnNumber: null };
-        const comp = el.closest('[data-component]')?.getAttribute('data-component');
+        if (file) {
+            return { fileName: file, lineNumber: line ? parseInt(line) : null, columnNumber: null, component };
+        }
+        const dataComp = el.closest('[data-component]')?.getAttribute('data-component');
         const testid = el.closest('[data-testid]')?.getAttribute('data-testid');
-        if (comp || testid) return { component: comp || null, testid: testid || null };
+        if (component || dataComp || testid) {
+            return { component: component || dataComp || null, testid: testid || null };
+        }
         return null;
     }
 
