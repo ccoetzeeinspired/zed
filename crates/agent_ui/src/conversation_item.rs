@@ -13,11 +13,11 @@
 use crate::ConversationView;
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    SharedString, Styled, WeakEntity, Window, div,
+    SharedString, Styled, Subscription, WeakEntity, Window, div,
 };
 use ui::{Icon, IconName};
 use workspace::Workspace;
-use workspace::item::Item;
+use workspace::item::{Item, ItemEvent};
 
 /// A center-pane tab that displays an agent [`ConversationView`].
 pub struct ConversationItem {
@@ -25,19 +25,30 @@ pub struct ConversationItem {
     // Captured for future stages (e.g. drag-between-regions); unused in Stage 1.
     #[allow(dead_code)]
     workspace: WeakEntity<Workspace>,
+    /// Refreshes the tab (title) when the conversation changes.
+    _observe_conversation: Subscription,
 }
 
 impl ConversationItem {
-    pub fn new(conversation: Entity<ConversationView>, workspace: WeakEntity<Workspace>) -> Self {
+    pub fn new(
+        conversation: Entity<ConversationView>,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let _observe_conversation = cx.observe(&conversation, |_this, _conversation, cx| {
+            cx.emit(ConversationItemEvent::UpdateTab);
+        });
         Self {
             conversation,
             workspace,
+            _observe_conversation,
         }
     }
 }
 
-/// No item-specific events yet — tab metadata is read live on render.
-pub enum ConversationItemEvent {}
+pub enum ConversationItemEvent {
+    UpdateTab,
+}
 
 impl EventEmitter<ConversationItemEvent> for ConversationItem {}
 
@@ -57,16 +68,22 @@ impl Render for ConversationItem {
 impl Item for ConversationItem {
     type Event = ConversationItemEvent;
 
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Agent".into()
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        match event {
+            ConversationItemEvent::UpdateTab => f(ItemEvent::UpdateTab),
+        }
+    }
+
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        self.conversation.read(cx).title(cx)
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         Some(Icon::new(IconName::ZedAssistant))
     }
 
-    fn tab_tooltip_text(&self, _cx: &App) -> Option<SharedString> {
-        Some("Agent conversation".into())
+    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        Some(self.conversation.read(cx).title(cx))
     }
 
     fn added_to_workspace(
