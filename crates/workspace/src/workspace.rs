@@ -3,6 +3,7 @@ pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
 pub mod item;
+pub mod layout;
 mod modal_layer;
 mod multi_workspace;
 #[cfg(test)]
@@ -8634,7 +8635,8 @@ impl Render for Workspace {
                                             &self.bottom_dock,
                                             window,
                                             cx,
-                                        ))),
+                                        )))
+                                        .into_any_element(),
 
                                     BottomDockLayout::LeftAligned => div()
                                         .flex()
@@ -8703,7 +8705,8 @@ impl Render for Workspace {
                                             &self.right_dock,
                                             window,
                                             cx,
-                                        )),
+                                        ))
+                                        .into_any_element(),
                                     BottomDockLayout::RightAligned => div()
                                         .flex()
                                         .flex_row()
@@ -8771,52 +8774,68 @@ impl Render for Workspace {
                                                     window,
                                                     cx,
                                                 ))),
-                                        ),
-                                    BottomDockLayout::Contained => div()
-                                        .flex()
-                                        .flex_row()
-                                        .h_full()
-                                        .children(self.render_dock(
-                                            DockPosition::Left,
-                                            &self.left_dock,
-                                            window,
-                                            cx,
-                                        ))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .child(
-                                                    h_flex()
-                                                        .flex_1()
-                                                        .when_some(paddings.0, |this, p| {
-                                                            this.child(p.border_r_1())
-                                                        })
-                                                        .child(self.center.render(
-                                                            self.zoomed.as_ref(),
-                                                            &pane_render_context,
-                                                            window,
-                                                            cx,
-                                                        ))
-                                                        .when_some(paddings.1, |this, p| {
-                                                            this.child(p.border_l_1())
-                                                        }),
+                                        )
+                                        .into_any_element(),
+                                    // FORK: dynamic layout engine (Stage 2 —
+                                    // plans/agent-in-center.md). The default
+                                    // Contained layout is assembled from the
+                                    // declarative layout tree so later stages can
+                                    // let it diverge for free region placement.
+                                    // Behavior-neutral: the tree reproduces the
+                                    // original Contained topology exactly.
+                                    BottomDockLayout::Contained => {
+                                        let center = h_flex()
+                                            .flex_1()
+                                            .when_some(paddings.0, |this, p| {
+                                                this.child(p.border_r_1())
+                                            })
+                                            .child(self.center.render(
+                                                self.zoomed.as_ref(),
+                                                &pane_render_context,
+                                                window,
+                                                cx,
+                                            ))
+                                            .when_some(paddings.1, |this, p| {
+                                                this.child(p.border_l_1())
+                                            })
+                                            .into_any_element();
+                                        let mut regions = crate::layout::RenderedRegions {
+                                            center: Some(center),
+                                            left: self
+                                                .render_dock(
+                                                    DockPosition::Left,
+                                                    &self.left_dock,
+                                                    window,
+                                                    cx,
                                                 )
-                                                .children(self.render_dock(
+                                                .map(|d| d.into_any_element()),
+                                            right: self
+                                                .render_dock(
+                                                    DockPosition::Right,
+                                                    &self.right_dock,
+                                                    window,
+                                                    cx,
+                                                )
+                                                .map(|d| d.into_any_element()),
+                                            bottom: self
+                                                .render_dock(
                                                     DockPosition::Bottom,
                                                     &self.bottom_dock,
                                                     window,
                                                     cx,
-                                                )),
+                                                )
+                                                .map(|d| d.into_any_element()),
+                                        };
+                                        let node = crate::layout::default_layout_node(
+                                            bottom_dock_layout,
+                                        );
+                                        crate::layout::assemble_layout(
+                                            &node,
+                                            &mut regions,
+                                            None,
+                                            true,
                                         )
-                                        .children(self.render_dock(
-                                            DockPosition::Right,
-                                            &self.right_dock,
-                                            window,
-                                            cx,
-                                        )),
+                                    }
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
