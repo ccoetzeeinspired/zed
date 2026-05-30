@@ -386,10 +386,17 @@ collisions, prefer the fork's behaviour and re-read this section.
 admin dashboard via claude-acp MCP tools). CP6 (scroll, tabs, screenshot, etc.)
 not started. Full write-up: [`plans/browser-automation.md`](plans/browser-automation.md).
 
+**CP6 progress (2026-05-30):** `browser_press_key` + `browser_scroll` shipped +
+verified (Google + Takealot). press_key backs `browser_type`'s `submit:true`.
+Gotcha baked in: Enter needs `text:"\r"` or Chromium skips `keypress` and
+form-submit silently no-ops (see `automation/keys.rs`). scroll returns
+`{x,y,maxY}`; `ref` mode uses `scrollIntoView` (handles inner scrollers).
+Remaining Tier 2: tabs, screenshot, select, evaluate, hover.
+
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through five MCP tools — `browser_navigate`, `browser_snapshot`,
-`browser_click`, `browser_type`, `browser_wait_for` — registered as the
-`zed-browser` context server. Tools hit the page via CDP (accessibility
+through seven MCP tools — `browser_navigate`, `browser_snapshot`,
+`browser_click`, `browser_type`, `browser_wait_for`, `browser_press_key`,
+`browser_scroll` — registered as the `zed-browser` context server. Tools hit the page via CDP (accessibility
 snapshot + DOM scripts), not Sikuli-style coordinates.
 
 **Stack:**

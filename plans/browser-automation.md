@@ -19,6 +19,15 @@ Typical agent loop:
 browser_navigate → browser_wait_for → browser_snapshot → browser_type / browser_click → …
 ```
 
+**Goal: Playwright MCP parity.** The agent-facing contract tracks Microsoft's
+[`@playwright/mcp`](https://github.com/microsoft/playwright-mcp) beat for beat —
+same tool names, same accessibility-snapshot-driven model, same opaque `ref=eN`
+handles, same arg schemas and auto-wait semantics. An agent that can drive
+`@playwright/mcp` should drive `zed-browser` with no relearning. The only
+difference is the target: the embedded WebView2 tab via
+`CallDevToolsProtocolMethod`, not a spawned Chromium. When in doubt on a tool's
+shape or behavior, match Playwright MCP rather than inventing our own.
+
 **Principles**
 
 - CDP / DOM on resolved element refs (`e1`, `e2`, … from snapshots).
@@ -83,10 +92,20 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_click` | `click` | Ref → actionability → `Runtime.callFunctionOn` |
 | `browser_type` | `type` | Native input setter + React `_valueTracker` sync |
 | `browser_wait_for` | `wait_for` | Load, text in title/body, or sleep seconds |
+| `browser_press_key` | `press_key` | Playwright-style key spec → CDP `Input.dispatchKeyEvent` (keyDown+keyUp); also backs `type`'s `submit:true` |
+| `browser_scroll` | `scroll` | `ref` → `scrollIntoView` (handles inner scrollers); else `window.scrollBy(dx,dy)`. Returns `{x,y,maxY}`. Fork extension (Playwright MCP has no scroll tool). |
 
-Tier 2 (CP6, not started): `browser_press_key`, `browser_scroll`,
-`browser_select_option`, `browser_tabs`, `browser_take_screenshot`,
-`browser_hover`, `browser_evaluate`.
+Tier 2 remaining (CP6, not started): `browser_select_option`,
+`browser_tabs`, `browser_take_screenshot`, `browser_hover`, `browser_evaluate`.
+
+**Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
+keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
+fires (so arrow-key nav and suggestion-select work) but **implicit form
+submission / SPA Enter handlers do not**. Symptom: Enter "does nothing" while
+arrows work. Matches Playwright's US layout (Enter→`\r`). See
+`automation/keys.rs`. The human-typing path (`browser_view::keystroke_to_cdp`)
+still maps Enter to `None` — same latent gap if SPA Enter-submit is ever needed
+there.
 
 ---
 
@@ -100,7 +119,7 @@ Tier 2 (CP6, not started): `browser_press_key`, `browser_scroll`,
 | **CP3** | Type into inputs (incl. React controlled fields) | Done |
 | **CP4** | Navigate + wait-for load/text | Done |
 | **CP5** | MCP adapter + `context_servers` + end-to-end agent | Done |
-| **CP6** | Tier 2 breadth | Not started |
+| **CP6** | Tier 2 breadth | In progress — `browser_press_key`, `browser_scroll` done |
 
 ### Verification log (2026-05-30)
 
@@ -110,6 +129,29 @@ Tier 2 (CP6, not started): `browser_press_key`, `browser_scroll`,
   credentials, click Sign In → landed on `/dashboard` with admin user table
   visible. Agent summarized sidebar + Active Users table from post-login
   snapshot.
+
+### Verification log (CP6, `browser_press_key`)
+
+- **Unit:** `automation::keys` — 9 tests (key specs, modifier chords, Enter
+  text payload).
+- **Runtime (via MCP server, real pages):**
+  - Google — `z`/`e`/`d` as three standalone `browser_press_key` calls →
+    `q=zed`; Enter submitted the search form (real URL nav). Confirms char +
+    Enter dispatch.
+  - Takealot — typing opened the autocomplete (input events fired), `ArrowDown`
+    moved the highlight. Plain Enter initially did **nothing** → root-caused to
+    the missing `text:"\r"` (no `keypress`). After the fix, type "mechanical
+    keyboard" + Enter navigated to the results page (filters + product grid),
+    **visually confirmed by the user**.
+
+### Verification log (CP6, `browser_scroll`)
+
+- **Unit:** `automation::commands` — CDP `returnByValue` unwrap (`{type,value}` →
+  inner).
+- **Runtime (Takealot results page, ~6000px):** viewport delta `0→1500→3000`;
+  `dy:100000` clamped to `y=maxY=5954`; `dy:-100000` → `y=0`; element-into-view
+  `ref` (Brand filter) from top → `y=369`; top-nav `ref` from bottom → `y=0`.
+  All confirmed by the deterministic `{x,y,maxY}` return (page `window.scrollX/Y`).
 
 ### Known fixes during CP5 dogfood
 
@@ -225,8 +267,10 @@ Zed logs IPC calls as `browser automation IPC: <method> …`. Set
 
 Priority order from dogfood:
 
-1. **`browser_press_key`** — Enter after type (`submit: true`), Tab, Escape.
-2. **`browser_scroll`** — viewport / element scroll for long pages.
+1. ~~**`browser_press_key`**~~ — **Done.** Key spec → CDP, backs `submit:true`.
+   Verified on Google + Takealot.
+2. ~~**`browser_scroll`**~~ — **Done.** Viewport delta + element-into-view,
+   returns `{x,y,maxY}`. Verified on Takealot results.
 3. **`browser_tabs`** — list/switch when multiple browser tabs exist.
 4. **`browser_take_screenshot`** — PNG for agent context (separate from snapshot).
 5. **`browser_select_option`**, **`browser_evaluate`**, **`browser_hover`**.

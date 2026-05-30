@@ -9,6 +9,7 @@ mod action;
 mod cdp;
 mod commands;
 mod ipc;
+mod keys;
 mod navigate;
 mod session;
 mod snapshot;
@@ -234,7 +235,7 @@ pub fn run_type(
     let attempt = Arc::new(
         move |session: &crate::webview2_host::WebView2Session,
               on_done: Box<dyn FnOnce(Result<()>) + 'static>| {
-            try_type_backend_node(session, backend_node_id, &text, on_done)
+            try_type_backend_node(session, backend_node_id, &text, false, on_done)
         },
     );
 

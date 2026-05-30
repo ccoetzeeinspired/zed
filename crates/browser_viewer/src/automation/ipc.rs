@@ -190,13 +190,33 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("type requires params.text"))?;
-            commands::type_text(browser, &ref_id, text, cx).await?;
-            if request.params.get("submit").and_then(|v| v.as_bool()) == Some(true) {
-                log::info!(
-                    "browser automation IPC: submit=true ignored (browser_press_key not implemented)"
-                );
+            let submit = request.params.get("submit").and_then(|v| v.as_bool()) == Some(true);
+            commands::type_text(browser.clone(), &ref_id, text, submit, cx).await?;
+            if submit {
+                commands::press_key(browser, "Enter", cx).await?;
             }
             Ok(json!({ "ref": ref_id, "chars": text.len() }))
+        }
+        "press_key" => {
+            let key = request
+                .params
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("press_key requires params.key"))?;
+            commands::press_key(browser, key, cx).await?;
+            Ok(json!({ "key": key }))
+        }
+        "scroll" => {
+            let ref_id = request
+                .params
+                .get("ref")
+                .or_else(|| request.params.get("target"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let dx = request.params.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let dy = request.params.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let pos = commands::scroll(browser, ref_id, dx, dy, cx).await?;
+            Ok(pos)
         }
         "navigate" => {
             let url = request

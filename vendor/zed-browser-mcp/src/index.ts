@@ -106,6 +106,56 @@ server.tool(
 );
 
 server.tool(
+  "browser_press_key",
+  "Press a key on the keyboard in the embedded Zed browser tab",
+  {
+    key: z
+      .string()
+      .describe(
+        "Key name or character to press, e.g. Enter, ArrowLeft, Escape, a, " +
+          "or a modifier chord like Control+a",
+      ),
+  },
+  async ({ key }) => {
+    await requireZedOk(await callZedAutomation("press_key", { key }));
+    return textContent(`Pressed ${key}`);
+  },
+);
+
+server.tool(
+  "browser_scroll",
+  "Scroll the embedded Zed browser tab — by a pixel delta, or to bring a snapshot element into view",
+  {
+    ref: z
+      .string()
+      .optional()
+      .describe("Snapshot ref (e.g. e14) to scroll into view; handles inner scroll containers"),
+    target: z.string().optional().describe("Alias for ref"),
+    dx: z
+      .number()
+      .optional()
+      .describe("Horizontal pixels to scroll, positive = right (ignored if ref given)"),
+    dy: z
+      .number()
+      .optional()
+      .describe("Vertical pixels to scroll, positive = down (ignored if ref given)"),
+  },
+  async ({ ref, target, dx, dy }) => {
+    const elementRef = ref ?? target;
+    const params: Record<string, unknown> = {};
+    if (elementRef) params.ref = elementRef;
+    if (dx != null) params.dx = dx;
+    if (dy != null) params.dy = dy;
+    const result = (await requireZedOk(
+      await callZedAutomation("scroll", params),
+    )) as { x?: number; y?: number; maxY?: number };
+    return textContent(
+      `Scrolled to x=${result.x ?? "?"}, y=${result.y ?? "?"} (maxY=${result.maxY ?? "?"})`,
+    );
+  },
+);
+
+server.tool(
   "browser_wait_for",
   "Wait for text to appear or a specified time to pass in the embedded Zed browser tab",
   {

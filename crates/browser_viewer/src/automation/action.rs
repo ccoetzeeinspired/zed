@@ -44,7 +44,7 @@ const CLICK_SCRIPT: &str = r#"function() {
 
 // React/Vue controlled inputs ignore plain `.value = …` — use the native setter +
 // InputEvent so framework state matches what the user sees.
-const TYPE_SCRIPT: &str = r#"function(text) {
+const TYPE_SCRIPT: &str = r#"function(text, submit) {
   function setNativeInputValue(el, value) {
     const proto = el instanceof HTMLTextAreaElement
       ? HTMLTextAreaElement.prototype
@@ -76,9 +76,12 @@ const TYPE_SCRIPT: &str = r#"function(text) {
   this.scrollIntoView({ block: 'center', inline: 'center' });
   this.focus();
   const tag = this.tagName ? this.tagName.toUpperCase() : '';
+  // When a submit (Enter) will follow, keep focus so the key event lands on
+  // this element and triggers implicit form submission; otherwise blur so the
+  // page sees the field as committed.
   if (tag === 'INPUT' || tag === 'TEXTAREA') {
     setNativeInputValue(this, text);
-    this.blur();
+    if (!submit) { this.blur(); }
     return true;
   }
   if (this.isContentEditable) {
@@ -89,7 +92,7 @@ const TYPE_SCRIPT: &str = r#"function(text) {
       inputType: 'insertText',
       data: text,
     }));
-    this.blur();
+    if (!submit) { this.blur(); }
     return true;
   }
   throw new Error('element is not a text input');
@@ -124,19 +127,48 @@ pub fn try_click_backend_node(
 }
 
 /// One-shot type attempt on a backend DOM node (no retry).
+///
+/// When `keep_focus_for_submit` is true the script skips its trailing
+/// `blur()`, so a following Enter key press lands on the still-focused element
+/// and triggers implicit form submission.
 pub fn try_type_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
     text: &str,
+    keep_focus_for_submit: bool,
     on_done: Box<dyn FnOnce(Result<()>) + 'static>,
 ) -> Result<()> {
-    let args = vec![json!({ "value": text })];
+    let args = vec![json!({ "value": text }), json!({ "value": keep_focus_for_submit })];
     invoke_on_backend_node(
         session,
         backend_node_id,
         TYPE_SCRIPT,
         Some(&args),
         Box::new(move |result| on_done(result.map(|_| ()))),
+    )
+}
+
+// Scroll the element to the centre of the viewport. `scrollIntoView` walks up
+// the scroll-parent chain, so this also scrolls inner (non-window) containers.
+// Returns the resulting window scroll position for caller feedback.
+const SCROLL_INTO_VIEW_SCRIPT: &str = r#"function() {
+  this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const el = document.scrollingElement || document.documentElement;
+  return { x: window.scrollX, y: window.scrollY, maxY: Math.max(0, el.scrollHeight - el.clientHeight) };
+}"#;
+
+/// One-shot "scroll this element into view" on a backend DOM node.
+pub fn try_scroll_into_view_backend_node(
+    session: &WebView2Session,
+    backend_node_id: i32,
+    on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+) -> Result<()> {
+    invoke_on_backend_node(
+        session,
+        backend_node_id,
+        SCROLL_INTO_VIEW_SCRIPT,
+        None,
+        on_done,
     )
 }
 
