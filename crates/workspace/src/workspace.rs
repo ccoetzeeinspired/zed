@@ -255,6 +255,16 @@ actions!(
         ActivateNextPane,
         /// Activates the previous pane in the workspace.
         ActivatePreviousPane,
+        /// FORK: dynamic layout — move the focused region (center or a dock) to the left edge.
+        MoveRegionLeft,
+        /// FORK: dynamic layout — move the focused region (center or a dock) to the right edge.
+        MoveRegionRight,
+        /// FORK: dynamic layout — move the focused region (center or a dock) to the top edge.
+        MoveRegionUp,
+        /// FORK: dynamic layout — move the focused region (center or a dock) to the bottom edge.
+        MoveRegionDown,
+        /// FORK: dynamic layout — reset the workspace layout to the built-in arrangement.
+        ResetWorkspaceLayout,
         /// Activates the last pane in the workspace.
         ActivateLastPane,
         /// Switches to the next window.
@@ -1361,6 +1371,11 @@ pub struct Workspace {
     left_dock: Entity<Dock>,
     bottom_dock: Entity<Dock>,
     right_dock: Entity<Dock>,
+    /// FORK: dynamic layout (Stage 3). `None` = the built-in topology (today's
+    /// behavior, driven by `bottom_dock_layout`). `Some(tree)` = a user-arranged
+    /// layout that overrides it, letting regions sit at any edge. See
+    /// `crate::layout` and plans/agent-in-center.md.
+    custom_layout: Option<crate::layout::LayoutNode>,
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
@@ -1815,6 +1830,7 @@ impl Workspace {
             left_dock,
             bottom_dock,
             right_dock,
+            custom_layout: None,
             _panels_task: None,
             project: project.clone(),
             follower_states: Default::default(),
@@ -2254,6 +2270,78 @@ impl Workspace {
             dock.read(cx).is_open() && dock.focus_handle(cx).contains_focused(window, cx)
         })
         .map(|(position, _)| position)
+    }
+
+    /// FORK: dynamic layout (Stage 3). Which layout region currently holds
+    /// focus — a focused dock, else the center pane group.
+    fn focused_region(&self, window: &Window, cx: &App) -> crate::layout::LayoutRegion {
+        match self.focused_dock_position(window, cx) {
+            Some(position) => crate::layout::LayoutRegion::Dock(position),
+            None => crate::layout::LayoutRegion::Center,
+        }
+    }
+
+    /// FORK: dynamic layout (Stage 3). Move the focused region toward `direction`.
+    /// Seeds a custom tree from the current built-in layout on first use, so the
+    /// arrangement only diverges once the user asks for it.
+    fn move_focused_region(
+        &mut self,
+        direction: crate::layout::MoveDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let region = self.focused_region(window, cx);
+        let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
+        let current = self
+            .custom_layout
+            .take()
+            .unwrap_or_else(|| crate::layout::default_layout_node(bottom_dock_layout));
+        self.custom_layout = Some(crate::layout::move_region(current, region, direction));
+        cx.notify();
+    }
+
+    /// FORK: dynamic layout (Stage 3). Drop any custom arrangement and return to
+    /// the built-in layout.
+    fn reset_workspace_layout(&mut self, cx: &mut Context<Self>) {
+        if self.custom_layout.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// FORK: dynamic layout (Stage 3). Render each region once and assemble them
+    /// according to `node` via the layout engine. Shared by the custom-layout
+    /// path and the Contained built-in arm.
+    #[allow(clippy::too_many_arguments)]
+    fn render_layout_node(
+        &self,
+        node: &crate::layout::LayoutNode,
+        paddings: (Option<Div>, Option<Div>),
+        pane_render_context: &PaneRenderContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let center = h_flex()
+            .flex_1()
+            .when_some(paddings.0, |this, p| this.child(p.border_r_1()))
+            .child(
+                self.center
+                    .render(self.zoomed.as_ref(), pane_render_context, window, cx),
+            )
+            .when_some(paddings.1, |this, p| this.child(p.border_l_1()))
+            .into_any_element();
+        let mut regions = crate::layout::RenderedRegions {
+            center: Some(center),
+            left: self
+                .render_dock(DockPosition::Left, &self.left_dock, window, cx)
+                .map(|d| d.into_any_element()),
+            right: self
+                .render_dock(DockPosition::Right, &self.right_dock, window, cx)
+                .map(|d| d.into_any_element()),
+            bottom: self
+                .render_dock(DockPosition::Bottom, &self.bottom_dock, window, cx)
+                .map(|d| d.into_any_element()),
+        };
+        crate::layout::assemble_layout(node, &mut regions, None, true)
     }
 
     pub fn active_worktree_creation(&self) -> &ActiveWorktreeCreation {
@@ -7365,6 +7453,22 @@ impl Workspace {
             .on_action(cx.listener(|workspace, _: &MovePaneDown, _, cx| {
                 workspace.move_pane_to_border(SplitDirection::Down, cx)
             }))
+            // FORK: dynamic layout (Stage 3) — move/reset region placement.
+            .on_action(cx.listener(|this, _: &MoveRegionLeft, window, cx| {
+                this.move_focused_region(crate::layout::MoveDirection::Left, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveRegionRight, window, cx| {
+                this.move_focused_region(crate::layout::MoveDirection::Right, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveRegionUp, window, cx| {
+                this.move_focused_region(crate::layout::MoveDirection::Up, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveRegionDown, window, cx| {
+                this.move_focused_region(crate::layout::MoveDirection::Down, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResetWorkspaceLayout, _window, cx| {
+                this.reset_workspace_layout(cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleLeftDock, window, cx| {
                 this.toggle_dock(DockPosition::Left, window, cx);
             }))
@@ -8580,6 +8684,17 @@ impl Render for Workspace {
                                 ))
                             })
                             .child({
+                                // FORK: dynamic layout (Stage 3). A user-arranged
+                                // custom tree overrides the built-in topology.
+                                if let Some(custom) = self.custom_layout.clone() {
+                                    self.render_layout_node(
+                                        &custom,
+                                        paddings,
+                                        &pane_render_context,
+                                        window,
+                                        cx,
+                                    )
+                                } else {
                                 match bottom_dock_layout {
                                     BottomDockLayout::Full => div()
                                         .flex()
@@ -8784,58 +8899,18 @@ impl Render for Workspace {
                                     // Behavior-neutral: the tree reproduces the
                                     // original Contained topology exactly.
                                     BottomDockLayout::Contained => {
-                                        let center = h_flex()
-                                            .flex_1()
-                                            .when_some(paddings.0, |this, p| {
-                                                this.child(p.border_r_1())
-                                            })
-                                            .child(self.center.render(
-                                                self.zoomed.as_ref(),
-                                                &pane_render_context,
-                                                window,
-                                                cx,
-                                            ))
-                                            .when_some(paddings.1, |this, p| {
-                                                this.child(p.border_l_1())
-                                            })
-                                            .into_any_element();
-                                        let mut regions = crate::layout::RenderedRegions {
-                                            center: Some(center),
-                                            left: self
-                                                .render_dock(
-                                                    DockPosition::Left,
-                                                    &self.left_dock,
-                                                    window,
-                                                    cx,
-                                                )
-                                                .map(|d| d.into_any_element()),
-                                            right: self
-                                                .render_dock(
-                                                    DockPosition::Right,
-                                                    &self.right_dock,
-                                                    window,
-                                                    cx,
-                                                )
-                                                .map(|d| d.into_any_element()),
-                                            bottom: self
-                                                .render_dock(
-                                                    DockPosition::Bottom,
-                                                    &self.bottom_dock,
-                                                    window,
-                                                    cx,
-                                                )
-                                                .map(|d| d.into_any_element()),
-                                        };
                                         let node = crate::layout::default_layout_node(
                                             bottom_dock_layout,
                                         );
-                                        crate::layout::assemble_layout(
+                                        self.render_layout_node(
                                             &node,
-                                            &mut regions,
-                                            None,
-                                            true,
+                                            paddings,
+                                            &pane_render_context,
+                                            window,
+                                            cx,
                                         )
                                     }
+                                }
                                 }
                             })
                             .children(self.zoomed.as_ref().and_then(|view| {
