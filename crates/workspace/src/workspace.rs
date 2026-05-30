@@ -2316,6 +2316,7 @@ impl Workspace {
         &self,
         node: &crate::layout::LayoutNode,
         paddings: (Option<Div>, Option<Div>),
+        interactive: bool,
         pane_render_context: &PaneRenderContext,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2331,17 +2332,75 @@ impl Workspace {
             .into_any_element();
         let mut regions = crate::layout::RenderedRegions {
             center: Some(center),
-            left: self
-                .render_dock(DockPosition::Left, &self.left_dock, window, cx)
-                .map(|d| d.into_any_element()),
-            right: self
-                .render_dock(DockPosition::Right, &self.right_dock, window, cx)
-                .map(|d| d.into_any_element()),
-            bottom: self
-                .render_dock(DockPosition::Bottom, &self.bottom_dock, window, cx)
-                .map(|d| d.into_any_element()),
+            left: self.render_dock_for_layout(
+                DockPosition::Left,
+                &self.left_dock,
+                interactive,
+                window,
+                cx,
+            ),
+            right: self.render_dock_for_layout(
+                DockPosition::Right,
+                &self.right_dock,
+                interactive,
+                window,
+                cx,
+            ),
+            bottom: self.render_dock_for_layout(
+                DockPosition::Bottom,
+                &self.bottom_dock,
+                interactive,
+                window,
+                cx,
+            ),
         };
-        crate::layout::assemble_layout(node, &mut regions, None, true)
+        crate::layout::assemble_layout(node, &mut regions, interactive)
+    }
+
+    /// FORK: dynamic layout (Stage 3b). Render a dock region for the layout
+    /// engine. On the default (Contained) path this is exactly `render_dock`
+    /// (closed docks collapse, the dock keeps its own edge handle). On the custom
+    /// path an open dock fills the slot the `RegionAxisElement` allocates by flex
+    /// (its own width/height is ignored so the generic handle drives sizing), and
+    /// a closed dock is omitted entirely so it never occupies a flex slot.
+    fn render_dock_for_layout(
+        &self,
+        position: DockPosition,
+        dock: &Entity<Dock>,
+        interactive: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<gpui::AnyElement> {
+        if !interactive {
+            return self
+                .render_dock(position, dock, window, cx)
+                .map(|d| d.into_any_element());
+        }
+        if self.zoomed_position == Some(position) {
+            return None;
+        }
+        if dock.read(cx).visible_panel().is_none() {
+            return None;
+        }
+        let leader_border = dock.read(cx).active_panel().and_then(|panel| {
+            let pane = panel.pane(cx)?;
+            let follower_states = &self.follower_states;
+            leader_border_for_pane(follower_states, &pane, window, cx)
+        });
+        let container = div()
+            .flex()
+            .overflow_hidden()
+            .size_full()
+            .child(dock.clone())
+            .children(leader_border);
+        Some(container.into_any_element())
+    }
+
+    /// FORK: dynamic layout (Stage 3b). True when a user-arranged custom layout
+    /// is active. Docks consult this to suppress their own resize handle in favor
+    /// of the generic region handle.
+    pub fn has_custom_layout(&self) -> bool {
+        self.custom_layout.is_some()
     }
 
     pub fn active_worktree_creation(&self) -> &ActiveWorktreeCreation {
@@ -8690,6 +8749,7 @@ impl Render for Workspace {
                                     self.render_layout_node(
                                         &custom,
                                         paddings,
+                                        true,
                                         &pane_render_context,
                                         window,
                                         cx,
@@ -8905,6 +8965,7 @@ impl Render for Workspace {
                                         self.render_layout_node(
                                             &node,
                                             paddings,
+                                            false,
                                             &pane_render_context,
                                             window,
                                             cx,

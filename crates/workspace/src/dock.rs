@@ -1093,6 +1093,13 @@ impl Render for Dock {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            // FORK: dynamic layout (Stage 3b). In a custom (relocated) layout the
+            // generic region handle owns resizing, so suppress the dock's own edge
+            // handle to avoid a double / mis-positioned handle.
+            let in_custom_layout = self
+                .workspace
+                .upgrade()
+                .is_some_and(|workspace| workspace.read(cx).has_custom_layout());
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1185,7 +1192,7 @@ impl Render for Dock {
                                 .cached(StyleRefinement::default().v_flex().size_full()),
                         ),
                 )
-                .when(self.resizable(cx), |this| {
+                .when(self.resizable(cx) && !in_custom_layout, |this| {
                     this.child(create_resize_handle())
                 })
         } else {
