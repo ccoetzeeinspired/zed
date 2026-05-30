@@ -211,7 +211,8 @@ fn open_mention_uri(
         | MentionUri::Diagnostics { .. }
         | MentionUri::TerminalSelection { .. }
         | MentionUri::GitDiff { .. }
-        | MentionUri::MergeConflict { .. } => {}
+        | MentionUri::MergeConflict { .. }
+        | MentionUri::Browser => {}
     });
 }
 

@@ -164,6 +164,7 @@ impl MentionSet {
             MentionUri::GitDiff { base_ref } => {
                 self.confirm_mention_for_git_diff(base_ref.into(), cx)
             }
+            MentionUri::Browser => self.confirm_mention_for_browser(),
             MentionUri::Selection {
                 abs_path: Some(abs_path),
                 line_range,
@@ -352,6 +353,7 @@ impl MentionSet {
             MentionUri::GitDiff { base_ref } => {
                 self.confirm_mention_for_git_diff(base_ref.into(), cx)
             }
+            MentionUri::Browser => self.confirm_mention_for_browser(),
             MentionUri::MergeConflict { .. } => {
                 debug_panic!("unexpected merge conflict URI");
                 Task::ready(Err(anyhow!("unexpected merge conflict URI")))
@@ -383,6 +385,18 @@ impl MentionSet {
                 .ok();
             }
         })
+    }
+
+    fn confirm_mention_for_browser(&self) -> Task<Result<Mention>> {
+        Task::ready(Ok(Mention::Text {
+            content: [
+                "Zed embedded browser context requested.",
+                "Use Zed-native browser commands against the active BrowserView.",
+                "Do not use the external Codex Desktop Browser plugin for this mention.",
+            ]
+            .join("\n"),
+            tracked_buffers: Vec::new(),
+        }))
     }
 
     pub fn confirm_mention_for_file(
