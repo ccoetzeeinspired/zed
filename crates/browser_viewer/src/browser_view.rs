@@ -174,6 +174,20 @@ impl BrowserItem {
     }
 }
 
+fn browser_target_context(target: &crate::browser_protocol::BrowserResolvedElement) -> String {
+    let label = target
+        .accessible_name
+        .as_deref()
+        .or(target.text.as_deref())
+        .map(|text| text.chars().take(120).collect::<String>())
+        .unwrap_or_else(|| target.selector.clone());
+    let tag = target.tag.as_deref().unwrap_or("element");
+    format!(
+        "{} \"{}\"\n  Selector: {}\n  Bounds: x={}, y={}, width={}, height={}",
+        tag, label, target.selector, target.rect.x, target.rect.y, target.rect.w, target.rect.h
+    )
+}
+
 impl EventEmitter<()> for BrowserItem {}
 
 /// Events emitted by `BrowserView`. Tracking these separately from
@@ -2052,6 +2066,49 @@ impl Item for BrowserView {
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         Some(self.item.read(cx).url().clone())
+    }
+
+    fn agent_browser_context(&self, cx: &App) -> Option<SharedString> {
+        let item = self.item.read(cx);
+        let mut context = format!(
+            "Zed embedded browser:\n- URL: {}\n- Title: {}",
+            item.url(),
+            item.title()
+        );
+
+        if let Some(selection) = item.design_selection.as_ref() {
+            let label = selection
+                .tag
+                .as_deref()
+                .map(|tag| format!("<{tag}>"))
+                .unwrap_or_else(|| "selected element".to_string());
+            context.push_str(&format!(
+                "\n- Selected element: {}\n  Selector: {}\n  Bounds: x={}, y={}, width={}, height={}",
+                label,
+                selection.selector,
+                selection.rect.x,
+                selection.rect.y,
+                selection.rect.w,
+                selection.rect.h
+            ));
+        }
+
+        if let Some(cursor) = item.agent_cursor.as_ref() {
+            context.push_str(&format!(
+                "\n- Previewed target: {}\n  Request id: {}",
+                browser_target_context(&cursor.target),
+                cursor.request_id
+            ));
+            if !cursor.ambiguity.is_empty() {
+                context.push_str(&format!(
+                    "\n  Ambiguous candidates: {}",
+                    cursor.ambiguity.len() + 1
+                ));
+            }
+        }
+
+        context.push_str("\nUse Zed-native browser commands against the active BrowserView.");
+        Some(context.into())
     }
 
     /// Capture a weak ref to the workspace + subscribe so we re-render

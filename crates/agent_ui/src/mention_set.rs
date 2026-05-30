@@ -164,7 +164,7 @@ impl MentionSet {
             MentionUri::GitDiff { base_ref } => {
                 self.confirm_mention_for_git_diff(base_ref.into(), cx)
             }
-            MentionUri::Browser => self.confirm_mention_for_browser(),
+            MentionUri::Browser => self.confirm_mention_for_browser(None, cx),
             MentionUri::Selection {
                 abs_path: Some(abs_path),
                 line_range,
@@ -353,7 +353,7 @@ impl MentionSet {
             MentionUri::GitDiff { base_ref } => {
                 self.confirm_mention_for_git_diff(base_ref.into(), cx)
             }
-            MentionUri::Browser => self.confirm_mention_for_browser(),
+            MentionUri::Browser => self.confirm_mention_for_browser(Some(workspace), cx),
             MentionUri::MergeConflict { .. } => {
                 debug_panic!("unexpected merge conflict URI");
                 Task::ready(Err(anyhow!("unexpected merge conflict URI")))
@@ -387,14 +387,31 @@ impl MentionSet {
         })
     }
 
-    fn confirm_mention_for_browser(&self) -> Task<Result<Mention>> {
+    fn confirm_mention_for_browser(
+        &self,
+        workspace: Option<&Entity<Workspace>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Mention>> {
+        let content = workspace
+            .and_then(|workspace| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .active_item(cx)
+                        .and_then(|item| item.agent_browser_context(cx))
+                })
+            })
+            .map(|context| context.to_string())
+            .unwrap_or_else(|| {
+                [
+                    "No active Zed browser tab is open.",
+                    "Open one with browser::NewTab, then mention @browser again.",
+                    "Do not use the external Codex Desktop Browser plugin for this mention.",
+                ]
+                .join("\n")
+            });
+
         Task::ready(Ok(Mention::Text {
-            content: [
-                "Zed embedded browser context requested.",
-                "Use Zed-native browser commands against the active BrowserView.",
-                "Do not use the external Codex Desktop Browser plugin for this mention.",
-            ]
-            .join("\n"),
+            content,
             tracked_buffers: Vec::new(),
         }))
     }
