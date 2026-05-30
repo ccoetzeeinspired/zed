@@ -584,21 +584,20 @@ pub fn init(cx: &mut App) {
                     }
                 })
                 .register_action(|workspace, action: &BrowserResolveElement, window, cx| {
-                    if let Some(active_item) = workspace.active_item(cx) {
-                        active_item.relay_action(Box::new(action.clone()), window, cx);
-                    }
+                    relay_to_active_browser_or_toast(workspace, Box::new(action.clone()), window, cx);
                 })
                 .register_action(
                     |workspace, action: &BrowserClickResolvedElement, window, cx| {
-                        if let Some(active_item) = workspace.active_item(cx) {
-                            active_item.relay_action(Box::new(action.clone()), window, cx);
-                        }
+                        relay_to_active_browser_or_toast(
+                            workspace,
+                            Box::new(action.clone()),
+                            window,
+                            cx,
+                        );
                     },
                 )
                 .register_action(|workspace, action: &BrowserClearAgentCursor, window, cx| {
-                    if let Some(active_item) = workspace.active_item(cx) {
-                        active_item.relay_action(Box::new(action.clone()), window, cx);
-                    }
+                    relay_to_active_browser_or_toast(workspace, Box::new(action.clone()), window, cx);
                 })
                 .register_action(
                     |workspace: &mut Workspace, _: &AddSelectionToThread, window, cx| {
@@ -765,6 +764,37 @@ fn build_design_bundle_blocks(action: &SendDesignBundleToAgent) -> Vec<acp::Cont
     }
 
     blocks
+}
+
+fn relay_to_active_browser_or_toast(
+    workspace: &mut Workspace,
+    action: Box<dyn Action>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(active_item) = workspace.active_item(cx) else {
+        show_no_active_browser_toast(workspace, cx);
+        return;
+    };
+
+    if active_item.agent_browser_context(cx).is_some() {
+        active_item.relay_action(action, window, cx);
+    } else {
+        show_no_active_browser_toast(workspace, cx);
+    }
+}
+
+fn show_no_active_browser_toast(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    struct NoActiveBrowserToast;
+
+    workspace.show_toast(
+        workspace::Toast::new(
+            workspace::notifications::NotificationId::unique::<NoActiveBrowserToast>(),
+            "No active Zed browser tab is open. Open one with browser::NewTab.",
+        )
+        .autohide(),
+        cx,
+    );
 }
 
 fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::ContentBlock> {
