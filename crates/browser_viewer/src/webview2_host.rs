@@ -215,6 +215,43 @@ impl WebView2Session {
     /// the renderer fires `input` events on form controls — non-text
     /// keys pass `None`.
     ///
+    /// Invoke an arbitrary Chrome DevTools Protocol method and deliver the
+    /// raw JSON response string to `on_done` on the GPUI thread (same
+    /// contract as [`Self::capture_preview_png`]).
+    pub fn call_devtools_protocol(
+        &self,
+        method: &str,
+        params_json: &str,
+        on_done: Box<dyn FnOnce(Result<String>) + 'static>,
+    ) -> Result<()> {
+        let method_h = HSTRING::from(method);
+        let params_h = HSTRING::from(params_json);
+        let mut done_slot: Option<Box<dyn FnOnce(Result<String>) + 'static>> = Some(on_done);
+        let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+            move |hr, result_json| {
+                let on_done = done_slot
+                    .take()
+                    .expect("CallDevToolsProtocolMethodCompletedHandler called twice");
+                if let Err(err) = hr {
+                    on_done(Err(anyhow!("CDP call failed: {err}")));
+                    return Ok(());
+                }
+                on_done(Ok(result_json));
+                Ok(())
+            },
+        ));
+        unsafe {
+            self.webview
+                .CallDevToolsProtocolMethod(
+                    PCWSTR(method_h.as_ptr()),
+                    PCWSTR(params_h.as_ptr()),
+                    &handler,
+                )
+                .map_err(|err| anyhow!("CallDevToolsProtocolMethod: {err}"))?;
+        }
+        Ok(())
+    }
+
     /// The completion handler is a no-op; we fire-and-forget. Any CDP
     /// error returns asynchronously and only matters for diagnosis.
     pub fn dispatch_key_event(

@@ -1254,6 +1254,13 @@ pub struct BrowserSettingsContent {
     ///
     /// Default: "https://www.google.com/search?q={query}"
     pub search_url: Option<String>,
+    /// Dev/dogfood: key/value login secrets for browser automation dev actions
+    /// (`email`, `password`, …). Set in user settings only — never commit real values.
+    pub automation_credentials: Option<HashMap<String, String>>,
+    /// Deprecated: use `automation_credentials.password` instead.
+    pub automation_dev_password: Option<String>,
+    /// Dev/dogfood: substring for `browser: automation wait for text`.
+    pub automation_dev_wait_text: Option<String>,
 }
 
 /// Settings for configuring the which-key popup behaviour.

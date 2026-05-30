@@ -116,6 +116,9 @@ pub struct BrowserItem {
     /// pointing at it before submitting.
     pub drawing_mode_enabled: bool,
     pub drawing: crate::drawing::DrawingCanvas,
+    /// Invalidates automation ref handles on navigation (see `automation`).
+    #[cfg(target_os = "windows")]
+    automation_state: crate::automation::AutomationSessionState,
     /// Phase 4.C: user drag offset for the "Describe the change" panel,
     /// added to its element-anchored base position so it can be moved off
     /// whatever it covers. Reset on new selection / panel close.
@@ -143,6 +146,8 @@ impl BrowserItem {
             design_prompt: String::new(),
             drawing_mode_enabled: false,
             drawing: crate::drawing::DrawingCanvas::default(),
+            #[cfg(target_os = "windows")]
+            automation_state: crate::automation::AutomationSessionState::new(),
             design_panel_offset: point(px(0.), px(0.)),
             design_drag: None,
         }
@@ -166,6 +171,16 @@ impl BrowserItem {
 
     pub fn can_go_forward(&self) -> bool {
         self.can_go_forward
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn automation_page_generation(&self) -> u64 {
+        self.automation_state.page_generation()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn resolve_automation_ref(&self, ref_id: &str) -> Option<crate::automation::ElementRef> {
+        self.automation_state.resolve_ref(ref_id)
     }
 }
 
@@ -244,6 +259,41 @@ impl BrowserView {
 
     pub fn item(&self) -> &Entity<BrowserItem> {
         &self.item
+    }
+
+    /// Run `f` against the live WebView2 session when initialization has finished.
+    #[cfg(target_os = "windows")]
+    pub fn with_webview_session<R>(
+        &self,
+        cx: &App,
+        f: impl FnOnce(&crate::webview2_host::WebView2Session) -> R,
+    ) -> Option<R> {
+        self.item.read(cx).session.as_ref().map(f)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn store_automation_snapshot(&self, cx: &mut App, snapshot: crate::automation::PageSnapshot) {
+        let ref_count = snapshot.ref_count;
+        let page_generation = snapshot.page_generation;
+        let yaml = snapshot.yaml.clone();
+        let registry = snapshot.registry;
+        self.item.update(cx, |item, _| {
+            item.automation_state.replace_registry(registry);
+        });
+        log::info!(
+            "browser automation snapshot: {ref_count} refs (page gen {page_generation})\n{yaml}"
+        );
+        if std::env::var("ZED_BROWSER_AUTOMATION_DEBUG").as_deref() == Ok("1") {
+            let dir = std::env::temp_dir().join("zed-browser-automation");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join(format!("snapshot-{page_generation}.yaml"));
+            let _ = std::fs::write(path, yaml);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn automation_navigate(&self, target: String, cx: &mut Context<Self>) {
+        self.navigate_to(target, cx);
     }
 
     #[cfg(target_os = "windows")]
@@ -2019,6 +2069,7 @@ fn apply_navigation_event(item: &mut BrowserItem, event: NavigationEvent) {
         }
         NavigationEvent::NavigationStarting => {
             item.is_loading = true;
+            item.automation_state.bump_page_generation();
             // Stale selection from the previous document is no longer
             // meaningful — clear so the floating "Describe" input
             // disappears for the duration of the load. The script

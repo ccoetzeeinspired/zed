@@ -15,9 +15,10 @@ Design documents for in-flight or upcoming features live under `plans/`.
 Read the relevant plan before starting implementation work on the
 corresponding feature.
 
-| Plan                                            | Status        | Branch (future)  |
-|-------------------------------------------------|---------------|------------------|
-| [`browser-viewer.md`](plans/browser-viewer.md)  | Draft, ready  | `browser-viewer` |
+| Plan                                            | Status        | Branch (future)      |
+|-------------------------------------------------|---------------|----------------------|
+| [`browser-viewer.md`](plans/browser-viewer.md)  | Draft, ready  | `browser-viewer`     |
+| [`browser-automation.md`](plans/browser-automation.md) | CP0–CP5 shipped | `browser-automation` |
 
 ## Remotes
 
@@ -38,6 +39,9 @@ corresponding feature.
   WebView2 browser tab with composition-mode rendering, CDP keyboard,
   design-mode element picker + drawing overlay + screenshot bundle,
   and the GPUI scene `Cutout` primitive (see below).
+- **`browser-automation`** — built on top of `browser-viewer`; adds agent
+  MCP control of the embedded browser tab (CDP automation + `zed-browser-mcp`).
+  See [`plans/browser-automation.md`](plans/browser-automation.md).
 
 ## What this fork adds, and why
 
@@ -376,6 +380,65 @@ collisions, prefer the fork's behaviour and re-read this section.
   "owned thread" model is a possible future refinement (deferred —
   needs async thread-handle capture).
 
+### `crates/browser_viewer/src/automation/` + `vendor/zed-browser-mcp/` — agent browser control
+
+**Status (2026-05-30):** CP0–CP5 shipped and dogfooded on TrueLens (login →
+admin dashboard via claude-acp MCP tools). CP6 (scroll, tabs, screenshot, etc.)
+not started. Full write-up: [`plans/browser-automation.md`](plans/browser-automation.md).
+
+**What it does:** The claude-acp agent drives the **embedded browser tab**
+through five MCP tools — `browser_navigate`, `browser_snapshot`,
+`browser_click`, `browser_type`, `browser_wait_for` — registered as the
+`zed-browser` context server. Tools hit the page via CDP (accessibility
+snapshot + DOM scripts), not Sikuli-style coordinates.
+
+**Stack:**
+
+```text
+agent panel → vendor/zed-browser-mcp (stdio MCP)
+           → loopback TCP 127.0.0.1:19382
+           → browser_viewer::automation (Rust, GPUI thread)
+           → WebView2Session
+```
+
+**One-time MCP build:**
+
+```powershell
+cd D:\src\zed\vendor\zed-browser-mcp
+npm install && npm run build
+```
+
+**Settings snippet** (`%APPDATA%\Zed\settings.json`):
+
+```jsonc
+"context_servers": {
+  "zed-browser": {
+    "command": "node",
+    "args": ["D:/src/zed/vendor/zed-browser-mcp/dist/index.js"]
+  }
+}
+```
+
+Enable the server on the agent profile. Open a browser tab before the agent
+runs tools. After navigation, the agent must **snapshot again** — refs
+(`e14`, …) invalidate on page change.
+
+**Load-bearing implementation notes:**
+
+- **`action.rs` `TYPE_SCRIPT`** — React/Vue controlled inputs need the native
+  `HTMLInputElement` value setter, `_valueTracker` reset, and `InputEvent`;
+  plain `.value =` only updates the DOM.
+- **`commands.rs`** — MCP click/type resolve refs with `browser.read()` on
+  the App context, never `browser.read()` inside `browser.update()` (GPUI
+  re-entrant borrow panic).
+- **`ipc.rs`** — TCP listener starts in `browser_viewer::init`; one global
+  mutex serializes MCP dispatch vs navigation handlers.
+- **Dev actions** under `browser: automation …` remain for manual testing
+  without MCP.
+
+**Dogfood credentials** (optional, dev actions only): `browser.automation_credentials`
+in settings; MCP type uses whatever the agent passes in tool args.
+
 ### `stubs/msvc_spectre_libs/` — build workaround
 
 A local no-op crate that replaces the crates.io `msvc_spectre_libs` via
@@ -450,7 +513,7 @@ error: only metadata stub found for `dylib` dependency `std` ...
 
 Run this whenever you want to incorporate new upstream Zed commits.
 The branch chain is `main` → `pdf-viewer` → `claude-only` →
-`browser-viewer`; each rebases onto its predecessor.
+`browser-viewer` → `browser-automation`; each rebases onto its predecessor.
 
 ```powershell
 # 1. Update local main from upstream
@@ -477,6 +540,12 @@ git checkout browser-viewer
 git rebase claude-only
 cargo build -j 4
 git push --force-with-lease origin browser-viewer
+
+# 5. Rebase browser-automation onto the new browser-viewer
+git checkout browser-automation
+git rebase browser-viewer
+cargo build -j 4
+git push --force-with-lease origin browser-automation
 ```
 
 ### Conflict hot spots
@@ -519,8 +588,8 @@ Files this fork modifies in code paths upstream churns frequently:
 upstream reorders sibling rules — search for `FORK:` markers.
 
 Everything under `crates/pdf_viewer/`, `crates/browser_viewer/`,
-`vendor/claude-agent-acp/`, and `stubs/` won't conflict — upstream
-doesn't touch them.
+`vendor/claude-agent-acp/`, `vendor/zed-browser-mcp/`, and `stubs/` won't
+conflict — upstream doesn't touch them.
 
 ### Rebase vs. merge
 

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser Automation Test</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, Segoe UI, Arial, sans-serif;
+        background: #151923;
+        color: #eef2ff;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+      }
+      main {
+        width: min(720px, calc(100vw - 48px));
+        border: 1px solid #3d4558;
+        border-radius: 10px;
+        background: #202635;
+        padding: 28px;
+      }
+      h1 { margin: 0 0 8px; font-size: 24px; }
+      p { margin: 0 0 22px; color: #bac4d8; }
+      .row { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+      button {
+        border: 1px solid #66708a;
+        border-radius: 8px;
+        background: #2d88ff;
+        color: white;
+        font: inherit;
+        font-weight: 600;
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+      button.secondary { background: #31394d; }
+      input {
+        flex: 1;
+        min-width: 200px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid #66708a;
+        background: #11151f;
+        color: #eef2ff;
+        font: inherit;
+      }
+      output {
+        display: block;
+        min-height: 24px;
+        padding: 12px;
+        border-radius: 8px;
+        background: #11151f;
+        color: #8ff0b4;
+        font-family: Consolas, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Browser Automation Test</h1>
+      <p>Tier-1 dogfood page for snapshot, click, and type checkpoints.</p>
+      <div class="row">
+        <button id="sign-in" data-testid="sign-in-button">Sign in</button>
+        <button id="create-account" class="secondary" data-testid="create-account-button">Create Account</button>
+      </div>
+      <div class="row">
+        <input id="email" type="email" aria-label="Email" placeholder="you@example.com" />
+        <button id="submit-email" type="button">Submit</button>
+      </div>
+      <output id="result">No interaction yet</output>
+    </main>
+    <script>
+      const result = document.getElementById("result");
+      document.getElementById("sign-in").addEventListener("click", () => {
+        result.textContent = "clicked: Sign in";
+      });
+      document.getElementById("create-account").addEventListener("click", () => {
+        result.textContent = "clicked: Create Account";
+      });
+      document.getElementById("submit-email").addEventListener("click", () => {
+        const email = document.getElementById("email").value;
+        result.textContent = email ? `submitted: ${email}` : "submitted: (empty)";
+      });
+    </script>
+  </body>
+</html>
