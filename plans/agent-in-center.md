@@ -170,3 +170,45 @@ math, interactive assemble branch) and `crates/workspace/src/workspace.rs`
 Verify live: relocate the agent (Stage 3a action), drag the agent↔editor boundary both
 horizontally and vertically, confirm the neighbor is zero-sum and the min-size clamp
 holds; confirm the default layout is unchanged and its dock handles still work.
+
+## Stage 4 — drag-to-rearrange (region drag/drop)
+
+Status: in progress (after 3b at `aea77cb`). The polished mouse alternative to the
+Stage 3a `MoveRegion*` palette commands: drag a whole region onto another region's
+edge/center to re-parent it in the tree. Structural template = pane **tab** drag-to-split
+(`pane.rs`: `DraggedTab`, `handle_drag_move` quadrant hit-test at ~3732, `handle_tab_drop`
+deferred split/move at ~3788, half-pane overlay at ~4527). GPUI DnD API:
+`on_drag<T,W>`/`on_drop<T>`/`on_drag_move<T>` + `DragMoveEvent<T>{event,bounds}` +
+`can_drop`; overlays that must catch the drop need `.occlude()`.
+
+**Grab affordance (user choice): Alt + drag the region body** — no chrome. Gated on Alt so
+it doesn't hijack normal interaction. KNOWN RISK to verify live: Alt+click is editor
+multi-cursor, so the drag source must be **non-occluding** (Alt+click still reaches the
+editor); only the *drop-zone* overlays occlude (to catch the mouse-up cleanly — the
+`.occlude()` lesson from browser_viewer 4.F).
+
+Split into two commits:
+- **4a — layout tree drop ops (pure, unit-tested).** In `layout.rs`: `DropZone{Left,Right,
+  Top,Bottom,Center}` (`axis()`/`inserts_before()`); `LayoutNode::replace_leaf` +
+  `swap_leaves`; `pub drop_region(root, moved, target, zone)` and `swap_regions(root,a,b)`.
+  Edge zones = detach `moved` via `without_region`, replace the `target` leaf with a 2-child
+  `split(zone.axis(), …)`, then `normalize` (this resets the affected split's flexes to
+  equal — accepted v1, same as 3a). Center = positional swap via `swap_leaves`, which
+  mutates leaves in place and **preserves flex weights**. No-ops: `moved==target`, target
+  absent, `moved` is the whole tree. `#[cfg(test)]` tests assert topology (a `shape()`
+  stringifier) + the `flexes.len()==children.len()` invariant. Verified with
+  `cargo test -p workspace`.
+- **4b — drag/drop UI.** `RegionBounds = Arc<Mutex<Vec<(LayoutRegion, Bounds<Pixels>)>>>`
+  written in `RegionAxisElement::prepaint` (Stage 3b dropped `bounding_boxes`; this re-adds
+  per-region rects, keyed by region, for drop hit-testing), threaded through
+  `assemble_layout`/`assemble_interactive`/`region_axis`, cleared+passed from
+  `render_layout_node`. `DraggedRegion(LayoutRegion)` payload. `Workspace`: `alt_held`
+  (via `on_modifiers_changed`), `region_bounds`, `drag_drop_target: Option<(LayoutRegion,
+  DropZone)>`. Source: Alt-gated non-occluding `on_drag` wrapper per region (subtle tint
+  for discoverability). Drop: an occluding full-size layer active during a `DraggedRegion`
+  drag with `on_drag_move::<DraggedRegion>` (hit-test cursor vs `region_bounds` → region →
+  5-zone sub-divide via `drop_target_size` band → `DropZone`) + `on_drop::<DraggedRegion>`
+  → `drop_region_on(moved,target,zone)`; a `deferred` highlight quad over the candidate
+  sub-rect. Single lone-leaf region falls back to `workspace.bounds`.
+
+Then Stage 5 (persistence + migration; serialize the tree incl. per-Split flex vectors).

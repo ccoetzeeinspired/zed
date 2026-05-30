@@ -114,6 +114,63 @@ impl LayoutNode {
             }
         }
     }
+
+    /// FORK Stage 4. Replace the first `Leaf(target)` found (depth-first) with
+    /// `replacement`, returning whether a replacement happened. Used by
+    /// `drop_region` to graft a `[moved, target]` split where `target` was.
+    fn replace_leaf(&mut self, target: LayoutRegion, replacement: LayoutNode) -> bool {
+        match self {
+            LayoutNode::Leaf(r) if *r == target => {
+                *self = replacement;
+                true
+            }
+            LayoutNode::Leaf(_) => false,
+            LayoutNode::Split { children, .. } => {
+                for child in children.iter_mut() {
+                    if child.replace_leaf(target, replacement.clone()) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// FORK Stage 4. Exchange the positions of leaves `a` and `b` in place,
+    /// returning whether both were found. Mutating leaves in place (rather than
+    /// rebuilding via `split`) deliberately **preserves every split's flex
+    /// vector** — a swap keeps your sizing.
+    fn swap_leaves(&mut self, a: LayoutRegion, b: LayoutRegion) -> bool {
+        let mut found_a = false;
+        let mut found_b = false;
+        self.swap_leaves_inner(a, b, &mut found_a, &mut found_b);
+        found_a && found_b
+    }
+
+    fn swap_leaves_inner(
+        &mut self,
+        a: LayoutRegion,
+        b: LayoutRegion,
+        found_a: &mut bool,
+        found_b: &mut bool,
+    ) {
+        match self {
+            LayoutNode::Leaf(r) if *r == a => {
+                *r = b;
+                *found_a = true;
+            }
+            LayoutNode::Leaf(r) if *r == b => {
+                *r = a;
+                *found_b = true;
+            }
+            LayoutNode::Leaf(_) => {}
+            LayoutNode::Split { children, .. } => {
+                for child in children.iter_mut() {
+                    child.swap_leaves_inner(a, b, found_a, found_b);
+                }
+            }
+        }
+    }
 }
 
 /// The four edges a region can be moved toward.
@@ -193,6 +250,97 @@ pub fn normalize(node: LayoutNode) -> LayoutNode {
             }
         }
     }
+}
+
+/// FORK Stage 4. Where a dragged region lands relative to a drop-target region:
+/// one of the four edges (insert a sibling alongside the target) or the center
+/// (swap the two regions' positions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropZone {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Center,
+}
+
+impl DropZone {
+    /// The split axis an edge drop creates (Left/Right → Horizontal,
+    /// Top/Bottom → Vertical). Not meaningful for `Center`.
+    fn axis(self) -> Axis {
+        match self {
+            DropZone::Left | DropZone::Right => Axis::Horizontal,
+            DropZone::Top | DropZone::Bottom => Axis::Vertical,
+            DropZone::Center => Axis::Horizontal,
+        }
+    }
+
+    /// True if the dropped region goes *before* the target along the axis
+    /// (Left/Top), false if *after* (Right/Bottom).
+    fn inserts_before(self) -> bool {
+        matches!(self, DropZone::Left | DropZone::Top)
+    }
+}
+
+/// FORK Stage 4. Drop `moved` onto `target`'s `zone`, returning the new root.
+///
+/// Edge zones detach `moved` (via [`LayoutNode::without_region`]) and replace
+/// the `target` leaf with a 2-child split along the zone's axis, then
+/// [`normalize`] (which merges the new split into an existing same-axis parent
+/// and, as a side effect, resets the affected split's flex weights to equal —
+/// accepted v1 behaviour). The `Center` zone is a positional swap that preserves
+/// flex weights. No-ops (return `root` unchanged) when `moved == target`, when
+/// `target` is not present, or when `moved` is the whole tree.
+pub fn drop_region(
+    root: LayoutNode,
+    moved: LayoutRegion,
+    target: LayoutRegion,
+    zone: DropZone,
+) -> LayoutNode {
+    if moved == target {
+        return root;
+    }
+    if zone == DropZone::Center {
+        return swap_regions(root, moved, target);
+    }
+    let Some(mut remainder) = root.clone().without_region(moved) else {
+        // `moved` was the entire tree; nothing to drop it against.
+        return root;
+    };
+    if !remainder.regions().contains(&target) {
+        // Target wasn't in the tree (shouldn't happen for a rendered drop
+        // target, since moved != target); leave the layout untouched.
+        return root;
+    }
+    let pair = if zone.inserts_before() {
+        LayoutNode::split(
+            zone.axis(),
+            vec![LayoutNode::leaf(moved), LayoutNode::leaf(target)],
+        )
+    } else {
+        LayoutNode::split(
+            zone.axis(),
+            vec![LayoutNode::leaf(target), LayoutNode::leaf(moved)],
+        )
+    };
+    remainder.replace_leaf(target, pair);
+    normalize(remainder)
+}
+
+/// FORK Stage 4. Swap the positions of regions `a` and `b` in the tree,
+/// preserving all split flex weights (see [`LayoutNode::swap_leaves`]). No-op if
+/// either is absent or `a == b`.
+pub fn swap_regions(root: LayoutNode, a: LayoutRegion, b: LayoutRegion) -> LayoutNode {
+    if a == b {
+        return root;
+    }
+    // No `normalize` here: swapping two *leaves* can never create same-axis
+    // nesting or a single-child split, so normalize would be a structural no-op
+    // — and it rebuilds every split via `LayoutNode::split`, which would reset
+    // the flex weights this swap is meant to preserve.
+    let mut root = root;
+    root.swap_leaves(a, b);
+    root
 }
 
 /// The region elements, each rendered once by `Workspace::render` and consumed
@@ -790,5 +938,130 @@ mod resize {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DropZone, LayoutNode, LayoutRegion, default_layout_node, drop_region};
+    use crate::BottomDockLayout;
+    use crate::dock::DockPosition;
+    use gpui::Axis;
+
+    /// Compact topology string, ignoring flex weights: leaves are
+    /// C/L/R/B (center / left / right / bottom dock), splits are H[..]/V[..].
+    fn shape(node: &LayoutNode) -> String {
+        match node {
+            LayoutNode::Leaf(LayoutRegion::Center) => "C".to_string(),
+            LayoutNode::Leaf(LayoutRegion::Dock(DockPosition::Left)) => "L".to_string(),
+            LayoutNode::Leaf(LayoutRegion::Dock(DockPosition::Right)) => "R".to_string(),
+            LayoutNode::Leaf(LayoutRegion::Dock(DockPosition::Bottom)) => "B".to_string(),
+            LayoutNode::Split { axis, children, .. } => {
+                let tag = match axis {
+                    Axis::Horizontal => "H",
+                    Axis::Vertical => "V",
+                };
+                let inner: Vec<String> = children.iter().map(shape).collect();
+                format!("{tag}[{}]", inner.join(","))
+            }
+        }
+    }
+
+    /// Every split's flex vector must stay in lockstep with its child count.
+    fn assert_flex_invariant(node: &LayoutNode) {
+        if let LayoutNode::Split {
+            children, flexes, ..
+        } = node
+        {
+            assert_eq!(
+                flexes.lock().len(),
+                children.len(),
+                "flex len must equal child count for {}",
+                shape(node)
+            );
+            for child in children {
+                assert_flex_invariant(child);
+            }
+        }
+    }
+
+    const CENTER: LayoutRegion = LayoutRegion::Center;
+    const LEFT: LayoutRegion = LayoutRegion::Dock(DockPosition::Left);
+    const RIGHT: LayoutRegion = LayoutRegion::Dock(DockPosition::Right);
+
+    fn contained() -> LayoutNode {
+        default_layout_node(BottomDockLayout::Contained)
+    }
+
+    #[test]
+    fn contained_default_shape() {
+        assert_eq!(shape(&contained()), "H[L,V[C,B],R]");
+        assert_flex_invariant(&contained());
+    }
+
+    #[test]
+    fn drop_center_left_of_right() {
+        // Detach C (V[C,B] collapses to B), then graft H[C,R] where R was;
+        // normalize merges the inner H into the outer H.
+        let out = drop_region(contained(), CENTER, RIGHT, DropZone::Left);
+        assert_eq!(shape(&out), "H[L,B,C,R]");
+        assert_flex_invariant(&out);
+    }
+
+    #[test]
+    fn drop_center_right_of_right() {
+        let out = drop_region(contained(), CENTER, RIGHT, DropZone::Right);
+        assert_eq!(shape(&out), "H[L,B,R,C]");
+        assert_flex_invariant(&out);
+    }
+
+    #[test]
+    fn drop_left_above_center() {
+        // Detach L → H[V[C,B],R]; replace C with V[L,C] → V[V[L,C],B] →
+        // normalize → V[L,C,B]; whole tree H[V[L,C,B],R].
+        let out = drop_region(contained(), LEFT, CENTER, DropZone::Top);
+        assert_eq!(shape(&out), "H[V[L,C,B],R]");
+        assert_flex_invariant(&out);
+    }
+
+    #[test]
+    fn drop_center_swaps_with_right() {
+        let out = drop_region(contained(), CENTER, RIGHT, DropZone::Center);
+        assert_eq!(shape(&out), "H[L,V[R,B],C]");
+        assert_flex_invariant(&out);
+    }
+
+    #[test]
+    fn swap_preserves_flex_weights() {
+        // Give the outer H non-equal weights, then swap two of its descendants;
+        // the outer split's weights must survive (swap mutates leaves in place).
+        let tree = contained();
+        if let LayoutNode::Split { flexes, .. } = &tree {
+            *flexes.lock() = vec![2.0, 0.5, 0.5];
+        }
+        let out = drop_region(tree, CENTER, RIGHT, DropZone::Center);
+        if let LayoutNode::Split { flexes, .. } = &out {
+            assert_eq!(*flexes.lock(), vec![2.0, 0.5, 0.5]);
+        } else {
+            panic!("expected a split at the root");
+        }
+    }
+
+    #[test]
+    fn drop_onto_self_is_noop() {
+        let out = drop_region(contained(), CENTER, CENTER, DropZone::Left);
+        assert_eq!(shape(&out), "H[L,V[C,B],R]");
+    }
+
+    #[test]
+    fn drop_onto_absent_target_is_noop() {
+        // A tree with no Right dock; dropping onto Right changes nothing.
+        let tree = LayoutNode::split(
+            Axis::Horizontal,
+            vec![LayoutNode::leaf(LEFT), LayoutNode::leaf(CENTER)],
+        );
+        let out = drop_region(tree, LEFT, RIGHT, DropZone::Right);
+        assert_eq!(shape(&out), "H[L,C]");
+        assert_flex_invariant(&out);
     }
 }
