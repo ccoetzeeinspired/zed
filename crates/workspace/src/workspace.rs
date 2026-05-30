@@ -63,8 +63,9 @@ use futures::{
 use gpui::{
     Action, AnyEntity, AnyView, AnyWeakView, App, AsyncApp, AsyncWindowContext, Axis, Bounds,
     Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView, MouseButton,
-    PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size, Stateful, Subscription,
+    Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke, ManagedView,
+    ModifiersChangedEvent, MouseButton, MouseUpEvent, PathPromptOptions, Point, PromptLevel, Render,
+    ResizeEdge, Size, Stateful, Subscription,
     SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity, WindowBounds, WindowHandle,
     WindowId, WindowOptions, actions, canvas, point, relative, size, transparent_black,
 };
@@ -1376,6 +1377,15 @@ pub struct Workspace {
     /// layout that overrides it, letting regions sit at any edge. See
     /// `crate::layout` and plans/agent-in-center.md.
     custom_layout: Option<crate::layout::LayoutNode>,
+    /// FORK Stage 4: true while Alt is held, which arms region drag-to-rearrange
+    /// (so a normal click/drag in the editor is never hijacked).
+    region_drag_alt: bool,
+    /// FORK Stage 4: true while a region (`DraggedRegion`) drag is in progress;
+    /// gates the occluding drop overlays so they only exist mid-drag.
+    region_drag_active: bool,
+    /// FORK Stage 4: the region + zone the cursor is currently over during a
+    /// region drag — drives the drop-zone highlight and the committed drop.
+    region_drop_target: Option<(crate::layout::LayoutRegion, crate::layout::DropZone)>,
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
@@ -1815,6 +1825,9 @@ impl Workspace {
             zoomed: None,
             zoomed_position: None,
             previous_dock_drag_coordinates: None,
+            region_drag_alt: false,
+            region_drag_active: false,
+            region_drop_target: None,
             center,
             panes: vec![center_pane.clone()],
             panes_by_item: Default::default(),
@@ -2321,6 +2334,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        use crate::layout::LayoutRegion;
         let center = h_flex()
             .flex_1()
             .when_some(paddings.0, |this, p| this.child(p.border_r_1()))
@@ -2330,29 +2344,36 @@ impl Workspace {
             )
             .when_some(paddings.1, |this, p| this.child(p.border_l_1()))
             .into_any_element();
+        // FORK Stage 4: on the interactive (custom-layout) path each region is
+        // wrapped with drag-to-rearrange chrome (Alt-drag source + drop zones).
+        let center = if interactive {
+            self.wrap_region_for_drag(LayoutRegion::Center, center, cx)
+        } else {
+            center
+        };
+        let left = self.render_dock_for_layout(DockPosition::Left, &self.left_dock, interactive, window, cx);
+        let right = self.render_dock_for_layout(DockPosition::Right, &self.right_dock, interactive, window, cx);
+        let bottom = self.render_dock_for_layout(DockPosition::Bottom, &self.bottom_dock, interactive, window, cx);
+        let (left, right, bottom) = if interactive {
+            (
+                left.map(|el| {
+                    self.wrap_region_for_drag(LayoutRegion::Dock(DockPosition::Left), el, cx)
+                }),
+                right.map(|el| {
+                    self.wrap_region_for_drag(LayoutRegion::Dock(DockPosition::Right), el, cx)
+                }),
+                bottom.map(|el| {
+                    self.wrap_region_for_drag(LayoutRegion::Dock(DockPosition::Bottom), el, cx)
+                }),
+            )
+        } else {
+            (left, right, bottom)
+        };
         let mut regions = crate::layout::RenderedRegions {
             center: Some(center),
-            left: self.render_dock_for_layout(
-                DockPosition::Left,
-                &self.left_dock,
-                interactive,
-                window,
-                cx,
-            ),
-            right: self.render_dock_for_layout(
-                DockPosition::Right,
-                &self.right_dock,
-                interactive,
-                window,
-                cx,
-            ),
-            bottom: self.render_dock_for_layout(
-                DockPosition::Bottom,
-                &self.bottom_dock,
-                interactive,
-                window,
-                cx,
-            ),
+            left,
+            right,
+            bottom,
         };
         crate::layout::assemble_layout(node, &mut regions, interactive)
     }
@@ -2401,6 +2422,121 @@ impl Workspace {
     /// of the generic region handle.
     pub fn has_custom_layout(&self) -> bool {
         self.custom_layout.is_some()
+    }
+
+    /// FORK Stage 4. Wrap a rendered region with drag-to-rearrange chrome:
+    /// - an Alt-gated, non-occluding `on_drag` source (so a normal click/drag in
+    ///   the editor still works — only Alt+drag starts a region move);
+    /// - an `on_drag_move` that hit-tests the cursor into a `DropZone` for this
+    ///   region and records it (`region_drop_target`);
+    /// - while a region drag is active, an occluding overlay carrying `on_drop`
+    ///   plus the drop-zone highlight (occluding so the mouse-up lands here and
+    ///   not in the editor/webview underneath — the `.occlude()` lesson from 4.F).
+    fn wrap_region_for_drag(
+        &self,
+        region: crate::layout::LayoutRegion,
+        content: gpui::AnyElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let alt = self.region_drag_alt;
+        let show_overlay = self.region_drag_active;
+        let active_target = self.region_drop_target;
+        let drop_fraction = WorkspaceSettings::get_global(cx).drop_target_size;
+        let highlight_color = cx.theme().colors().drop_target_background;
+
+        // Stable per-region element id so `on_drag` (a StatefulInteractiveElement
+        // method) is available and drag state persists across frames.
+        let drag_id = match region {
+            crate::layout::LayoutRegion::Center => "region-drag-center",
+            crate::layout::LayoutRegion::Dock(DockPosition::Left) => "region-drag-left",
+            crate::layout::LayoutRegion::Dock(DockPosition::Right) => "region-drag-right",
+            crate::layout::LayoutRegion::Dock(DockPosition::Bottom) => "region-drag-bottom",
+        };
+
+        // NB: must be a flex column, not a plain block. The center region is an
+        // `h_flex().flex_1()` that sizes by growing inside a flex parent; a block
+        // wrapper strips its flex context and the editor collapses to an empty
+        // pane (docks survive because they size via `size_full`). Mirrors the
+        // center-leaf wrapper in `layout::assemble_interactive`.
+        div()
+            .id(drag_id)
+            .flex()
+            .flex_col()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .child(content)
+            .when(alt, |this| {
+                this.cursor(gpui::CursorStyle::OpenHand).on_drag(
+                    DraggedRegion(region),
+                    |dragged, _offset, _window, cx| cx.new(|_| dragged.clone()),
+                )
+            })
+            .on_drag_move(cx.listener(
+                move |workspace, e: &DragMoveEvent<DraggedRegion>, _window, cx| {
+                    workspace.region_drag_active = true;
+                    if e.bounds.contains(&e.event.position) {
+                        let zone = region_drop_zone(e.bounds, e.event.position, drop_fraction);
+                        let next = Some((region, zone));
+                        if workspace.region_drop_target != next {
+                            workspace.region_drop_target = next;
+                        }
+                    }
+                    cx.notify();
+                },
+            ))
+            .when(show_overlay, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .occlude()
+                        .when_some(
+                            match active_target {
+                                Some((r, zone)) if r == region => Some(zone),
+                                _ => None,
+                            },
+                            |this, zone| this.child(region_drop_highlight(zone, highlight_color)),
+                        )
+                        .on_drop(cx.listener(
+                            move |workspace, dragged: &DraggedRegion, window, cx| {
+                                let moved = dragged.0;
+                                let (target, zone) = workspace
+                                    .region_drop_target
+                                    .unwrap_or((region, crate::layout::DropZone::Center));
+                                workspace.drop_region_on(moved, target, zone, window, cx);
+                            },
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// FORK Stage 4. Commit a region drag: re-parent `moved` relative to `target`
+    /// per `zone`, seeding a custom tree from the built-in layout on first use
+    /// (mirrors `move_focused_region`). Always clears the transient drag state.
+    fn drop_region_on(
+        &mut self,
+        moved: crate::layout::LayoutRegion,
+        target: crate::layout::LayoutRegion,
+        zone: crate::layout::DropZone,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.region_drag_active = false;
+        self.region_drop_target = None;
+        if moved != target {
+            let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
+            let current = self
+                .custom_layout
+                .take()
+                .unwrap_or_else(|| crate::layout::default_layout_node(bottom_dock_layout));
+            self.custom_layout = Some(crate::layout::drop_region(current, moved, target, zone));
+        }
+        cx.notify();
     }
 
     pub fn active_worktree_creation(&self) -> &ActiveWorktreeCreation {
@@ -8573,6 +8709,86 @@ impl Render for DraggedDock {
     }
 }
 
+/// FORK Stage 4: payload for a region drag-to-rearrange gesture. Carries the
+/// region being moved; also serves as its own floating drag preview.
+#[derive(Clone)]
+struct DraggedRegion(crate::layout::LayoutRegion);
+
+impl Render for DraggedRegion {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let label = match self.0 {
+            crate::layout::LayoutRegion::Center => "Editor",
+            crate::layout::LayoutRegion::Dock(DockPosition::Left) => "Left panel",
+            crate::layout::LayoutRegion::Dock(DockPosition::Right) => "Right panel",
+            crate::layout::LayoutRegion::Dock(DockPosition::Bottom) => "Bottom panel",
+        };
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().elevated_surface_background)
+            .text_color(cx.theme().colors().text)
+            .text_sm()
+            .child(format!("⠿ {label}"))
+    }
+}
+
+/// FORK Stage 4: classify where in a target region the cursor sits — one of the
+/// four edge bands (insert alongside) or the center (swap). Mirrors the pane-tab
+/// drag hit-test (`Pane::handle_drag_move`): an edge band of `drop_fraction` of
+/// the region's smaller dimension, else center.
+fn region_drop_zone(
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+    drop_fraction: f32,
+) -> crate::layout::DropZone {
+    use crate::layout::DropZone;
+    let w = bounds.size.width;
+    let h = bounds.size.height;
+    let band = w.min(h) * drop_fraction;
+    let rx = position.x - bounds.left();
+    let ry = position.y - bounds.top();
+    let near_edge = rx < band || rx > w - band || ry < band || ry > h - band;
+    if !near_edge {
+        return DropZone::Center;
+    }
+    // Nearest edge wins.
+    let dl = rx;
+    let dr = w - rx;
+    let dt = ry;
+    let db = h - ry;
+    let mut zone = DropZone::Left;
+    let mut best = dl;
+    if dr < best {
+        best = dr;
+        zone = DropZone::Right;
+    }
+    if dt < best {
+        best = dt;
+        zone = DropZone::Top;
+    }
+    if db < best {
+        zone = DropZone::Bottom;
+    }
+    zone
+}
+
+/// FORK Stage 4: the highlighted sub-rect that previews where a dropped region
+/// will land (half the target for an edge, the whole target for a swap).
+fn region_drop_highlight(zone: crate::layout::DropZone, color: Hsla) -> Div {
+    use crate::layout::DropZone;
+    let base = div().absolute().bg(color);
+    match zone {
+        DropZone::Left => base.top_0().left_0().bottom_0().w(relative(0.5)),
+        DropZone::Right => base.top_0().right_0().bottom_0().w(relative(0.5)),
+        DropZone::Top => base.top_0().left_0().right_0().h(relative(0.5)),
+        DropZone::Bottom => base.bottom_0().left_0().right_0().h(relative(0.5)),
+        DropZone::Center => base.top_0().left_0().right_0().bottom_0(),
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
@@ -8642,6 +8858,17 @@ impl Render for Workspace {
                     cx.notify(id);
                 }
             })
+            // FORK Stage 4: track Alt so region drag-to-rearrange is armed only
+            // while it's held. Separate handler so it can use `cx.notify()` (self)
+            // rather than the `App`-level notify(id) the loop above needs.
+            .on_modifiers_changed(cx.listener(
+                move |workspace, e: &ModifiersChangedEvent, _, cx| {
+                    if workspace.region_drag_alt != e.modifiers.alt {
+                        workspace.region_drag_alt = e.modifiers.alt;
+                        cx.notify();
+                    }
+                },
+            ))
             .child(
                 div()
                     .size_full()
@@ -8742,6 +8969,21 @@ impl Render for Workspace {
                                     },
                                 ))
                             })
+                            // FORK Stage 4: clear region-drag state on any mouse-up
+                            // that wasn't consumed by a successful drop (drop that
+                            // missed every region), so the overlays don't get stuck.
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|workspace, _: &MouseUpEvent, _window, cx| {
+                                    if workspace.region_drag_active
+                                        || workspace.region_drop_target.is_some()
+                                    {
+                                        workspace.region_drag_active = false;
+                                        workspace.region_drop_target = None;
+                                        cx.notify();
+                                    }
+                                }),
+                            )
                             .child({
                                 // FORK: dynamic layout (Stage 3). A user-arranged
                                 // custom tree overrides the built-in topology.
