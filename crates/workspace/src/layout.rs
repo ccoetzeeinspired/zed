@@ -18,6 +18,7 @@
 
 use gpui::{AnyElement, Axis, div, prelude::*};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::BottomDockLayout;
@@ -343,6 +344,134 @@ pub fn swap_regions(root: LayoutNode, a: LayoutRegion, b: LayoutRegion) -> Layou
     root
 }
 
+// ===========================================================================
+// FORK Stage 5 — serialization (persist the custom layout across restart).
+//
+// `LayoutNode` can't derive serde (it holds `Arc<Mutex<Vec<f32>>>`), so we keep
+// a plain serde mirror and convert at the persistence boundary. The mirror is
+// stored as JSON text in the `workspaces.custom_layout` column (see
+// `persistence.rs`); the workspace round-trips it via [`LayoutNode::to_serialized`]
+// / [`LayoutNode::from_serialized`]. The serde representation is deliberately
+// independent of `gpui::Axis`/`DockPosition` reprs so the on-disk format stays
+// stable even if those types change upstream.
+// ===========================================================================
+
+/// Serde mirror of [`LayoutRegion`].
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerializedLayoutRegion {
+    Center,
+    DockLeft,
+    DockRight,
+    DockBottom,
+}
+
+impl From<LayoutRegion> for SerializedLayoutRegion {
+    fn from(region: LayoutRegion) -> Self {
+        match region {
+            LayoutRegion::Center => SerializedLayoutRegion::Center,
+            LayoutRegion::Dock(DockPosition::Left) => SerializedLayoutRegion::DockLeft,
+            LayoutRegion::Dock(DockPosition::Right) => SerializedLayoutRegion::DockRight,
+            LayoutRegion::Dock(DockPosition::Bottom) => SerializedLayoutRegion::DockBottom,
+        }
+    }
+}
+
+impl From<SerializedLayoutRegion> for LayoutRegion {
+    fn from(region: SerializedLayoutRegion) -> Self {
+        match region {
+            SerializedLayoutRegion::Center => LayoutRegion::Center,
+            SerializedLayoutRegion::DockLeft => LayoutRegion::Dock(DockPosition::Left),
+            SerializedLayoutRegion::DockRight => LayoutRegion::Dock(DockPosition::Right),
+            SerializedLayoutRegion::DockBottom => LayoutRegion::Dock(DockPosition::Bottom),
+        }
+    }
+}
+
+/// Serde mirror of `gpui::Axis` (kept local so the on-disk format is stable).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerializedLayoutAxis {
+    Horizontal,
+    Vertical,
+}
+
+impl From<Axis> for SerializedLayoutAxis {
+    fn from(axis: Axis) -> Self {
+        match axis {
+            Axis::Horizontal => SerializedLayoutAxis::Horizontal,
+            Axis::Vertical => SerializedLayoutAxis::Vertical,
+        }
+    }
+}
+
+impl From<SerializedLayoutAxis> for Axis {
+    fn from(axis: SerializedLayoutAxis) -> Self {
+        match axis {
+            SerializedLayoutAxis::Horizontal => Axis::Horizontal,
+            SerializedLayoutAxis::Vertical => Axis::Vertical,
+        }
+    }
+}
+
+/// Serde mirror of [`LayoutNode`] — the persisted form of the custom layout tree.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum SerializedLayoutNode {
+    Leaf(SerializedLayoutRegion),
+    Split {
+        axis: SerializedLayoutAxis,
+        flexes: Vec<f32>,
+        children: Vec<SerializedLayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    /// Convert this live tree into its serde mirror (reading flex weights out of
+    /// the shared `Arc<Mutex<_>>`), ready to be stored as JSON.
+    pub fn to_serialized(&self) -> SerializedLayoutNode {
+        match self {
+            LayoutNode::Leaf(region) => SerializedLayoutNode::Leaf((*region).into()),
+            LayoutNode::Split {
+                axis,
+                children,
+                flexes,
+            } => SerializedLayoutNode::Split {
+                axis: (*axis).into(),
+                flexes: flexes.lock().clone(),
+                children: children.iter().map(LayoutNode::to_serialized).collect(),
+            },
+        }
+    }
+
+    /// Rebuild a live tree from its serde mirror. Flex weights are validated the
+    /// same way `PaneAxis::load` validates pane flexes: a split whose stored
+    /// weights don't match its child count, or don't sum to that count (the
+    /// `sum == len` invariant), is reset to equal weights. This keeps a corrupt
+    /// or stale persisted layout from violating the rendering invariants.
+    pub fn from_serialized(node: SerializedLayoutNode) -> LayoutNode {
+        match node {
+            SerializedLayoutNode::Leaf(region) => LayoutNode::Leaf(region.into()),
+            SerializedLayoutNode::Split {
+                axis,
+                flexes,
+                children,
+            } => {
+                let children: Vec<LayoutNode> =
+                    children.into_iter().map(LayoutNode::from_serialized).collect();
+                let mut flexes = flexes;
+                if flexes.len() != children.len()
+                    || (flexes.iter().copied().sum::<f32>() - flexes.len() as f32).abs() >= 0.001
+                {
+                    flexes = vec![1.; children.len()];
+                }
+                LayoutNode::Split {
+                    axis: axis.into(),
+                    children,
+                    flexes: Arc::new(Mutex::new(flexes)),
+                }
+            }
+        }
+    }
+}
+
 /// The region elements, each rendered once by `Workspace::render` and consumed
 /// (via `take`) as the tree is assembled. A region appears at most once in any
 /// tree, so taking is safe. A dock that is closed/absent is `None` and is
@@ -440,10 +569,11 @@ pub fn assemble_layout(
     node: &LayoutNode,
     regions: &mut RenderedRegions,
     interactive: bool,
+    workspace: gpui::WeakEntity<crate::Workspace>,
 ) -> AnyElement {
     if interactive {
         let mut basis = 0usize;
-        assemble_interactive(node, regions, &mut basis)
+        assemble_interactive(node, regions, &workspace, &mut basis)
             .unwrap_or_else(|| div().into_any_element())
     } else {
         assemble_default(node, regions, None, true)
@@ -512,6 +642,7 @@ fn assemble_default(
 fn assemble_interactive(
     node: &LayoutNode,
     regions: &mut RenderedRegions,
+    workspace: &gpui::WeakEntity<crate::Workspace>,
     basis: &mut usize,
 ) -> Option<AnyElement> {
     match node {
@@ -543,7 +674,7 @@ fn assemble_interactive(
             // each stays aligned with its weight in `flexes`.
             let child_opts: Vec<Option<AnyElement>> = children
                 .iter()
-                .map(|child| assemble_interactive(child, regions, basis))
+                .map(|child| assemble_interactive(child, regions, workspace, basis))
                 .collect();
             let present = child_opts.iter().filter(|c| c.is_some()).count();
             match present {
@@ -551,7 +682,7 @@ fn assemble_interactive(
                 // A lone present child needs no axis/handle — render it directly.
                 1 => child_opts.into_iter().flatten().next(),
                 _ => Some(
-                    resize::region_axis(my_basis, *axis, flexes.clone(), child_opts)
+                    resize::region_axis(my_basis, *axis, flexes.clone(), child_opts, workspace.clone())
                         .into_any_element(),
                 ),
             }
@@ -575,10 +706,13 @@ mod resize {
     use gpui::{
         Along, AnyElement, App, Axis, Bounds, CursorStyle, Element, ElementId, GlobalElementId,
         Hitbox, HitboxBehavior, IntoElement, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-        Point, Size, Style, Window, px, relative, size,
+        Point, Size, Style, WeakEntity, Window, px, relative, size,
     };
     use parking_lot::Mutex;
     use ui::prelude::*;
+    use util::ResultExt;
+
+    use crate::Workspace;
 
     const HANDLE_HITBOX_SIZE: f32 = 4.0;
     const DIVIDER_SIZE: f32 = 1.0;
@@ -593,12 +727,14 @@ mod resize {
         axis: Axis,
         flexes: Arc<Mutex<Vec<f32>>>,
         children: Vec<Option<AnyElement>>,
+        workspace: WeakEntity<Workspace>,
     ) -> RegionAxisElement {
         RegionAxisElement {
             basis,
             axis,
             flexes,
             children,
+            workspace,
         }
     }
 
@@ -607,6 +743,9 @@ mod resize {
         axis: Axis,
         flexes: Arc<Mutex<Vec<f32>>>,
         children: Vec<Option<AnyElement>>,
+        /// FORK Stage 5: handle to persist the layout after a resize drag, the
+        /// same way `PaneAxisElement` serializes the pane group on resize.
+        workspace: WeakEntity<Workspace>,
     }
 
     pub(super) struct RegionAxisLayout {
@@ -650,6 +789,7 @@ mod resize {
             axis: Axis,
             container_size: Size<Pixels>,
             present_total: f32,
+            workspace: &WeakEntity<Workspace>,
             window: &mut Window,
             cx: &mut App,
         ) {
@@ -687,7 +827,13 @@ mod resize {
             let delta = new_flex_a - flexes[a];
             flexes[a] = new_flex_a;
             flexes[b] -= delta;
+            drop(flexes);
 
+            // FORK Stage 5: persist the new sizes (mirrors PaneAxisElement, which
+            // calls serialize_workspace at the end of its resize).
+            workspace
+                .update(cx, |workspace, cx| workspace.serialize_workspace(window, cx))
+                .log_err();
             cx.stop_propagation();
             window.refresh();
         }
@@ -893,13 +1039,22 @@ mod resize {
                     let dragged_handle = layout.dragged_handle.clone();
                     let flexes = self.flexes.clone();
                     let handle_hitbox = handle.hitbox.clone();
+                    let workspace = self.workspace.clone();
                     move |e: &MouseDownEvent, phase, window, cx| {
                         if phase.bubble() && handle_hitbox.is_hovered(window) {
                             dragged_handle.replace(Some(a));
                             // Double-click resets the split to equal weights.
                             if e.click_count >= 2 {
-                                let mut borrow = flexes.lock();
-                                *borrow = vec![1.; borrow.len()];
+                                {
+                                    let mut borrow = flexes.lock();
+                                    *borrow = vec![1.; borrow.len()];
+                                }
+                                // FORK Stage 5: persist the reset.
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.serialize_workspace(window, cx)
+                                    })
+                                    .log_err();
                                 window.refresh();
                             }
                             cx.stop_propagation();
@@ -910,6 +1065,7 @@ mod resize {
                 window.on_mouse_event({
                     let dragged_handle = layout.dragged_handle.clone();
                     let flexes = self.flexes.clone();
+                    let workspace = self.workspace.clone();
                     move |e: &MouseMoveEvent, phase, window, cx| {
                         if phase.bubble() && *dragged_handle.borrow() == Some(a) {
                             Self::compute_resize(
@@ -921,6 +1077,7 @@ mod resize {
                                 axis,
                                 container_size,
                                 present_total,
+                                &workspace,
                                 window,
                                 cx,
                             );
@@ -943,7 +1100,10 @@ mod resize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DropZone, LayoutNode, LayoutRegion, default_layout_node, drop_region};
+    use super::{
+        DropZone, LayoutNode, LayoutRegion, SerializedLayoutAxis, SerializedLayoutNode,
+        SerializedLayoutRegion, default_layout_node, drop_region,
+    };
     use crate::BottomDockLayout;
     use crate::dock::DockPosition;
     use gpui::Axis;
@@ -1063,5 +1223,85 @@ mod tests {
         let out = drop_region(tree, LEFT, RIGHT, DropZone::Right);
         assert_eq!(shape(&out), "H[L,C]");
         assert_flex_invariant(&out);
+    }
+
+    // ----- Stage 5 serialization round-trip -----
+
+    #[test]
+    fn serialized_round_trip_preserves_shape_and_flex() {
+        // Build a rearranged tree, then give the root split distinct (valid:
+        // sum == len) flex weights so we can prove they survive the round-trip.
+        let tree = drop_region(contained(), CENTER, RIGHT, DropZone::Right); // H[L,B,R,C]
+        assert_eq!(shape(&tree), "H[L,B,R,C]");
+        if let LayoutNode::Split { flexes, .. } = &tree {
+            *flexes.lock() = vec![1.5, 0.5, 0.7, 1.3];
+        } else {
+            panic!("expected split root");
+        }
+
+        // Through actual JSON text, exactly as it is stored in the DB column.
+        let json = serde_json::to_string(&tree.to_serialized()).unwrap();
+        let restored = LayoutNode::from_serialized(serde_json::from_str(&json).unwrap());
+
+        assert_eq!(shape(&restored), shape(&tree));
+        assert_flex_invariant(&restored);
+        if let LayoutNode::Split { flexes, .. } = &restored {
+            assert_eq!(*flexes.lock(), vec![1.5, 0.5, 0.7, 1.3]);
+        } else {
+            panic!("expected split root");
+        }
+    }
+
+    #[test]
+    fn from_serialized_resets_wrong_length_flex() {
+        // Stored flexes have the wrong length for the child count → reset to equal.
+        let bad = SerializedLayoutNode::Split {
+            axis: SerializedLayoutAxis::Horizontal,
+            flexes: vec![5.0],
+            children: vec![
+                SerializedLayoutNode::Leaf(SerializedLayoutRegion::DockLeft),
+                SerializedLayoutNode::Leaf(SerializedLayoutRegion::Center),
+            ],
+        };
+        let node = LayoutNode::from_serialized(bad);
+        assert_eq!(shape(&node), "H[L,C]");
+        assert_flex_invariant(&node);
+        if let LayoutNode::Split { flexes, .. } = &node {
+            assert_eq!(*flexes.lock(), vec![1.0, 1.0]);
+        } else {
+            panic!("expected split");
+        }
+    }
+
+    #[test]
+    fn from_serialized_resets_bad_sum_flex() {
+        // Right length, but the weights don't satisfy the sum == len invariant.
+        let bad = SerializedLayoutNode::Split {
+            axis: SerializedLayoutAxis::Vertical,
+            flexes: vec![5.0, 5.0],
+            children: vec![
+                SerializedLayoutNode::Leaf(SerializedLayoutRegion::Center),
+                SerializedLayoutNode::Leaf(SerializedLayoutRegion::DockBottom),
+            ],
+        };
+        let node = LayoutNode::from_serialized(bad);
+        if let LayoutNode::Split { flexes, .. } = &node {
+            assert_eq!(*flexes.lock(), vec![1.0, 1.0]);
+        } else {
+            panic!("expected split");
+        }
+    }
+
+    #[test]
+    fn region_enum_round_trips() {
+        for region in [
+            LayoutRegion::Center,
+            LayoutRegion::Dock(DockPosition::Left),
+            LayoutRegion::Dock(DockPosition::Right),
+            LayoutRegion::Dock(DockPosition::Bottom),
+        ] {
+            let back: LayoutRegion = SerializedLayoutRegion::from(region).into();
+            assert_eq!(back, region);
+        }
     }
 }

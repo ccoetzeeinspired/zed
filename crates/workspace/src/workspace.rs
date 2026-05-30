@@ -2310,13 +2310,18 @@ impl Workspace {
             .take()
             .unwrap_or_else(|| crate::layout::default_layout_node(bottom_dock_layout));
         self.custom_layout = Some(crate::layout::move_region(current, region, direction));
+        // FORK Stage 5: persist the new arrangement.
+        self.serialize_workspace(window, cx);
         cx.notify();
     }
 
     /// FORK: dynamic layout (Stage 3). Drop any custom arrangement and return to
     /// the built-in layout.
-    fn reset_workspace_layout(&mut self, cx: &mut Context<Self>) {
+    fn reset_workspace_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.custom_layout.take().is_some() {
+            // FORK Stage 5: persist the return to the built-in layout (clears the
+            // stored custom_layout column).
+            self.serialize_workspace(window, cx);
             cx.notify();
         }
     }
@@ -2375,7 +2380,7 @@ impl Workspace {
             right,
             bottom,
         };
-        crate::layout::assemble_layout(node, &mut regions, interactive)
+        crate::layout::assemble_layout(node, &mut regions, interactive, self.weak_self.clone())
     }
 
     /// FORK: dynamic layout (Stage 3b). Render a dock region for the layout
@@ -2523,7 +2528,7 @@ impl Workspace {
         moved: crate::layout::LayoutRegion,
         target: crate::layout::LayoutRegion,
         zone: crate::layout::DropZone,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.region_drag_active = false;
@@ -2535,6 +2540,8 @@ impl Workspace {
                 .take()
                 .unwrap_or_else(|| crate::layout::default_layout_node(bottom_dock_layout));
             self.custom_layout = Some(crate::layout::drop_region(current, moved, target, zone));
+            // FORK Stage 5: persist the new arrangement.
+            self.serialize_workspace(window, cx);
         }
         cx.notify();
     }
@@ -7207,6 +7214,13 @@ impl Workspace {
                 let docks = build_serialized_docks(self, window, cx);
                 let window_bounds = Some(SerializedWindowBounds(window.window_bounds()));
                 let identity_paths_hint = self.project_group_key(cx).path_list().clone();
+                // FORK Stage 5: snapshot the custom layout tree as JSON (reads the
+                // live flex weights out of the shared Arc<Mutex>). `None` => the
+                // built-in layout, persisted as a NULL column.
+                let custom_layout_json = self
+                    .custom_layout
+                    .as_ref()
+                    .and_then(|node| serde_json::to_string(&node.to_serialized()).log_err());
 
                 let serialized_workspace = SerializedWorkspace {
                     id: database_id,
@@ -7228,6 +7242,10 @@ impl Workspace {
                 let db = WorkspaceDb::global(cx);
                 window.spawn(cx, async move |_| {
                     db.save_workspace(serialized_workspace).await;
+                    // FORK Stage 5: persist the custom layout in its own column.
+                    db.save_custom_layout(database_id, custom_layout_json)
+                        .await
+                        .log_err();
                 })
             }
             WorkspaceLocation::DetachFromSession => {
@@ -7393,6 +7411,24 @@ impl Workspace {
                 })
                 .collect::<Vec<_>>();
 
+            // FORK Stage 5: load the persisted custom layout (its own DB column,
+            // written by `save_custom_layout`). Absent / unparseable => built-in.
+            let custom_layout = {
+                let db = cx.update(|_, cx| WorkspaceDb::global(cx)).ok();
+                let json = match db {
+                    Some(db) => db
+                        .get_custom_layout(serialized_workspace.id)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                };
+                json.and_then(|json| {
+                    serde_json::from_str::<crate::layout::SerializedLayoutNode>(&json).log_err()
+                })
+                .map(crate::layout::LayoutNode::from_serialized)
+            };
+
             // Remove old panes from workspace panes list
             workspace.update_in(cx, |workspace, window, cx| {
                 if let Some((center_group, active_pane)) = center_group {
@@ -7424,6 +7460,12 @@ impl Workspace {
                         dock.serialized_dock = Some(serialized_dock.clone());
                         dock.restore_state(window, cx);
                     });
+                }
+
+                // FORK Stage 5: apply the restored custom layout after the regions
+                // it arranges (center + docks) are in place.
+                if let Some(custom_layout) = custom_layout {
+                    workspace.custom_layout = Some(custom_layout);
                 }
 
                 cx.notify();
@@ -7661,8 +7703,8 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &MoveRegionDown, window, cx| {
                 this.move_focused_region(crate::layout::MoveDirection::Down, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ResetWorkspaceLayout, _window, cx| {
-                this.reset_workspace_layout(cx);
+            .on_action(cx.listener(|this, _: &ResetWorkspaceLayout, window, cx| {
+                this.reset_workspace_layout(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleLeftDock, window, cx| {
                 this.toggle_dock(DockPosition::Left, window, cx);
