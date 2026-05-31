@@ -440,6 +440,58 @@ deterministic, now-implemented fixes. Fallback-selector capture (id/data-testid 
 saucedemo exposes perfect `data-test` attrs) remains a v2 nicety for the rare case
 where even `.nth(i)` is too positional (DOM reorders between record and replay).
 
+#### 4.6.2 Stress campaign — real complex sites (2026-05-31)
+
+Per the user ("stress it, proper workflows, no practice/generic sites"), a second
+campaign ran 3 deep journeys on real heavy sites, driven through the **rebuilt
+binary** (so these double as the real-tool confirmation of `exact:true` + `.nth`),
+then verified by a 3-agent Workflow (each ran its spec 3× under real Playwright +
+adversarially audited it):
+
+| Flow | Site | Journey | Result |
+|---|---|---|---|
+| A | theguardian.com | home → Science section → Environment section → assert heading | 3/3 ✅ |
+| B | github.com | microsoft/playwright → Issues tab → Labels → assert search box | 3/3 ✅ |
+| C | developer.mozilla.org | reveal search → type+Enter → article → sidebar "Array" → assert | 3/3 ✅ |
+
+**All passed now — but the audit surfaced real fragilities the happy-path runs
+hid. These are the substantive findings:**
+
+1. **`exact:true` vs dynamic accessible names — the key tension (GitHub, CRITICAL).**
+   GitHub's Issues tab name is `"Issues 143"` — the live open-issue **count is
+   baked into the accessible name**. Our `exact:true` (which *fixed* the
+   substring-collision class in §4.6.1) makes this *more* brittle: the day the
+   count moves off 143, the locator stops matching. So `exact:true` is
+   double-edged. **v2 fix:** detect volatile name components (trailing/embedded
+   counts, dates) at record time and emit a stable form — strip the count and use
+   a prefix/regex (`{ name: /^Issues/ }`) or anchor links by `href`.
+2. **Cross-origin consent iframes are invisible to the snapshot (all 3, esp.
+   Guardian).** `getFullAXTree` returns only the main frame, so a Sourcepoint/CMP
+   consent dialog (a cross-origin iframe) never appears as refs — the live agent
+   can't click it and codegen can't record a dismissal. The specs passed only
+   because the headless profile/geo didn't raise a *blocking* overlay; on a cold
+   EU profile the consent iframe could intercept the nav clicks. **v2:** (a) walk
+   child frames in the snapshot (CDP per-frame AX), and/or (b) emit
+   `page.addLocatorHandler` for known CMPs, and/or (c) seed `storageState` with
+   prior consent.
+3. **`.nth(i)` is positional, not semantic (Guardian, MDN).** Disambiguation by
+   DOM index reproduces the exact element now, but silently resolves to a
+   *different* element if the site reorders/AB-tests its header/footer or changes
+   search-result ranking. Inherent to index-based selection. **v2:** prefer a
+   captured `href`/`data-testid` fallback over `.nth(i)` when available; keep
+   `.nth(i)` as the last resort.
+4. **Timing residual confirmed.** The trailing post-assertion `waitForLoadState()`
+   is frequently a no-op, and the real waits rely on Playwright auto-waiting
+   rather than the emitted ones. Harmless here; the §4.5 "attach the wait to the
+   navigating click" fix would make the emitted waits meaningful.
+
+**Takeaway:** the engine reproduces real deep-nav/SPA/search journeys verbatim
+(9/9 across both campaigns once `exact`+`.nth` landed). The remaining work is all
+**locator *durability over time*** (dynamic names, consent frames, positional
+indices) — not reproduction *now*. A v2 "smart locator" pass (volatile-name
+normalization + href/test-id fallback + frame-aware snapshot + CMP handling) is
+the clear next investment.
+
 ### 4.7 Effort / risk
 
 - **Recorder:** small (one hook at the dispatch chokepoint + a Mutex buffer).
