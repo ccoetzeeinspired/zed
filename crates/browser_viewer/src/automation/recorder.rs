@@ -23,6 +23,10 @@ use serde_json::{Value, json};
 pub struct Target {
     pub role: String,
     pub name: String,
+    /// `Some(i)` when this `(role, name)` matched >1 element on the page at
+    /// record time — codegen appends `.nth(i)` to pick the exact one the agent
+    /// acted on (DOM/AX order). `None` when the locator is already unambiguous.
+    pub index: Option<usize>,
     /// Optional fallback selector (id / data-testid / css) captured at record
     /// time, emitted as a comment so a human can swap it on a name collision.
     pub fallback: Option<String>,
@@ -33,8 +37,15 @@ impl Target {
         Self {
             role: role.into(),
             name: name.into(),
+            index: None,
             fallback: None,
         }
+    }
+
+    /// Set the disambiguation index (`Some` only when there were duplicates).
+    pub fn with_index(mut self, index: Option<usize>) -> Self {
+        self.index = index;
+        self
     }
 }
 
@@ -485,16 +496,29 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
     }
 }
 
-/// Primary locator: `page.getByRole('role', { name: 'name' })`.
+/// Primary locator: `page.getByRole('role', { name: 'name', exact: true })`.
+///
+/// `exact: true` matters: the recorded `name` is the element's *full* accessible
+/// name, but Playwright's default `getByRole` name match is a case-insensitive
+/// **substring**, which over-matches (e.g. `'Secure Area'` also hits
+/// `'Welcome to the Secure Area…'`). Exact matching is both more faithful to what
+/// we recorded and kills that whole class of strict-mode collisions. (It does NOT
+/// fix genuine multiplicity — N truly identical elements — which still needs
+/// `.nth(i)`/a fallback selector; see the codegen plan §4.4.)
 fn locator(t: &Target) -> String {
-    if t.name.is_empty() {
+    let base = if t.name.is_empty() {
         format!("page.getByRole({})", js_str(&t.role))
     } else {
         format!(
-            "page.getByRole({}, {{ name: {} }})",
+            "page.getByRole({}, {{ name: {}, exact: true }})",
             js_str(&t.role),
             js_str(&t.name)
         )
+    };
+    // Disambiguate when the role+name matched multiple elements at record time.
+    match t.index {
+        Some(i) => format!("{base}.nth({i})"),
+        None => base,
     }
 }
 
@@ -593,7 +617,9 @@ mod tests {
             }],
         );
         let script = render(&r);
-        assert!(script.contains("await page.getByRole('button', { name: 'Sign In' }).click();"));
+        assert!(script.contains(
+            "await page.getByRole('button', { name: 'Sign In', exact: true }).click();"
+        ));
         assert!(script.contains("import { test, expect } from '@playwright/test';"));
     }
 
@@ -675,6 +701,38 @@ mod tests {
         );
         let script = render(&r);
         assert!(script.contains(".dblclick({ button: 'right', modifiers: ['Shift'] });"));
+    }
+
+    #[test]
+    fn ambiguous_target_emits_nth() {
+        let r = rec(
+            "https://shop.example.com",
+            vec![RecordedAction::Click {
+                target: Target::new("button", "Add to cart").with_index(Some(2)),
+                button: "left".into(),
+                double: false,
+                modifiers: vec![],
+            }],
+        );
+        let script = render(&r);
+        assert!(script.contains(
+            "await page.getByRole('button', { name: 'Add to cart', exact: true }).nth(2).click();"
+        ));
+    }
+
+    #[test]
+    fn unambiguous_target_omits_nth() {
+        let r = rec(
+            "https://example.com",
+            vec![RecordedAction::Click {
+                target: Target::new("button", "Sign In").with_index(None),
+                button: "left".into(),
+                double: false,
+                modifiers: vec![],
+            }],
+        );
+        let script = render(&r);
+        assert!(!script.contains(".nth("));
     }
 
     #[test]

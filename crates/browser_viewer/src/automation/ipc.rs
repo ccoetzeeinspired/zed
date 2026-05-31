@@ -663,7 +663,11 @@ fn resolve_target(
             .item()
             .read(app)
             .resolve_automation_ref(ref_id)
-            .map(|e| Target::new(e.role, e.name))
+            .map(|e| {
+                // Only emit .nth(i) when the role+name was actually ambiguous.
+                let index = (e.dup_count > 1).then_some(e.dup_index);
+                Target::new(e.role, e.name).with_index(index)
+            })
     })
 }
 

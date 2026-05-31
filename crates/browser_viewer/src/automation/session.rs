@@ -12,6 +12,13 @@ pub struct ElementRef {
     pub backend_dom_node_id: Option<i32>,
     pub role: String,
     pub name: String,
+    /// 0-based index of this element among all snapshot elements that share the
+    /// same `(role, name)`, in DOM/AX order. With `dup_count`, lets codegen emit
+    /// `.nth(i)` to disambiguate a `getByRole` that would otherwise be ambiguous.
+    pub dup_index: usize,
+    /// Total number of snapshot elements sharing this `(role, name)`. `> 1` means
+    /// the role+name locator is ambiguous and needs `.nth(dup_index)`.
+    pub dup_count: usize,
 }
 
 /// Ref map for the current page generation. Invalidated when navigation bumps

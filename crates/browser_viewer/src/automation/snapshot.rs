@@ -167,6 +167,17 @@ pub fn snapshot_from_ax_tree(
     let mut lines = Vec::new();
     let mut ref_count = 0usize;
 
+    // Collected in DOM/AX pre-order so we can compute per-(role,name) duplicate
+    // indices once the full set is known, then build the registry.
+    struct PendingRef {
+        ref_id: String,
+        ax_node_id: String,
+        backend_dom_node_id: Option<i32>,
+        role: String,
+        name: String,
+    }
+    let mut pending: Vec<PendingRef> = Vec::new();
+
     let mut stack = vec![(root_id, 0usize)];
     while let Some((node_id, depth)) = stack.pop() {
         let Some(node) = by_id.get(&node_id) else {
@@ -183,18 +194,15 @@ pub fn snapshot_from_ax_tree(
         let name = node.name_str();
         let include = should_include_in_snapshot(&role, &name);
 
-        if include && registry.ref_count() < max_refs {
+        if include && pending.len() < max_refs {
             let ref_id = registry.allocate_ref();
-            registry.insert(
-                ref_id.clone(),
-                ElementRef {
-                    ref_id: ref_id.clone(),
-                    ax_node_id: node.node_id.clone(),
-                    backend_dom_node_id: node.backend_dom_node_id(),
-                    role: role.clone(),
-                    name: name.clone(),
-                },
-            );
+            pending.push(PendingRef {
+                ref_id: ref_id.clone(),
+                ax_node_id: node.node_id.clone(),
+                backend_dom_node_id: node.backend_dom_node_id(),
+                role: role.clone(),
+                name: name.clone(),
+            });
             ref_count += 1;
 
             let indent = "  ".repeat(depth);
@@ -213,6 +221,31 @@ pub fn snapshot_from_ax_tree(
         for child in node.child_ids.iter().rev() {
             stack.push((child.clone(), child_depth));
         }
+    }
+
+    // Totals per (role, name) → which locators are ambiguous.
+    let mut totals: HashMap<(String, String), usize> = HashMap::new();
+    for p in &pending {
+        *totals.entry((p.role.clone(), p.name.clone())).or_default() += 1;
+    }
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    for p in pending {
+        let key = (p.role.clone(), p.name.clone());
+        let dup_index = *seen.get(&key).unwrap_or(&0);
+        *seen.entry(key.clone()).or_default() += 1;
+        let dup_count = *totals.get(&key).unwrap_or(&1);
+        registry.insert(
+            p.ref_id.clone(),
+            ElementRef {
+                ref_id: p.ref_id,
+                ax_node_id: p.ax_node_id,
+                backend_dom_node_id: p.backend_dom_node_id,
+                role: p.role,
+                name: p.name,
+                dup_index,
+                dup_count,
+            },
+        );
     }
 
     let yaml = if lines.is_empty() {
@@ -320,6 +353,30 @@ mod tests {
         assert_eq!(link.role, "link");
         assert_eq!(link.backend_dom_node_id, Some(42));
         assert_eq!(snap.registry.page_generation(), 7);
+    }
+
+    #[test]
+    fn duplicate_role_name_gets_indices_and_count() {
+        let tree = serde_json::json!({
+            "nodes": [
+                {
+                    "nodeId": "1",
+                    "role": { "value": "RootWebArea" },
+                    "name": { "value": "Shop" },
+                    "childIds": ["2", "3", "4"]
+                },
+                { "nodeId": "2", "role": { "value": "button" }, "name": { "value": "Add to cart" }, "childIds": [] },
+                { "nodeId": "3", "role": { "value": "button" }, "name": { "value": "Add to cart" }, "childIds": [] },
+                { "nodeId": "4", "role": { "value": "button" }, "name": { "value": "Checkout" }, "childIds": [] }
+            ]
+        });
+        let snap = snapshot_from_ax_tree(tree, 1).unwrap();
+        let first = snap.registry.get("e2").unwrap();
+        let second = snap.registry.get("e3").unwrap();
+        let unique = snap.registry.get("e4").unwrap();
+        assert_eq!((first.dup_index, first.dup_count), (0, 2));
+        assert_eq!((second.dup_index, second.dup_count), (1, 2));
+        assert_eq!((unique.dup_index, unique.dup_count), (0, 1));
     }
 
     #[test]
