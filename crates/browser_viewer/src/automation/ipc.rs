@@ -207,7 +207,7 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
     // CP15: resolve ref→role+name *before* the action runs (refs invalidate on
     // navigation), then commit it to the recording buffer only on success.
     let pending = if recorder::is_recording() {
-        capture_pending_action(request.method.as_str(), &request.params, &browser, cx)
+        capture_pending_action(request.method.as_str(), &request.params, &browser, cx).await
     } else {
         None
     };
@@ -671,16 +671,35 @@ fn resolve_target(
     })
 }
 
+/// Resolve a ref to a full [`Target`]: role+name+dup-index (sync) plus the most
+/// durable unique selector for the element (async CDP read). Best-effort.
+async fn target_for(
+    browser: &Entity<BrowserView>,
+    ref_id: &str,
+    cx: &mut AsyncApp,
+) -> Option<Target> {
+    let base = resolve_target(browser, ref_id, cx)?;
+    let durable = commands::durable_selector(browser.clone(), ref_id, cx)
+        .await
+        .map(|(is_testid, value)| {
+            if is_testid {
+                recorder::DurableLoc::TestId(value)
+            } else {
+                recorder::DurableLoc::Css(value)
+            }
+        });
+    Some(base.with_durable(durable))
+}
+
 /// Build a [`RecordedAction`] for a recordable method, resolving any refs to
-/// role+name *before* the action runs. Returns `None` for non-recordable
-/// methods (snapshot, evaluate, screenshot, storage, tabs, …).
-fn capture_pending_action(
+/// role+name (+ durable selector) *before* the action runs. Returns `None` for
+/// non-recordable methods (snapshot, evaluate, screenshot, storage, tabs, …).
+async fn capture_pending_action(
     method: &str,
     params: &Value,
     browser: &Entity<BrowserView>,
     cx: &mut AsyncApp,
 ) -> Option<RecordedAction> {
-    let target = |ref_id: &str, cx: &mut AsyncApp| resolve_target(browser, ref_id, cx);
     match method {
         "navigate" => {
             let url = params.get("url").and_then(|v| v.as_str())?.to_string();
@@ -689,7 +708,7 @@ fn capture_pending_action(
         "navigate_back" => Some(RecordedAction::NavigateBack),
         "click" => {
             let ref_id = ref_str(params)?;
-            let target = target(&ref_id, cx)?;
+            let target = target_for(browser, &ref_id, cx).await?;
             let button = params
                 .get("button")
                 .and_then(|v| v.as_str())
@@ -710,7 +729,7 @@ fn capture_pending_action(
         }
         "type" => {
             let ref_id = ref_str(params)?;
-            let target = target(&ref_id, cx)?;
+            let target = target_for(browser, &ref_id, cx).await?;
             let text = params.get("text").and_then(|v| v.as_str())?.to_string();
             let submit = params.get("submit").and_then(|v| v.as_bool()) == Some(true);
             let slowly = params.get("slowly").and_then(|v| v.as_bool()) == Some(true);
@@ -734,7 +753,7 @@ fn capture_pending_action(
         "hover" => {
             let ref_id = ref_str(params)?;
             Some(RecordedAction::Hover {
-                target: target(&ref_id, cx)?,
+                target: target_for(browser, &ref_id, cx).await?,
             })
         }
         "scroll" => {
@@ -744,7 +763,7 @@ fn capture_pending_action(
                 .and_then(|v| v.as_str());
             if let Some(ref_id) = ref_id {
                 Some(RecordedAction::ScrollTo {
-                    target: target(ref_id, cx)?,
+                    target: target_for(browser, ref_id, cx).await?,
                 })
             } else {
                 let dx = params.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -756,7 +775,7 @@ fn capture_pending_action(
             let ref_id = ref_str(params)?;
             let values = parse_string_list(params.get("values"))?;
             Some(RecordedAction::SelectOption {
-                target: target(&ref_id, cx)?,
+                target: target_for(browser, &ref_id, cx).await?,
                 values,
             })
         }
@@ -765,7 +784,7 @@ fn capture_pending_action(
             let paths =
                 parse_string_list(params.get("paths").or_else(|| params.get("files")))?;
             Some(RecordedAction::FileUpload {
-                target: target(&ref_id, cx)?,
+                target: target_for(browser, &ref_id, cx).await?,
                 paths,
             })
         }
@@ -781,8 +800,8 @@ fn capture_pending_action(
                 .or_else(|| params.get("to"))
                 .and_then(|v| v.as_str())?;
             Some(RecordedAction::Drag {
-                from: target(start, cx)?,
-                to: target(end, cx)?,
+                from: target_for(browser, start, cx).await?,
+                to: target_for(browser, end, cx).await?,
             })
         }
         "fill_form" => {
@@ -801,7 +820,7 @@ fn capture_pending_action(
                 };
                 let kind = item.get("type").and_then(|v| v.as_str()).map(str::to_string);
                 fields.push(FormFieldRec {
-                    target: target(ref_id, cx)?,
+                    target: target_for(browser, ref_id, cx).await?,
                     value,
                     kind,
                 });
@@ -869,10 +888,10 @@ fn capture_pending_action(
             }
         }
         "verify_element_visible" => Some(RecordedAction::VerifyElementVisible {
-            target: target(&ref_str(params)?, cx)?,
+            target: target_for(browser, &ref_str(params)?, cx).await?,
         }),
         "verify_list_visible" => Some(RecordedAction::VerifyListVisible {
-            target: target(&ref_str(params)?, cx)?,
+            target: target_for(browser, &ref_str(params)?, cx).await?,
         }),
         "verify_text_visible" => {
             let text = params.get("text").and_then(|v| v.as_str())?.to_string();
@@ -882,7 +901,7 @@ fn capture_pending_action(
             let ref_id = ref_str(params)?;
             let value = params.get("value").and_then(|v| v.as_str())?.to_string();
             Some(RecordedAction::VerifyValue {
-                target: target(&ref_id, cx)?,
+                target: target_for(browser, &ref_id, cx).await?,
                 value,
             })
         }

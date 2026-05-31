@@ -18,18 +18,30 @@ use std::sync::Mutex;
 
 use serde_json::{Value, json};
 
-/// A resolved element target → Playwright `getByRole(role, { name })`.
+/// A durable, *unique* structural locator captured for an element at record
+/// time (verified `querySelectorAll().length === 1` in the page). More stable
+/// than an accessible name (which can carry counts/dates/localization).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DurableLoc {
+    /// A `data-testid` value → `page.getByTestId(v)` (Playwright's most durable).
+    TestId(String),
+    /// A unique CSS selector (id / other test-id attr / link href / name attr).
+    Css(String),
+}
+
+/// A resolved element target → a Playwright locator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Target {
     pub role: String,
     pub name: String,
     /// `Some(i)` when this `(role, name)` matched >1 element on the page at
-    /// record time — codegen appends `.nth(i)` to pick the exact one the agent
-    /// acted on (DOM/AX order). `None` when the locator is already unambiguous.
+    /// record time — codegen uses it (via `.nth(i)`) only as a last-resort
+    /// disambiguator when no `durable` locator is available.
     pub index: Option<usize>,
-    /// Optional fallback selector (id / data-testid / css) captured at record
-    /// time, emitted as a comment so a human can swap it on a name collision.
-    pub fallback: Option<String>,
+    /// The most durable *unique* locator for this element, if one was found.
+    /// Preferred over a positional `.nth(i)`, and (for a `data-testid`) over the
+    /// accessible name too.
+    pub durable: Option<DurableLoc>,
 }
 
 impl Target {
@@ -38,13 +50,19 @@ impl Target {
             role: role.into(),
             name: name.into(),
             index: None,
-            fallback: None,
+            durable: None,
         }
     }
 
     /// Set the disambiguation index (`Some` only when there were duplicates).
     pub fn with_index(mut self, index: Option<usize>) -> Self {
         self.index = index;
+        self
+    }
+
+    /// Attach the durable unique locator (if one was resolved at record time).
+    pub fn with_durable(mut self, durable: Option<DurableLoc>) -> Self {
+        self.durable = durable;
         self
     }
 }
@@ -342,11 +360,9 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
             double,
             modifiers,
         } => {
-            let mut comment = fallback_comment(target);
             let opts = click_options(button, modifiers);
             let method = if *double { "dblclick" } else { "click" };
-            comment.push(format!("await {}.{method}({opts});", locator(target)));
-            comment
+            vec![format!("await {}.{method}({opts});", locator(target))]
         }
         RecordedAction::Type {
             target,
@@ -355,7 +371,7 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
             slowly,
             delay_ms,
         } => {
-            let mut lines = fallback_comment(target);
+            let mut lines: Vec<String> = Vec::new();
             if *slowly {
                 let opts = if *delay_ms > 0 {
                     format!("{}, {{ delay: {delay_ms} }}", js_str(text))
@@ -506,6 +522,11 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
 /// fix genuine multiplicity — N truly identical elements — which still needs
 /// `.nth(i)`/a fallback selector; see the codegen plan §4.4.)
 fn locator(t: &Target) -> String {
+    // 1. data-testid → Playwright's most durable locator. Test ids are an
+    //    intentional, stable contract, so prefer one even over a unique name.
+    if let Some(DurableLoc::TestId(v)) = &t.durable {
+        return format!("page.getByTestId({})", js_str(v));
+    }
     let base = if t.name.is_empty() {
         format!("page.getByRole({})", js_str(&t.role))
     } else {
@@ -515,19 +536,21 @@ fn locator(t: &Target) -> String {
             js_str(&t.name)
         )
     };
-    // Disambiguate when the role+name matched multiple elements at record time.
-    match t.index {
-        Some(i) => format!("{base}.nth({i})"),
-        None => base,
+    // 2. Unambiguous role+name → accessible-first. NOTE: we deliberately do NOT
+    //    override a unique accessible name with an id/href selector — ids and
+    //    hrefs can be framework-generated/volatile (e.g. React `:r1:`, session
+    //    params), so an accessible name is the safer default here.
+    if t.index.is_none() {
+        return base;
     }
-}
-
-/// A `// fallback: ...` comment line when a fallback selector was captured.
-fn fallback_comment(t: &Target) -> Vec<String> {
-    match &t.fallback {
-        Some(sel) if !sel.is_empty() => vec![format!("// fallback locator: page.locator({})", js_str(sel))],
-        _ => Vec::new(),
+    // 3. Ambiguous (role+name matched >1): a *verified-unique* structural
+    //    selector is a semantic disambiguator — strictly better than guessing by
+    //    DOM position.
+    if let Some(DurableLoc::Css(sel)) = &t.durable {
+        return format!("page.locator({})", js_str(sel));
     }
+    // 4. Last resort: positional index.
+    format!("{base}.nth({})", t.index.unwrap_or(0))
 }
 
 fn click_options(button: &str, modifiers: &[String]) -> String {
@@ -718,6 +741,41 @@ mod tests {
         assert!(script.contains(
             "await page.getByRole('button', { name: 'Add to cart', exact: true }).nth(2).click();"
         ));
+    }
+
+    #[test]
+    fn testid_preferred_over_role_name() {
+        let r = rec(
+            "https://x.com",
+            vec![RecordedAction::Click {
+                target: Target::new("button", "Submit")
+                    .with_durable(Some(DurableLoc::TestId("submit-btn".into()))),
+                button: "left".into(),
+                double: false,
+                modifiers: vec![],
+            }],
+        );
+        let s = render(&r);
+        assert!(s.contains("await page.getByTestId('submit-btn').click();"));
+        assert!(!s.contains("getByRole"));
+    }
+
+    #[test]
+    fn ambiguous_uses_css_durable_not_nth() {
+        let r = rec(
+            "https://x.com",
+            vec![RecordedAction::Click {
+                target: Target::new("link", "World")
+                    .with_index(Some(3))
+                    .with_durable(Some(DurableLoc::Css("a[href=\"/world\"]".into()))),
+                button: "left".into(),
+                double: false,
+                modifiers: vec![],
+            }],
+        );
+        let s = render(&r);
+        assert!(s.contains("await page.locator('a[href=\"/world\"]').click();"));
+        assert!(!s.contains(".nth("));
     }
 
     #[test]

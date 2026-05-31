@@ -38,6 +38,57 @@ fn resolve_ref_on_browser(
     element_for_action(element)
 }
 
+/// CP15 codegen: compute the most durable *unique* selector for the element a
+/// snapshot ref points at, in the page itself. Returns `(is_testid, value)` —
+/// `is_testid` ⇒ a `data-testid` value (use `getByTestId`); else `value` is a
+/// unique CSS selector. `None` if nothing stable+unique exists. Best-effort:
+/// never errors, so recording can't break a tool call.
+pub async fn durable_selector(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    cx: &mut AsyncApp,
+) -> Option<(bool, String)> {
+    let backend = cx.update(|app| {
+        browser
+            .read(app)
+            .item()
+            .read(app)
+            .resolve_automation_ref(ref_id)
+            .and_then(|e| e.backend_dom_node_id)
+    })?;
+    let (tx, rx) = oneshot::channel::<Result<Value>>();
+    let mut tx_slot = Some(tx);
+    let kicked = browser.update(cx, |view, cx| {
+        view.with_webview_session(cx, |session| {
+            crate::automation::action::try_durable_selector_backend_node(
+                session,
+                backend,
+                Box::new(move |r| {
+                    if let Some(tx) = tx_slot.take() {
+                        let _ = tx.send(r);
+                    }
+                }),
+            )
+            .is_ok()
+        })
+        .unwrap_or(false)
+    });
+    if !kicked {
+        return None;
+    }
+    let value = rx.await.ok()?.ok()?;
+    let kind = value.get("k").and_then(|v| v.as_str()).unwrap_or("");
+    let sel = value.get("v").and_then(|v| v.as_str()).unwrap_or("");
+    if sel.is_empty() {
+        return None;
+    }
+    match kind {
+        "testid" => Some((true, sel.to_string())),
+        "css" => Some((false, sel.to_string())),
+        _ => None,
+    }
+}
+
 async fn run_with_actionability_wait_result(
     cx: &mut AsyncApp,
     browser: Entity<BrowserView>,

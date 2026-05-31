@@ -304,6 +304,47 @@ pub fn try_hover_point_backend_node(
     invoke_on_backend_node(session, backend_node_id, HOVER_POINT_SCRIPT, None, on_done)
 }
 
+// Compute the most stable selector that *uniquely* identifies this element on
+// the page, checked against `querySelectorAll().length === 1` in the page
+// itself. Priority (most→least durable, all generic — no site assumptions):
+// data-testid → other test-id attrs → id → link href (route identity) → name
+// attr. Returns `{ k, v }`: k="testid" (data-testid value, for getByTestId),
+// k="css" (a unique CSS selector), or k="" (nothing stable+unique found).
+const DURABLE_SELECTOR_SCRIPT: &str = r#"function() {
+  var uniq = function(sel){ try { return document.querySelectorAll(sel).length === 1; } catch(e){ return false; } };
+  var cssEsc = function(s){ return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/["\\]/g, '\\$&'); };
+  var attrSel = function(name, val){ return '[' + name + '="' + String(val).replace(/["\\]/g, '\\$&') + '"]'; };
+  if (!this || !this.getAttribute) { return { k: '', v: '' }; }
+  var tid = this.getAttribute('data-testid');
+  if (tid && uniq(attrSel('data-testid', tid))) { return { k: 'testid', v: tid }; }
+  var attrs = ['data-test', 'data-test-id', 'data-cy', 'data-qa'];
+  for (var i = 0; i < attrs.length; i++) {
+    var av = this.getAttribute(attrs[i]);
+    if (av) { var s = attrSel(attrs[i], av); if (uniq(s)) { return { k: 'css', v: s }; } }
+  }
+  if (this.id) { var sid = '#' + cssEsc(this.id); if (uniq(sid)) { return { k: 'css', v: sid }; } }
+  if (this.tagName === 'A') {
+    var h = this.getAttribute('href');
+    if (h && h.charAt(0) !== '#' && h.indexOf('javascript:') !== 0) {
+      var sh = 'a' + attrSel('href', h);
+      if (uniq(sh)) { return { k: 'css', v: sh }; }
+    }
+  }
+  var nm = this.getAttribute('name');
+  if (nm) { var tag = (this.tagName || '').toLowerCase(); var sn = tag + attrSel('name', nm); if (uniq(sn)) { return { k: 'css', v: sn }; } }
+  return { k: '', v: '' };
+}"#;
+
+/// One-shot "compute a durable unique selector" for a backend node. The result
+/// is `{ k, v }` (see `DURABLE_SELECTOR_SCRIPT`).
+pub fn try_durable_selector_backend_node(
+    session: &WebView2Session,
+    backend_node_id: i32,
+    on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+) -> Result<()> {
+    invoke_on_backend_node(session, backend_node_id, DURABLE_SELECTOR_SCRIPT, None, on_done)
+}
+
 /// Run `functionDeclaration` on the node identified by `backend_node_id`.
 pub fn invoke_on_backend_node(
     session: &WebView2Session,
