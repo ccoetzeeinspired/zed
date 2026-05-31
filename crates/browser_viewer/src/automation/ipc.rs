@@ -425,6 +425,65 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .unwrap_or(true);
             commands::pdf_save(browser, landscape, print_background, cx).await
         }
+        "cookie_list" => commands::cookie_list(browser, cx).await,
+        "cookie_get" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("cookie_get requires params.name"))?;
+            commands::cookie_get(browser, name, cx).await
+        }
+        "cookie_set" => {
+            let cookie = request
+                .params
+                .get("cookie")
+                .cloned()
+                .ok_or_else(|| anyhow!("cookie_set requires params.cookie (object with name+value)"))?;
+            commands::cookie_set(browser, cookie, cx).await
+        }
+        "cookie_delete" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("cookie_delete requires params.name"))?;
+            commands::cookie_delete(browser, name, cx).await
+        }
+        "cookie_clear" => commands::cookie_clear(browser, cx).await,
+        "storage_list" => {
+            let store = store_from_params(&request.params);
+            commands::storage_list(browser, &store, cx).await
+        }
+        "storage_get" => {
+            let store = store_from_params(&request.params);
+            let key = key_from_params(&request.params)?;
+            commands::storage_get(browser, &store, &key, cx).await
+        }
+        "storage_set" => {
+            let store = store_from_params(&request.params);
+            let key = key_from_params(&request.params)?;
+            let value = request.params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            commands::storage_set(browser, &store, &key, &value, cx).await
+        }
+        "storage_delete" => {
+            let store = store_from_params(&request.params);
+            let key = key_from_params(&request.params)?;
+            commands::storage_delete(browser, &store, &key, cx).await
+        }
+        "storage_clear" => {
+            let store = store_from_params(&request.params);
+            commands::storage_clear(browser, &store, cx).await
+        }
+        "storage_state" => commands::storage_state(browser, cx).await,
+        "set_storage_state" => {
+            let state = request
+                .params
+                .get("state")
+                .cloned()
+                .ok_or_else(|| anyhow!("set_storage_state requires params.state"))?;
+            commands::set_storage_state(browser, state, cx).await
+        }
         "navigate" => {
             let url = request
                 .params
@@ -537,6 +596,24 @@ fn ref_from_params(params: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow!("missing ref/target — run browser_snapshot first"))
+}
+
+/// Web-storage kind from params (`store` = "local"/"session"; default local).
+fn store_from_params(params: &Value) -> String {
+    params
+        .get("store")
+        .and_then(|v| v.as_str())
+        .unwrap_or("local")
+        .to_string()
+}
+
+/// Required `key` param (web storage).
+fn key_from_params(params: &Value) -> Result<String> {
+    params
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("missing params.key"))
 }
 
 /// Required numeric param under any of `keys`.

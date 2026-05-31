@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -474,6 +474,164 @@ server.tool(
     const buf = Buffer.from(result.data, "base64");
     writeFileSync(out, buf);
     return textContent(`Saved PDF (${buf.length} bytes) to ${out}`);
+  },
+);
+
+// ---- CP12: storage — cookies, local/session storage, storage_state ----
+
+server.tool(
+  "browser_cookie_list",
+  "List cookies for the current page in the embedded Zed browser tab",
+  {},
+  async () => {
+    const r = (await requireZedOk(await callZedAutomation("cookie_list"))) as {
+      cookies?: Array<{ name: string; value: string; domain?: string }>;
+      count?: number;
+    };
+    const cs = r.cookies ?? [];
+    const body = cs.length ? cs.map((c) => `${c.name}=${c.value}${c.domain ? ` (${c.domain})` : ""}`).join("\n") : "(no cookies)";
+    return textContent(`### Cookies (${r.count ?? cs.length})\n${body}`);
+  },
+);
+
+server.tool(
+  "browser_cookie_get",
+  "Get a cookie by name from the embedded Zed browser tab",
+  { name: z.string().describe("Cookie name") },
+  async ({ name }) => {
+    const r = (await requireZedOk(await callZedAutomation("cookie_get", { name }))) as { cookie?: unknown };
+    return textContent(JSON.stringify(r.cookie ?? null, null, 2));
+  },
+);
+
+server.tool(
+  "browser_cookie_set",
+  "Set a cookie in the embedded Zed browser tab (defaults to the current page's URL)",
+  {
+    name: z.string(),
+    value: z.string(),
+    url: z.string().optional(),
+    domain: z.string().optional(),
+    path: z.string().optional(),
+    secure: z.boolean().optional(),
+    httpOnly: z.boolean().optional(),
+    sameSite: z.enum(["Strict", "Lax", "None"]).optional(),
+    expires: z.number().optional().describe("Unix epoch seconds"),
+  },
+  async (cookie) => {
+    await requireZedOk(await callZedAutomation("cookie_set", { cookie }));
+    return textContent(`Set cookie ${cookie.name}`);
+  },
+);
+
+server.tool(
+  "browser_cookie_delete",
+  "Delete a cookie by name from the embedded Zed browser tab",
+  { name: z.string() },
+  async ({ name }) => {
+    await requireZedOk(await callZedAutomation("cookie_delete", { name }));
+    return textContent(`Deleted cookie ${name}`);
+  },
+);
+
+server.tool(
+  "browser_cookie_clear",
+  "Clear all cookies in the embedded Zed browser",
+  {},
+  async () => {
+    await requireZedOk(await callZedAutomation("cookie_clear"));
+    return textContent("Cleared all cookies");
+  },
+);
+
+function registerWebStorage(kind: "local" | "session") {
+  const store = kind;
+  const pfx = kind === "local" ? "localstorage" : "sessionstorage";
+  const label = kind === "local" ? "localStorage" : "sessionStorage";
+  server.tool(
+    `browser_${pfx}_get`,
+    `Get a ${label} value by key in the embedded Zed browser tab`,
+    { key: z.string() },
+    async ({ key }) => {
+      const r = (await requireZedOk(await callZedAutomation("storage_get", { store, key }))) as { value?: unknown };
+      return textContent(JSON.stringify(r.value ?? null));
+    },
+  );
+  server.tool(
+    `browser_${pfx}_set`,
+    `Set a ${label} key/value in the embedded Zed browser tab`,
+    { key: z.string(), value: z.string() },
+    async ({ key, value }) => {
+      await requireZedOk(await callZedAutomation("storage_set", { store, key, value }));
+      return textContent(`Set ${label}[${key}]`);
+    },
+  );
+  server.tool(
+    `browser_${pfx}_list`,
+    `List all ${label} entries in the embedded Zed browser tab`,
+    {},
+    async () => {
+      const r = (await requireZedOk(await callZedAutomation("storage_list", { store }))) as { items?: Record<string, string> };
+      const items = r.items ?? {};
+      const keys = Object.keys(items);
+      const body = keys.length ? keys.map((k) => `${k} = ${items[k]}`).join("\n") : `(${label} empty)`;
+      return textContent(`### ${label} (${keys.length})\n${body}`);
+    },
+  );
+  server.tool(
+    `browser_${pfx}_delete`,
+    `Remove a ${label} key in the embedded Zed browser tab`,
+    { key: z.string() },
+    async ({ key }) => {
+      await requireZedOk(await callZedAutomation("storage_delete", { store, key }));
+      return textContent(`Deleted ${label}[${key}]`);
+    },
+  );
+  server.tool(
+    `browser_${pfx}_clear`,
+    `Clear all ${label} in the embedded Zed browser tab`,
+    {},
+    async () => {
+      await requireZedOk(await callZedAutomation("storage_clear", { store }));
+      return textContent(`Cleared ${label}`);
+    },
+  );
+}
+registerWebStorage("local");
+registerWebStorage("session");
+
+server.tool(
+  "browser_storage_state",
+  "Capture the current page's cookies + local/session storage to a JSON file (for auth/session reuse)",
+  { filename: z.string().optional().describe("Output path; defaults to a temp file") },
+  async ({ filename }) => {
+    const state = await requireZedOk(await callZedAutomation("storage_state"));
+    const out = filename ?? join(tmpdir(), `zed-storage-${Date.now()}.json`);
+    writeFileSync(out, JSON.stringify(state, null, 2));
+    return textContent(`Saved storage state to ${out}`);
+  },
+);
+
+server.tool(
+  "browser_set_storage_state",
+  "Restore cookies + storage into the current page from a saved storage-state file (or inline state)",
+  {
+    filename: z.string().optional().describe("Path to a storage-state JSON file"),
+    state: z.record(z.unknown()).optional().describe("Inline storage-state object (instead of filename)"),
+  },
+  async ({ filename, state }) => {
+    let payload = state;
+    if (!payload && filename) {
+      payload = JSON.parse(readFileSync(filename, "utf8"));
+    }
+    if (!payload) {
+      throw new Error("browser_set_storage_state requires filename or state");
+    }
+    const r = (await requireZedOk(await callZedAutomation("set_storage_state", { state: payload }))) as {
+      cookies?: number;
+      items?: number;
+    };
+    return textContent(`Restored ${r.cookies ?? 0} cookie(s) + ${r.items ?? 0} storage item(s)`);
   },
 );
 

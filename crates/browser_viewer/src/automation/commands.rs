@@ -917,6 +917,215 @@ pub async fn pdf_save(
     Ok(serde_json::json!({ "data": data, "bytes": data.len() }))
 }
 
+// ---- CP12: storage — cookies (CDP Network) + web storage (evaluate) ----
+
+/// List cookies visible to the current page (CDP `Network.getCookies`).
+pub async fn cookie_list(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result<Value> {
+    let raw = run_one_shot(&browser, cx, "cookie_list", move |session, done| {
+        CdpSession::new(session).call_with_domain_enabled(
+            "Network.enable",
+            "Network.getCookies",
+            "{}",
+            done,
+        )
+    })
+    .await?;
+    let cookies = raw.get("cookies").cloned().unwrap_or_else(|| serde_json::json!([]));
+    let count = cookies.as_array().map(|a| a.len()).unwrap_or(0);
+    Ok(serde_json::json!({ "cookies": cookies, "count": count }))
+}
+
+/// Get one cookie by name.
+pub async fn cookie_get(browser: Entity<BrowserView>, name: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let list = cookie_list(browser, cx).await?;
+    let found = list
+        .get("cookies")
+        .and_then(|c| c.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|c| c.get("name").and_then(|n| n.as_str()) == Some(name))
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+    Ok(serde_json::json!({ "cookie": found }))
+}
+
+/// Set a cookie (CDP `Network.setCookie`). If neither `url` nor `domain` is in
+/// `params`, defaults `url` to the current page.
+pub async fn cookie_set(
+    browser: Entity<BrowserView>,
+    mut params: Value,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    if params.get("url").is_none() && params.get("domain").is_none() {
+        let url = cx.update(|app| browser.read(app).item().read(app).url().to_string());
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("url".into(), Value::from(url));
+        }
+    }
+    let p = params.to_string();
+    let raw = run_one_shot(&browser, cx, "cookie_set", move |session, done| {
+        CdpSession::new(session).call_with_domain_enabled("Network.enable", "Network.setCookie", &p, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "success": raw.get("success").cloned().unwrap_or(Value::Bool(true)) }))
+}
+
+/// Delete cookie(s) by name (CDP `Network.deleteCookies`). Defaults `url` to the
+/// current page when no url/domain given.
+pub async fn cookie_delete(
+    browser: Entity<BrowserView>,
+    name: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let url = cx.update(|app| browser.read(app).item().read(app).url().to_string());
+    let p = serde_json::json!({ "name": name, "url": url }).to_string();
+    run_one_shot(&browser, cx, "cookie_delete", move |session, done| {
+        CdpSession::new(session).call_with_domain_enabled("Network.enable", "Network.deleteCookies", &p, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "deleted": name }))
+}
+
+/// Clear all browser cookies (CDP `Network.clearBrowserCookies`).
+pub async fn cookie_clear(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result<Value> {
+    run_one_shot(&browser, cx, "cookie_clear", move |session, done| {
+        CdpSession::new(session).call_with_domain_enabled(
+            "Network.enable",
+            "Network.clearBrowserCookies",
+            "{}",
+            done,
+        )
+    })
+    .await?;
+    Ok(serde_json::json!({ "cleared": true }))
+}
+
+/// `store` → the JS storage object expression.
+fn store_expr(store: &str) -> &'static str {
+    if store == "session" || store == "sessionStorage" {
+        "window.sessionStorage"
+    } else {
+        "window.localStorage"
+    }
+}
+
+/// List all entries in `store` (local/session) as `{ key: value }`.
+pub async fn storage_list(browser: Entity<BrowserView>, store: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let s = store_expr(store);
+    let expr = format!(
+        "(()=>{{ const o={s}; const r={{}}; for(let i=0;i<o.length;i++){{ const k=o.key(i); r[k]=o.getItem(k); }} return r; }})()"
+    );
+    let raw = run_one_shot(&browser, cx, "storage_list", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "store": store, "items": unwrap_cdp_value(raw) }))
+}
+
+/// Get one `store` value by key.
+pub async fn storage_get(browser: Entity<BrowserView>, store: &str, key: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let s = store_expr(store);
+    let k = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into());
+    let expr = format!("(()=>{s}.getItem({k}))()");
+    let raw = run_one_shot(&browser, cx, "storage_get", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "store": store, "key": key, "value": unwrap_cdp_value(raw) }))
+}
+
+/// Set a `store` key/value.
+pub async fn storage_set(browser: Entity<BrowserView>, store: &str, key: &str, value: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let s = store_expr(store);
+    let k = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into());
+    let v = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
+    let expr = format!("(()=>{{ {s}.setItem({k},{v}); return true; }})()");
+    run_one_shot(&browser, cx, "storage_set", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "store": store, "key": key }))
+}
+
+/// Remove a `store` key.
+pub async fn storage_delete(browser: Entity<BrowserView>, store: &str, key: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let s = store_expr(store);
+    let k = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into());
+    let expr = format!("(()=>{{ {s}.removeItem({k}); return true; }})()");
+    run_one_shot(&browser, cx, "storage_delete", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "store": store, "key": key, "deleted": true }))
+}
+
+/// Clear a whole `store`.
+pub async fn storage_clear(browser: Entity<BrowserView>, store: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let s = store_expr(store);
+    let expr = format!("(()=>{{ {s}.clear(); return true; }})()");
+    run_one_shot(&browser, cx, "storage_clear", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "store": store, "cleared": true }))
+}
+
+/// Capture the current page's cookies + local/session storage as one JSON blob.
+/// (Current page/origin only — not Playwright's full multi-origin storageState.)
+pub async fn storage_state(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result<Value> {
+    let cookies = cookie_list(browser.clone(), cx)
+        .await?
+        .get("cookies")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let local = storage_list(browser.clone(), "local", cx)
+        .await?
+        .get("items")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let session = storage_list(browser.clone(), "session", cx)
+        .await?
+        .get("items")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let url = cx.update(|app| browser.read(app).item().read(app).url().to_string());
+    Ok(serde_json::json!({
+        "url": url,
+        "cookies": cookies,
+        "localStorage": local,
+        "sessionStorage": session,
+    }))
+}
+
+/// Apply a previously-captured `state` to the current page (cookies + storage).
+pub async fn set_storage_state(
+    browser: Entity<BrowserView>,
+    state: Value,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let mut cookies = 0u64;
+    if let Some(cs) = state.get("cookies").and_then(|c| c.as_array()) {
+        for c in cs {
+            if cookie_set(browser.clone(), c.clone(), cx).await.is_ok() {
+                cookies += 1;
+            }
+        }
+    }
+    let mut items = 0u64;
+    for (field, store) in [("localStorage", "local"), ("sessionStorage", "session")] {
+        if let Some(obj) = state.get(field).and_then(|o| o.as_object()) {
+            for (k, v) in obj {
+                let vs = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
+                if storage_set(browser.clone(), store, k, &vs, cx).await.is_ok() {
+                    items += 1;
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({ "cookies": cookies, "items": items }))
+}
+
 pub async fn navigate(
     browser: Entity<BrowserView>,
     url: &str,

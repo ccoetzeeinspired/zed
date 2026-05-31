@@ -446,20 +446,30 @@ console.* + uncaught errors (not browser-internal); fetch/XHR with status+timing
 file). PDF uses paper (≈A4) layout, not the viewport. Verified: resize→600×400
 (innerWidth/Height confirmed + visible), pdf→valid %PDF of the page.
 
-**Next: full Playwright MCP parity (CP12+).** The plan's §9 has a full parity
-matrix + checkpoint breakdown: storage (CP12); verify_* assertions (CP13);
-network mocking deferred (CP14). Documented divergences (won't replicate):
-`run_code_unsafe`, `generate_locator`, tracing/video/annotate, `get_config`.
+**CP12 done + user-verified (2026-05-31):** storage — cookies
+(`browser_cookie_get/set/list/delete/clear`, CDP `Network` cookies, httpOnly-aware),
+localStorage + sessionStorage (`browser_localstorage_*` / `browser_sessionstorage_*`,
+shared `storage_*` backend over `evaluate`), and `browser_storage_state` /
+`browser_set_storage_state` (capture/restore cookies+storage to/from a JSON
+file; MCP server does file I/O; current-origin, not Playwright's multi-origin).
+**Verified on a real TrueLens auth session:** captured → cleared (→ /dashboard
+kicked to login) → restored (→ /dashboard authenticated, no re-login).
+
+**Next: full Playwright MCP parity (CP13 — last one).** §9 has the matrix +
+breakdown: verify_* assertions (CP13); network mocking deferred (CP14).
+Documented divergences (won't replicate): `run_code_unsafe`, `generate_locator`,
+tracing/video/annotate, `get_config`.
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through 30 MCP tools registered as the `zed-browser` context server: navigation
+through 47 MCP tools registered as the `zed-browser` context server: navigation
 (`navigate`, `navigate_back`), inspection (`snapshot`, `evaluate`,
 `take_screenshot`), element interaction (`click`, `type`, `fill_form`,
 `select_option`, `hover`, `press_key`, `scroll`, `file_upload`, `drag`, `drop`),
 coordinate "vision" mouse (`mouse_move_xy`/`_click_xy`/`_down`/`_up`/`_drag_xy`/
 `_wheel`), dialogs (`handle_dialog`), tab management (`tabs`, `close`),
 observation (`console_messages`, `network_requests`, `network_request`),
-emulation/output (`resize`, `pdf_save`), and sync (`wait_for`). Tools hit the page via CDP (accessibility
+emulation/output (`resize`, `pdf_save`), storage (`cookie_*`, `localstorage_*`,
+`sessionstorage_*`, `storage_state`, `set_storage_state`), and sync (`wait_for`). Tools hit the page via CDP (accessibility
 snapshot + DOM scripts), with coordinate-based control as a fallback.
 
 **Stack:**

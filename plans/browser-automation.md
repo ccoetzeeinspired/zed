@@ -1,7 +1,8 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP11 shipped and verified (30-tool surface; CP11 = resize +
-pdf_save); CP12–CP13 left to **full** Playwright MCP parity (see §9)  
+**Status:** CP0–CP12 shipped and verified (47-tool surface; CP12 = storage —
+cookies / local / session / storage_state, incl. real auth capture+restore);
+CP13 (verify_*) left to **full** Playwright MCP parity (see §9)  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
 **Last updated:** 2026-05-31
@@ -112,8 +113,11 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_network_requests` / `browser_network_request` | `network_requests` / `network_request` | Read buffered fetch/XHR (method/status/timing) from JS instrumentation; list or by id (CP10). |
 | `browser_resize` | `resize` | CDP `Emulation.setDeviceMetricsOverride` viewport override (CP11). |
 | `browser_pdf_save` | `pdf_save` | CDP `Page.printToPDF` → base64; MCP server writes the file (CP11). |
+| `browser_cookie_get`/`_set`/`_list`/`_delete`/`_clear` | `cookie_*` | CDP `Network` cookies (httpOnly-aware) (CP12). |
+| `browser_localstorage_*` / `browser_sessionstorage_*` (get/set/list/delete/clear) | `storage_*` (+`store`) | `evaluate` over the storage APIs (CP12). |
+| `browser_storage_state` / `browser_set_storage_state` | `storage_state` / `set_storage_state` | Capture/restore cookies + storage (auth reuse); MCP server does file I/O (CP12). |
 
-**CP6–CP11 complete** — 30 tools shipped.
+**CP6–CP12 complete** — 47 tools shipped.
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -142,6 +146,7 @@ there.
 | **CP9** | Coordinate "vision" mouse tools (move/click/down/up/drag/wheel xy) | Done |
 | **CP10** | Observation: console + network (read-only, doc-start JS instrumentation) | Done |
 | **CP11** | Emulation + PDF (resize, pdf_save) | Done |
+| **CP12** | Storage (cookies, local/session storage, storage_state) | Done |
 
 ### Verification log (2026-05-30)
 
@@ -274,6 +279,21 @@ Driven through the MCP server against a full-viewport overlay that shows a live
   `innerWidth=600, innerHeight=400`.
 - `pdf_save` → 22 KB `%PDF` written to disk; rendering inspected (the example.com
   page incl. background). Uses paper (≈A4) layout, not the viewport.
+
+### Verification log (CP12 — user-confirmed on a real TrueLens auth session)
+
+- Logged in (c@admin.com) → `cookie_list` showed the `tl_session` JWT;
+  `localstorage_list` showed `userId`/`userType`; user confirmed both in
+  DevTools → Application.
+- `storage_state` → wrote cookies + storage to a JSON file.
+- `cookie_clear` + `localstorage_clear` → `/dashboard` redirected to login
+  (`hasSignIn:true`).
+- `set_storage_state` (from the file) → `/dashboard` loaded the authenticated
+  Dashboard (`hasDashboard:true`), no re-login. User confirmed on screen.
+- The A/B (`/dashboard` without vs with restored state) cleanly isolated it —
+  the SPA renders `/` as login regardless of auth, so `/dashboard` is the true
+  test. (cookie_get/delete, *storage_get/delete, sessionstorage_* share the
+  verified backends.)
 
 ### Follow-ups discovered during CP7 verification — ALL FIXED + user-verified
 
@@ -475,9 +495,9 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 | `browser_network_requests` / `browser_network_request` | ✅ doc-start JS instrumentation (fetch/XHR) read via `evaluate` | CP10 |
 | `browser_resize` | ✅ CDP `Emulation.setDeviceMetricsOverride` (override, no auto-reset) | CP11 |
 | `browser_pdf_save` | ✅ CDP `Page.printToPDF` (paper layout; MCP writes the file) | CP11 |
-| `browser_cookie_*` (get/set/list/delete/clear) | ➕ CDP `Network.*Cookies` | CP12 |
-| `browser_localstorage_*` / `browser_sessionstorage_*` | ➕ `Runtime.evaluate` over storage APIs | CP12 |
-| `browser_storage_state` / `browser_set_storage_state` | ➕ compose cookies + storage to/from JSON | CP12 |
+| `browser_cookie_*` (get/set/list/delete/clear) | ✅ CDP `Network.*Cookies` (sees/sets httpOnly) | CP12 |
+| `browser_localstorage_*` / `browser_sessionstorage_*` | ✅ `evaluate` over storage APIs (shared backend, `store` param) | CP12 |
+| `browser_storage_state` / `browser_set_storage_state` | ✅ compose cookies + storage to/from JSON (current origin) | CP12 |
 | `browser_verify_element_visible` / `_list_visible` / `_text_visible` / `_value` | ➕ assert over AX snapshot + DOM | CP13 |
 | `browser_route` / `_unroute` / `_route_list` / `network_state_set` | ➕ CDP `Fetch` interception | CP14 (deferred) |
 | `browser_run_code_unsafe` | ⛔ no Playwright runtime → use `browser_evaluate` | — |
@@ -524,10 +544,14 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
   base64 → MCP server writes the file). Notes: resize sets a viewport *override*
   with no auto-reset (resize back to clear); PDF uses paper (≈A4) layout, not the
   viewport (expected print-to-PDF behavior).
-- **CP12 — storage.** Cookies via `Network.getCookies`/`setCookie`/
-  `deleteCookies`/`clearBrowserCookies`; local/session storage via
-  `Runtime.evaluate`; `storage_state`/`set_storage_state` compose both to/from a
-  JSON file. (Unlocks auth/session reuse — the biggest real-capability add.)
+- **CP12 — storage. DONE + user-verified.** Cookies via CDP `Network.getCookies`/
+  `setCookie`/`deleteCookies`/`clearBrowserCookies` (handles httpOnly); local/
+  session storage via `evaluate` (shared backend, `store` param); `storage_state`/
+  `set_storage_state` compose cookies + local/session storage to/from a JSON file
+  (current origin, not Playwright's multi-origin format). **Verified on a real
+  TrueLens auth session:** captured state → cleared → `/dashboard` kicked to
+  login → `set_storage_state` restored cookie+localStorage → `/dashboard` loaded
+  authenticated, no re-login.
 - **CP13 — testing assertions.** `browser_verify_*` evaluated against the AX
   snapshot + DOM. (`generate_locator` stays a divergence.)
 - **CP14 — network mocking (deferred).** `browser_route`/`_unroute`/`_route_list`/

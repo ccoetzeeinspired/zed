@@ -128,6 +128,40 @@ impl<'a> CdpSession<'a> {
         )
     }
 
+    /// Enable a CDP domain (`enable_method`, e.g. `"Network.enable"`) then call
+    /// `method` with `params_json`. Used by the cookie tools.
+    pub fn call_with_domain_enabled(
+        &self,
+        enable_method: &str,
+        method: &str,
+        params_json: &str,
+        on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+    ) -> Result<()> {
+        let webview = self.session.webview.clone();
+        let method = method.to_string();
+        let params = params_json.to_string();
+        let completion: Completion<Value> = Rc::new(RefCell::new(Some(on_done)));
+        let enable_completion = completion.clone();
+        self.call_method(
+            enable_method,
+            "{}",
+            Box::new(move |enable_result| match enable_result {
+                Err(err) => finish(&enable_completion, Err(err)),
+                Ok(_) => {
+                    let call_completion = completion.clone();
+                    let _ = call_devtools_on_webview(
+                        &webview,
+                        &method,
+                        &params,
+                        Box::new(move |raw| {
+                            finish(&call_completion, raw.and_then(parse_cdp_response));
+                        }),
+                    );
+                }
+            }),
+        )
+    }
+
     /// Evaluate a JS expression in the page main world (`Runtime.evaluate`).
     pub fn evaluate_expression(
         &self,
