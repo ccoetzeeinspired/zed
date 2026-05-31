@@ -573,6 +573,42 @@ site-side bot-walls + consent flakiness):** GitHub, MDN, crates.io, TrueLens,
 example→iana, the-internet, quotes, wikipedia = **green**. Open levers:
 **consent/iframe handling** (Guardian) and **headed/profile runner mode** (npmjs).
 
+#### 4.6.5 Pass 5 — e-retail (Takealot, Amazon), 2026-05-31
+
+Target: e-commerce (the hostile-by-design class). Two **new** sites, driven via
+the embedded browser, codegen, run under **headless** Playwright. **No Zed code
+change was needed** — the matured codegen (passes 1–4) handled e-retail as-is.
+
+| Flow | Result | Note |
+|---|---|---|
+| **Takealot** (NEW) | **3/3 ✅** | home → **dismiss cookie banner ("Got it")** → search "laptop" → assert "Filters" facet. The consent banner is **main-frame** (a real `ref`, unlike Guardian's cross-origin iframe), so the dismissal was **recorded and reproduced** — Playwright's fresh context shows the banner and the recorded click clears it. The adaptivity-capture claim, *proven positively*. |
+| **Amazon** (NEW) | **3/3 ✅** | home → search "wireless mouse" → assert "Brands" facet. Reproduced headless — Amazon's *browse* path (home→search→results) does **not** bot-wall headless Chromium (its walls are on transactional/checkout steps). |
+
+**Findings:**
+- **Consent capture works when the banner is same-origin/main-frame** (Takealot)
+  — the recorder captures the dismiss as a normal click and codegen replays it.
+  This is the counterpoint to Guardian (§4.6.1/§4.6.4): the gap is specifically
+  *cross-origin iframe* CMPs, not consent in general.
+- **Option A (headed/profile runner) was unnecessary here** — e-retail *browse*
+  flows reproduce headless. Bot-walls (npmjs §4.6.4) and transactional steps
+  remain the cases that would need it; deferred until a flow actually requires it.
+- **E-retail product-card accessibility gap (Takealot):** result-grid product
+  links are image-only with **no accessible name** (the title sits in a sibling
+  `heading`, and clicking the heading didn't bubble to the card's anchor), so a
+  specific product isn't cleanly addressable by role+name from the snapshot — and
+  result ordering is non-deterministic anyway, so a product-specific click
+  wouldn't reproduce. Worked around by asserting on a stable facet. A future
+  "click the product card" capability would need the snapshot to surface the
+  card's anchor (e.g. name it from the child heading) — a snapshot enhancement,
+  not codegen.
+- **Dynamic-count headings reconfirmed** (Amazon "1-16 of over 30,000 results…",
+  Takealot "1546 results for…") — avoided by asserting on stable facets.
+
+**Scorecard add:** Takealot, Amazon → **green** (headless). Reproduction now
+verified green across 10 real sites + 4 practice sites; the only non-green real
+cases remain Guardian (cross-origin consent flake) and npmjs (headless bot-wall),
+both runner/environment issues, not codegen.
+
 ### 4.7 Effort / risk
 
 - **Recorder:** small (one hook at the dispatch chokepoint + a Mutex buffer).
