@@ -569,7 +569,11 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
   on absent text, wrong value, and a hidden element). (`generate_locator` stays a
   divergence.) **This completes full Playwright MCP parity.**
 - **CP14 — network mocking (deferred).** `browser_route`/`_unroute`/`_route_list`/
-  `network_state_set` via CDP `Fetch` domain interception.
+  `network_state_set` via CDP `Fetch` domain interception. (GitHub issue #13.)
+- **CP15 — record + codegen (candidate, beyond parity).** Turn an agent's run
+  into a runnable Playwright `.spec.ts` (record-not-recall; role+name refs map to
+  `getByRole` locators; `storage_state` seeds auth). Full design + testing
+  strategy: [`browser-codegen.md`](browser-codegen.md).
 
 ### 9.3 Divergences (won't replicate; analogs provided)
 

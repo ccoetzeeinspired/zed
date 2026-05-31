@@ -19,6 +19,7 @@ corresponding feature.
 |-------------------------------------------------|-----------------------------------------|
 | [`browser-viewer.md`](plans/browser-viewer.md)  | Shipped (in `cccl-main`)                |
 | [`browser-automation.md`](plans/browser-automation.md) | CP0–CP13 shipped — full Playwright MCP parity (51 tools) |
+| [`browser-codegen.md`](plans/browser-codegen.md) | Proposal — CP15 record→codegen (agent run → runnable Playwright script) + testing strategy. **Start here for the next phase.** |
 
 All shipped features now live in `cccl-main` (see Branches below).
 
@@ -475,6 +476,15 @@ mocking via CDP `Fetch`) remains, deferred by choice. Documented divergences
 (intentionally not replicated): `run_code_unsafe` (→ `browser_evaluate`),
 `generate_locator` (→ `browser_snapshot` refs), `annotate` (→ design mode),
 tracing/video/`resume`, `get_config`. See `plans/browser-automation.md` §9.
+
+**Next phase — agent → runnable scripts (CP15, candidate).** The high-value
+direction beyond parity: a **record + codegen** layer that turns an agent's
+interactive run into a runnable Playwright `.spec.ts`. Feasible *because* our
+refs are role+name (≈ `getByRole` locators), we own the dispatch chokepoint
+(record-not-recall), and `storage_state` seeds auth (proven). Full design,
+rationale, the action→Playwright mapping, and the test-the-claim experiment:
+[`plans/browser-codegen.md`](plans/browser-codegen.md) — **the orientation doc
+for a fresh session** (it recaps the whole framework + how to build/run/verify).
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
 through 51 MCP tools registered as the `zed-browser` context server: navigation
