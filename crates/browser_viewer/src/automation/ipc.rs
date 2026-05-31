@@ -410,6 +410,21 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .ok_or_else(|| anyhow!("network_request requires params.id"))?;
             commands::network_request(browser, id, cx).await
         }
+        "resize" => {
+            let width = num_param(&request.params, &["width", "w"])? as i64;
+            let height = num_param(&request.params, &["height", "h"])? as i64;
+            commands::resize(browser, width, height, cx).await
+        }
+        "pdf_save" => {
+            let landscape = request.params.get("landscape").and_then(|v| v.as_bool()).unwrap_or(false);
+            let print_background = request
+                .params
+                .get("printBackground")
+                .or_else(|| request.params.get("print_background"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            commands::pdf_save(browser, landscape, print_background, cx).await
+        }
         "navigate" => {
             let url = request
                 .params

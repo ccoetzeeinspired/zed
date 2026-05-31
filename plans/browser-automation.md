@@ -1,7 +1,7 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP10 shipped and verified (28-tool surface; CP10 = console +
-network observation); CP11+ roadmap to **full** Playwright MCP parity in §9  
+**Status:** CP0–CP11 shipped and verified (30-tool surface; CP11 = resize +
+pdf_save); CP12–CP13 left to **full** Playwright MCP parity (see §9)  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
 **Last updated:** 2026-05-31
@@ -110,8 +110,10 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_mouse_move_xy` / `_click_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | `mouse_*` | Coordinate ("vision") mouse via CDP `Input.dispatchMouseEvent`; explicit viewport CSS-px coords (CP9). |
 | `browser_console_messages` | `console_messages` | Read buffered `console.*` + uncaught errors (doc-start JS instrumentation); `level` filter, `clear` (CP10). |
 | `browser_network_requests` / `browser_network_request` | `network_requests` / `network_request` | Read buffered fetch/XHR (method/status/timing) from JS instrumentation; list or by id (CP10). |
+| `browser_resize` | `resize` | CDP `Emulation.setDeviceMetricsOverride` viewport override (CP11). |
+| `browser_pdf_save` | `pdf_save` | CDP `Page.printToPDF` → base64; MCP server writes the file (CP11). |
 
-**CP6–CP10 complete** — 28 tools shipped.
+**CP6–CP11 complete** — 30 tools shipped.
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -139,6 +141,7 @@ there.
 | **CP8** | Input interactions (file_upload, drag, drop, handle_dialog) | Done |
 | **CP9** | Coordinate "vision" mouse tools (move/click/down/up/drag/wheel xy) | Done |
 | **CP10** | Observation: console + network (read-only, doc-start JS instrumentation) | Done |
+| **CP11** | Emulation + PDF (resize, pdf_save) | Done |
 
 ### Verification log (2026-05-30)
 
@@ -264,6 +267,13 @@ Driven through the MCP server against a full-viewport overlay that shows a live
 - `network_requests` — `fetch("…?zedprobe=42")` → tool returned
   `#1 GET 200 … (489ms)`; the user saw the same request (status 200) in the
   DevTools Network tab. `network_request(id:1)` returned the full record.
+
+### Verification log (CP11 — user-confirmed)
+
+- `resize(600,400)` → page rendered at the smaller box; `evaluate` confirmed
+  `innerWidth=600, innerHeight=400`.
+- `pdf_save` → 22 KB `%PDF` written to disk; rendering inspected (the example.com
+  page incl. background). Uses paper (≈A4) layout, not the viewport.
 
 ### Follow-ups discovered during CP7 verification — ALL FIXED + user-verified
 
@@ -463,8 +473,8 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 | `browser_mouse_click_xy` / `_move_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | ✅ CDP `Input.dispatchMouseEvent` (vision; explicit coords) | CP9 |
 | `browser_console_messages` | ✅ doc-start JS instrumentation (console.* + errors) read via `evaluate` | CP10 |
 | `browser_network_requests` / `browser_network_request` | ✅ doc-start JS instrumentation (fetch/XHR) read via `evaluate` | CP10 |
-| `browser_resize` | ➕ CDP `Emulation.setDeviceMetricsOverride` | CP11 |
-| `browser_pdf_save` | ➕ CDP `Page.printToPDF` | CP11 |
+| `browser_resize` | ✅ CDP `Emulation.setDeviceMetricsOverride` (override, no auto-reset) | CP11 |
+| `browser_pdf_save` | ✅ CDP `Page.printToPDF` (paper layout; MCP writes the file) | CP11 |
 | `browser_cookie_*` (get/set/list/delete/clear) | ➕ CDP `Network.*Cookies` | CP12 |
 | `browser_localstorage_*` / `browser_sessionstorage_*` | ➕ `Runtime.evaluate` over storage APIs | CP12 |
 | `browser_storage_state` / `browser_set_storage_state` | ➕ compose cookies + storage to/from JSON | CP12 |
@@ -509,9 +519,11 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
   (not browser-internal logs); network = fetch/XHR with status+timing (not
   document/image/script subresources, no response bodies/headers). Verified
   against the browser's own DevTools console + network panels.
-- **CP11 — emulation + PDF.** `browser_resize`
-  (`Emulation.setDeviceMetricsOverride`, for responsive testing);
-  `browser_pdf_save` (`Page.printToPDF`) — composes with the fork's PDF viewer.
+- **CP11 — emulation + PDF. DONE + user-verified.** `browser_resize`
+  (`Emulation.setDeviceMetricsOverride`); `browser_pdf_save` (`Page.printToPDF`,
+  base64 → MCP server writes the file). Notes: resize sets a viewport *override*
+  with no auto-reset (resize back to clear); PDF uses paper (≈A4) layout, not the
+  viewport (expected print-to-PDF behavior).
 - **CP12 — storage.** Cookies via `Network.getCookies`/`setCookie`/
   `deleteCookies`/`clearBrowserCookies`; local/session storage via
   `Runtime.evaluate`; `storage_state`/`set_storage_state` compose both to/from a

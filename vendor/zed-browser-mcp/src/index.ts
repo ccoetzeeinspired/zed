@@ -2,6 +2,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { callZedAutomation, requireZedOk } from "./ipc.js";
 
@@ -436,6 +439,41 @@ server.tool(
       await callZedAutomation("network_request", { id }),
     )) as { request?: unknown };
     return textContent(JSON.stringify(result.request ?? null, null, 2));
+  },
+);
+
+server.tool(
+  "browser_resize",
+  "Resize the embedded Zed browser tab's viewport (for responsive testing)",
+  {
+    width: z.number().int().describe("Viewport width in CSS px"),
+    height: z.number().int().describe("Viewport height in CSS px"),
+  },
+  async ({ width, height }) => {
+    await requireZedOk(await callZedAutomation("resize", { width, height }));
+    return textContent(`Resized viewport to ${width}×${height}`);
+  },
+);
+
+server.tool(
+  "browser_pdf_save",
+  "Save the current page as a PDF file from the embedded Zed browser tab",
+  {
+    filename: z.string().optional().describe("Output path; defaults to a temp file"),
+    landscape: z.boolean().optional().describe("Landscape orientation"),
+    printBackground: z.boolean().optional().describe("Print background graphics (default true)"),
+  },
+  async ({ filename, landscape, printBackground }) => {
+    const result = (await requireZedOk(
+      await callZedAutomation("pdf_save", {
+        landscape: landscape ?? false,
+        printBackground: printBackground ?? true,
+      }),
+    )) as { data: string; bytes: number };
+    const out = filename ?? join(tmpdir(), `zed-browser-${Date.now()}.pdf`);
+    const buf = Buffer.from(result.data, "base64");
+    writeFileSync(out, buf);
+    return textContent(`Saved PDF (${buf.length} bytes) to ${out}`);
   },
 );
 

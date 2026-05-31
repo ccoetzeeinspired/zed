@@ -871,6 +871,52 @@ pub async fn network_request(
     Ok(serde_json::json!({ "request": unwrap_cdp_value(raw) }))
 }
 
+// ---- CP11: emulation (resize) + PDF ----
+
+/// CP11: override the viewport the page renders at (CDP
+/// `Emulation.setDeviceMetricsOverride`) — for responsive testing.
+pub async fn resize(
+    browser: Entity<BrowserView>,
+    width: i64,
+    height: i64,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let params = serde_json::json!({
+        "width": width, "height": height, "deviceScaleFactor": 1, "mobile": false,
+    })
+    .to_string();
+    run_one_shot(&browser, cx, "resize", move |session, done| {
+        CdpSession::new(session).call_method("Emulation.setDeviceMetricsOverride", &params, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "width": width, "height": height }))
+}
+
+/// CP11: render the page to PDF (CDP `Page.printToPDF`). Returns
+/// `{ data: <base64>, bytes }`.
+pub async fn pdf_save(
+    browser: Entity<BrowserView>,
+    landscape: bool,
+    print_background: bool,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let params = serde_json::json!({
+        "landscape": landscape,
+        "printBackground": print_background,
+        "transferMode": "ReturnAsBase64",
+    })
+    .to_string();
+    let raw = run_one_shot(&browser, cx, "pdf_save", move |session, done| {
+        CdpSession::new(session).call_method("Page.printToPDF", &params, done)
+    })
+    .await?;
+    let data = raw
+        .get("data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Page.printToPDF returned no data"))?;
+    Ok(serde_json::json!({ "data": data, "bytes": data.len() }))
+}
+
 pub async fn navigate(
     browser: Entity<BrowserView>,
     url: &str,

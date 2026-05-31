@@ -440,21 +440,26 @@ page-side ring buffers, read back via `evaluate`. Chosen over CDP
 console.* + uncaught errors (not browser-internal); fetch/XHR with status+timing
 (not subresources). Verified against the browser's own DevTools.
 
-**Next: full Playwright MCP parity (CP11+).** The plan's §9 has a full parity
-matrix + checkpoint breakdown: resize + pdf (CP11); storage (CP12); verify_*
-assertions (CP13); network mocking deferred (CP14). Documented divergences
-(won't replicate): `run_code_unsafe`, `generate_locator`, tracing/video/annotate,
-`get_config`.
+**CP11 done + user-verified (2026-05-31):** `browser_resize` (CDP
+`Emulation.setDeviceMetricsOverride` — viewport override, no auto-reset) and
+`browser_pdf_save` (CDP `Page.printToPDF` → base64; the MCP server writes the
+file). PDF uses paper (≈A4) layout, not the viewport. Verified: resize→600×400
+(innerWidth/Height confirmed + visible), pdf→valid %PDF of the page.
+
+**Next: full Playwright MCP parity (CP12+).** The plan's §9 has a full parity
+matrix + checkpoint breakdown: storage (CP12); verify_* assertions (CP13);
+network mocking deferred (CP14). Documented divergences (won't replicate):
+`run_code_unsafe`, `generate_locator`, tracing/video/annotate, `get_config`.
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through 28 MCP tools registered as the `zed-browser` context server: navigation
+through 30 MCP tools registered as the `zed-browser` context server: navigation
 (`navigate`, `navigate_back`), inspection (`snapshot`, `evaluate`,
 `take_screenshot`), element interaction (`click`, `type`, `fill_form`,
 `select_option`, `hover`, `press_key`, `scroll`, `file_upload`, `drag`, `drop`),
 coordinate "vision" mouse (`mouse_move_xy`/`_click_xy`/`_down`/`_up`/`_drag_xy`/
 `_wheel`), dialogs (`handle_dialog`), tab management (`tabs`, `close`),
-observation (`console_messages`, `network_requests`, `network_request`), and
-sync (`wait_for`). Tools hit the page via CDP (accessibility
+observation (`console_messages`, `network_requests`, `network_request`),
+emulation/output (`resize`, `pdf_save`), and sync (`wait_for`). Tools hit the page via CDP (accessibility
 snapshot + DOM scripts), with coordinate-based control as a fallback.
 
 **Stack:**
