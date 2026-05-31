@@ -1,8 +1,7 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP8 shipped and verified (19-tool surface; CP8 = input
-interactions: file_upload, drag, drop, handle_dialog); CP9+ roadmap to **full**
-Playwright MCP parity in §9  
+**Status:** CP0–CP9 shipped and verified (25-tool surface; CP9 = coordinate
+"vision" mouse tools); CP10+ roadmap to **full** Playwright MCP parity in §9  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
 **Last updated:** 2026-05-31
@@ -108,8 +107,9 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_drag` | `drag` | Mouse drag press→move→release between two element centres (CP8). |
 | `browser_drop` | `drop` | Synthetic HTML5 drop (data/MIME; not files — use file_upload) (CP8). |
 | `browser_handle_dialog` | `handle_dialog` | JS-override of alert/confirm/prompt via `evaluate`; arm-then-trigger (CP8). |
+| `browser_mouse_move_xy` / `_click_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | `mouse_*` | Coordinate ("vision") mouse via CDP `Input.dispatchMouseEvent`; explicit viewport CSS-px coords (CP9). |
 
-**CP6–CP8 complete** — 19 tools shipped (Tier 1 + Tier 2 parity fills + input interactions).
+**CP6–CP9 complete** — 25 tools shipped (Tier 1 + Tier 2 + parity fills + input interactions + coordinate vision).
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -135,6 +135,7 @@ there.
 | **CP6** | Tier 2 breadth (press_key, scroll, tabs, screenshot, evaluate, select_option, hover) | Done |
 | **CP7** | Parity fills (click options, wait_for textGone, type slowly, navigate_back, fill_form, close) | Done |
 | **CP8** | Input interactions (file_upload, drag, drop, handle_dialog) | Done |
+| **CP9** | Coordinate "vision" mouse tools (move/click/down/up/drag/wheel xy) | Done |
 
 ### Verification log (2026-05-30)
 
@@ -238,6 +239,19 @@ user** plus a tool-side `evaluate` read-back:
 - `handle_dialog` — armed accept+text → `confirm()=true`, `prompt()="…"`; armed
   dismiss → `confirm()=false`, `prompt()=null`; **no dialog box popped** (JS
   override, by design).
+
+### Verification log (CP9 — user-confirmed, step-by-step)
+
+Driven through the MCP server against a full-viewport overlay that shows a live
+`move:` readout, an event log, and drops colored markers at event coords; each
+**visually confirmed by the user**:
+
+- `mouse_move_xy(500,300)` → readout `move: 500,300`.
+- `mouse_click_xy(400,250)` → magenta marker + `down/up/click 400,250`.
+- `mouse_down(250,450)` + `mouse_up(650,450)` → red marker left, blue right
+  (plus an expected same-element `click` at the release point).
+- `mouse_drag_xy(200,550→800,550)` → red start, blue end (button held).
+- `mouse_wheel(deltaY 240)` → `wheel 0,240`.
 
 ### Follow-ups discovered during CP7 verification — ALL FIXED + user-verified
 
@@ -431,7 +445,7 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 | `browser_drag` | ✅ CDP `Input` mouse drag (press→move→release) | CP8 |
 | `browser_drop` | ✅ synthetic HTML5 drop (data/MIME; not files — use file_upload) | CP8 |
 | `browser_handle_dialog` | ✅ JS-override (`evaluate`) — arm-then-trigger; not native `ScriptDialogOpening` | CP8 |
-| `browser_mouse_click_xy` / `_move_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | ➕ CDP `Input.dispatchMouseEvent` (vision) | CP9 |
+| `browser_mouse_click_xy` / `_move_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | ✅ CDP `Input.dispatchMouseEvent` (vision; explicit coords) | CP9 |
 | `browser_console_messages` | ➕ `GetDevToolsProtocolEventReceiver` buffer | CP10 |
 | `browser_network_requests` / `browser_network_request` | ➕ `Network.*` event buffer (read-only) | CP10 |
 | `browser_resize` | ➕ CDP `Emulation.setDeviceMetricsOverride` | CP11 |
@@ -464,9 +478,10 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
   suppression). Semantics: arm `browser_handle_dialog` *before* the action that
   triggers the dialog; re-arm after navigation. Covers alert/confirm/prompt
   (not native chrome dialogs / beforeunload / file chooser).
-- **CP9 — vision / coordinate tools.** `browser_mouse_*_xy` via
-  `Input.dispatchMouseEvent` (the hover path already proves this works). Flip the
-  coordinate non-goal in §8.
+- **CP9 — vision / coordinate tools. DONE + user-verified.** `browser_mouse_*_xy`
+  (move/click/down/up/drag/wheel) via `Input.dispatchMouseEvent`. Coordinates are
+  explicit per call (we don't track a cursor between calls) — a small divergence
+  from Playwright's implicit-current-position `mouse_down`/`mouse_up`.
 - **CP10 — observation infra (console + network, read-only).** New per-session
   buffers fed by `GetDevToolsProtocolEventReceiver` (CDP *events*, vs the
   request/response calls used today): `Runtime.consoleAPICalled`/`Log.entryAdded`

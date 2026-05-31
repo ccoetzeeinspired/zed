@@ -726,6 +726,88 @@ pub async fn handle_dialog(
     Ok(serde_json::json!({ "armed": true, "accept": accept, "last": unwrap_cdp_value(raw) }))
 }
 
+// ---- CP9: coordinate ("vision") mouse tools (raw viewport CSS px) ----
+
+/// Move the mouse to `(x, y)`.
+pub async fn mouse_move_xy(browser: Entity<BrowserView>, x: f64, y: f64, cx: &mut AsyncApp) -> Result<Value> {
+    dispatch_mouse(&browser, cx, "mouseMoved", x, y, "none", 0, 0, 0).await?;
+    Ok(serde_json::json!({ "x": x, "y": y }))
+}
+
+/// Click at `(x, y)` with `button` (left/right/middle), optionally double.
+pub async fn mouse_click_xy(
+    browser: Entity<BrowserView>,
+    x: f64,
+    y: f64,
+    button: &str,
+    double: bool,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (btn, buttons) = button_codes(button)?;
+    dispatch_mouse(&browser, cx, "mouseMoved", x, y, "none", 0, 0, 0).await?;
+    let clicks = if double { 2 } else { 1 };
+    for cc in 1..=clicks {
+        dispatch_mouse(&browser, cx, "mousePressed", x, y, btn, buttons, cc, 0).await?;
+        dispatch_mouse(&browser, cx, "mouseReleased", x, y, btn, 0, cc, 0).await?;
+    }
+    Ok(serde_json::json!({ "x": x, "y": y, "button": button, "double": double }))
+}
+
+/// Press (`down=true`) or release (`down=false`) a mouse button at `(x, y)`.
+/// Coordinates are explicit (we don't track a cursor position between calls).
+pub async fn mouse_button(
+    browser: Entity<BrowserView>,
+    x: f64,
+    y: f64,
+    button: &str,
+    down: bool,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (btn, buttons) = button_codes(button)?;
+    let (kind, held) = if down { ("mousePressed", buttons) } else { ("mouseReleased", 0) };
+    dispatch_mouse(&browser, cx, kind, x, y, btn, held, 1, 0).await?;
+    Ok(serde_json::json!({ "x": x, "y": y, "button": button, "down": down }))
+}
+
+/// Drag from `(sx, sy)` to `(ex, ey)` with `button` held.
+pub async fn mouse_drag_xy(
+    browser: Entity<BrowserView>,
+    sx: f64,
+    sy: f64,
+    ex: f64,
+    ey: f64,
+    button: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (btn, buttons) = button_codes(button)?;
+    dispatch_mouse(&browser, cx, "mouseMoved", sx, sy, "none", 0, 0, 0).await?;
+    dispatch_mouse(&browser, cx, "mousePressed", sx, sy, btn, buttons, 1, 0).await?;
+    dispatch_mouse(&browser, cx, "mouseMoved", (sx + ex) / 2.0, (sy + ey) / 2.0, "none", buttons, 0, 0).await?;
+    dispatch_mouse(&browser, cx, "mouseMoved", ex, ey, "none", buttons, 0, 0).await?;
+    dispatch_mouse(&browser, cx, "mouseReleased", ex, ey, btn, 0, 1, 0).await?;
+    Ok(serde_json::json!({ "from": [sx, sy], "to": [ex, ey], "button": button }))
+}
+
+/// Scroll the wheel by `(delta_x, delta_y)` at `(x, y)`.
+pub async fn mouse_wheel(
+    browser: Entity<BrowserView>,
+    x: f64,
+    y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let params = serde_json::json!({
+        "type": "mouseWheel", "x": x, "y": y, "deltaX": delta_x, "deltaY": delta_y,
+    })
+    .to_string();
+    run_one_shot(&browser, cx, "mouse_wheel", move |session, done| {
+        CdpSession::new(session).call_method("Input.dispatchMouseEvent", &params, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "x": x, "y": y, "deltaX": delta_x, "deltaY": delta_y }))
+}
+
 pub async fn navigate(
     browser: Entity<BrowserView>,
     url: &str,

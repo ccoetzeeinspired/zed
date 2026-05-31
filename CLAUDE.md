@@ -425,22 +425,27 @@ re-arm after nav) rather than WebView2's native `ScriptDialogOpening` — chosen
 for composition-mode reliability; no dialog box pops (intercepted). Verified
 step-by-step on-screen.
 
-**Next: full Playwright MCP parity (CP9+).** The plan's §9 has a full parity
-matrix + checkpoint breakdown: coordinate vision tools (CP9); console + network
-read-only via `GetDevToolsProtocolEventReceiver` buffers (CP10); resize + pdf
-(CP11); storage (CP12); verify_* assertions (CP13); network mocking deferred
-(CP14). Documented divergences (won't replicate): `run_code_unsafe`,
-`generate_locator`, tracing/video/annotate, `get_config`.
+**CP9 done + user-verified (2026-05-31):** coordinate "vision" mouse tools —
+`browser_mouse_move_xy` / `_click_xy` / `_down` / `_up` / `_drag_xy` / `_wheel`
+via CDP `Input.dispatchMouseEvent`. Coords are explicit per call (no cursor
+tracking between calls). Verified on-screen via a coordinate overlay.
+
+**Next: full Playwright MCP parity (CP10+).** The plan's §9 has a full parity
+matrix + checkpoint breakdown: console + network read-only via
+`GetDevToolsProtocolEventReceiver` buffers (CP10); resize + pdf (CP11); storage
+(CP12); verify_* assertions (CP13); network mocking deferred (CP14). Documented
+divergences (won't replicate): `run_code_unsafe`, `generate_locator`, tracing/
+video/annotate, `get_config`.
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through nineteen MCP tools — `browser_navigate`, `browser_navigate_back`,
-`browser_snapshot`, `browser_click`, `browser_type`, `browser_fill_form`,
-`browser_wait_for`, `browser_press_key`, `browser_scroll`, `browser_tabs`,
-`browser_close`, `browser_take_screenshot`, `browser_evaluate`,
-`browser_select_option`, `browser_hover`, `browser_file_upload`, `browser_drag`,
-`browser_drop`, `browser_handle_dialog` — registered as the `zed-browser`
-context server. Tools hit the page via CDP (accessibility
-snapshot + DOM scripts); coordinate-based control arrives in CP9.
+through 25 MCP tools registered as the `zed-browser` context server: navigation
+(`navigate`, `navigate_back`), inspection (`snapshot`, `evaluate`,
+`take_screenshot`), element interaction (`click`, `type`, `fill_form`,
+`select_option`, `hover`, `press_key`, `scroll`, `file_upload`, `drag`, `drop`),
+coordinate "vision" mouse (`mouse_move_xy`/`_click_xy`/`_down`/`_up`/`_drag_xy`/
+`_wheel`), dialogs (`handle_dialog`), tab management (`tabs`, `close`), and
+sync (`wait_for`). Tools hit the page via CDP (accessibility
+snapshot + DOM scripts), with coordinate-based control as a fallback.
 
 **Stack:**
 

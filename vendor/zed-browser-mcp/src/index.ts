@@ -288,6 +288,98 @@ server.tool(
   },
 );
 
+// --- Coordinate ("vision") mouse tools: raw viewport CSS-pixel coordinates ---
+
+server.tool(
+  "browser_mouse_move_xy",
+  "Move the mouse to (x, y) pixel coordinates in the embedded Zed browser tab",
+  { x: z.number().describe("X in CSS px"), y: z.number().describe("Y in CSS px") },
+  async ({ x, y }) => {
+    await requireZedOk(await callZedAutomation("mouse_move_xy", { x, y }));
+    return textContent(`Moved to (${x}, ${y})`);
+  },
+);
+
+server.tool(
+  "browser_mouse_click_xy",
+  "Click at (x, y) pixel coordinates in the embedded Zed browser tab",
+  {
+    x: z.number().describe("X in CSS px"),
+    y: z.number().describe("Y in CSS px"),
+    button: z.enum(["left", "right", "middle"]).optional().describe("Mouse button (default left)"),
+    doubleClick: z.boolean().optional().describe("Double-click"),
+  },
+  async ({ x, y, button, doubleClick }) => {
+    await requireZedOk(
+      await callZedAutomation("mouse_click_xy", { x, y, button: button ?? "left", doubleClick: doubleClick ?? false }),
+    );
+    return textContent(`Clicked at (${x}, ${y})`);
+  },
+);
+
+server.tool(
+  "browser_mouse_down",
+  "Press a mouse button at (x, y) in the embedded Zed browser tab (pair with browser_mouse_up)",
+  {
+    x: z.number().describe("X in CSS px"),
+    y: z.number().describe("Y in CSS px"),
+    button: z.enum(["left", "right", "middle"]).optional().describe("Mouse button (default left)"),
+  },
+  async ({ x, y, button }) => {
+    await requireZedOk(await callZedAutomation("mouse_down", { x, y, button: button ?? "left" }));
+    return textContent(`Mouse down at (${x}, ${y})`);
+  },
+);
+
+server.tool(
+  "browser_mouse_up",
+  "Release a mouse button at (x, y) in the embedded Zed browser tab",
+  {
+    x: z.number().describe("X in CSS px"),
+    y: z.number().describe("Y in CSS px"),
+    button: z.enum(["left", "right", "middle"]).optional().describe("Mouse button (default left)"),
+  },
+  async ({ x, y, button }) => {
+    await requireZedOk(await callZedAutomation("mouse_up", { x, y, button: button ?? "left" }));
+    return textContent(`Mouse up at (${x}, ${y})`);
+  },
+);
+
+server.tool(
+  "browser_mouse_drag_xy",
+  "Drag the mouse from (startX, startY) to (endX, endY) in the embedded Zed browser tab",
+  {
+    startX: z.number().describe("Start X in CSS px"),
+    startY: z.number().describe("Start Y in CSS px"),
+    endX: z.number().describe("End X in CSS px"),
+    endY: z.number().describe("End Y in CSS px"),
+    button: z.enum(["left", "right", "middle"]).optional().describe("Mouse button (default left)"),
+  },
+  async ({ startX, startY, endX, endY, button }) => {
+    await requireZedOk(
+      await callZedAutomation("mouse_drag_xy", { startX, startY, endX, endY, button: button ?? "left" }),
+    );
+    return textContent(`Dragged (${startX}, ${startY}) → (${endX}, ${endY})`);
+  },
+);
+
+server.tool(
+  "browser_mouse_wheel",
+  "Scroll the mouse wheel by (deltaX, deltaY) at (x, y) in the embedded Zed browser tab",
+  {
+    deltaX: z.number().optional().describe("Horizontal scroll delta (px)"),
+    deltaY: z.number().optional().describe("Vertical scroll delta (px, positive = down)"),
+    x: z.number().optional().describe("X in CSS px (default 0)"),
+    y: z.number().optional().describe("Y in CSS px (default 0)"),
+  },
+  async ({ deltaX, deltaY, x, y }) => {
+    await requireZedOk(
+      await callZedAutomation("mouse_wheel", { x: x ?? 0, y: y ?? 0, deltaX: deltaX ?? 0, deltaY: deltaY ?? 0 }),
+    );
+    return textContent(`Wheel (${deltaX ?? 0}, ${deltaY ?? 0}) at (${x ?? 0}, ${y ?? 0})`);
+  },
+);
+
 server.tool(
   "browser_take_screenshot",
   "Take a screenshot (PNG/JPEG) of the embedded Zed browser tab",

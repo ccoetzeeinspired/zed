@@ -356,6 +356,43 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .map(str::to_string);
             commands::handle_dialog(browser, accept, prompt_text, cx).await
         }
+        "mouse_move_xy" => {
+            let (x, y) = xy_from_params(&request.params)?;
+            commands::mouse_move_xy(browser, x, y, cx).await
+        }
+        "mouse_click_xy" => {
+            let (x, y) = xy_from_params(&request.params)?;
+            let button = button_from_params(&request.params);
+            let double = request
+                .params
+                .get("doubleClick")
+                .or_else(|| request.params.get("double"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            commands::mouse_click_xy(browser, x, y, &button, double, cx).await
+        }
+        "mouse_down" => {
+            let (x, y) = xy_from_params(&request.params)?;
+            commands::mouse_button(browser, x, y, &button_from_params(&request.params), true, cx).await
+        }
+        "mouse_up" => {
+            let (x, y) = xy_from_params(&request.params)?;
+            commands::mouse_button(browser, x, y, &button_from_params(&request.params), false, cx).await
+        }
+        "mouse_drag_xy" => {
+            let sx = num_param(&request.params, &["startX", "x1", "fromX"])?;
+            let sy = num_param(&request.params, &["startY", "y1", "fromY"])?;
+            let ex = num_param(&request.params, &["endX", "x2", "toX"])?;
+            let ey = num_param(&request.params, &["endY", "y2", "toY"])?;
+            commands::mouse_drag_xy(browser, sx, sy, ex, ey, &button_from_params(&request.params), cx).await
+        }
+        "mouse_wheel" => {
+            let x = request.params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = request.params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let dx = request.params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let dy = request.params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            commands::mouse_wheel(browser, x, y, dx, dy, cx).await
+        }
         "navigate" => {
             let url = request
                 .params
@@ -468,6 +505,27 @@ fn ref_from_params(params: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow!("missing ref/target — run browser_snapshot first"))
+}
+
+/// Required numeric param under any of `keys`.
+fn num_param(params: &Value, keys: &[&str]) -> Result<f64> {
+    keys.iter()
+        .find_map(|k| params.get(*k).and_then(|v| v.as_f64()))
+        .ok_or_else(|| anyhow!("missing numeric param (one of {keys:?})"))
+}
+
+/// Required `x` / `y` coordinate pair.
+fn xy_from_params(params: &Value) -> Result<(f64, f64)> {
+    Ok((num_param(params, &["x"])?, num_param(params, &["y"])?))
+}
+
+/// Mouse button name from params (default left).
+fn button_from_params(params: &Value) -> String {
+    params
+        .get("button")
+        .and_then(|v| v.as_str())
+        .unwrap_or("left")
+        .to_string()
 }
 
 /// Parse `fill_form` `fields`: `[{ ref|target, value, type? }, …]`.
