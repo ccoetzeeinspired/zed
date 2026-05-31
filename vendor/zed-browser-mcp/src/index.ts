@@ -215,6 +215,80 @@ server.tool(
 );
 
 server.tool(
+  "browser_file_upload",
+  "Upload file(s) to a <input type=file> in the embedded Zed browser tab",
+  {
+    ref: z.string().optional().describe("Snapshot ref of the file input"),
+    target: z.string().optional().describe("Alias for ref"),
+    paths: z
+      .union([z.string(), z.array(z.string())])
+      .describe("Absolute path(s) of the file(s) to upload (must exist on disk)"),
+  },
+  async ({ ref, target, paths }) => {
+    const elementRef = ref ?? target;
+    if (!elementRef) {
+      throw new Error("browser_file_upload requires target or ref from browser_snapshot");
+    }
+    const result = (await requireZedOk(
+      await callZedAutomation("file_upload", { ref: elementRef, paths }),
+    )) as { uploaded?: number };
+    return textContent(`Uploaded ${result.uploaded ?? 0} file(s) to ${elementRef}`);
+  },
+);
+
+server.tool(
+  "browser_drag",
+  "Drag from one element to another in the embedded Zed browser tab (mouse-based)",
+  {
+    startRef: z.string().describe("Snapshot ref of the element to drag from"),
+    endRef: z.string().describe("Snapshot ref of the element to drop onto"),
+  },
+  async ({ startRef, endRef }) => {
+    await requireZedOk(
+      await callZedAutomation("drag", { startRef, endRef }),
+    );
+    return textContent(`Dragged ${startRef} → ${endRef}`);
+  },
+);
+
+server.tool(
+  "browser_drop",
+  "Drop data onto an element in the embedded Zed browser tab (synthetic HTML5 drop; data/MIME only, not files — use browser_file_upload for files)",
+  {
+    ref: z.string().optional().describe("Snapshot ref of the drop target"),
+    target: z.string().optional().describe("Alias for ref"),
+    data: z.string().optional().describe("Data payload to drop"),
+    mime: z.string().optional().describe("MIME type for the data (default text/plain)"),
+  },
+  async ({ ref, target, data, mime }) => {
+    const elementRef = ref ?? target;
+    if (!elementRef) {
+      throw new Error("browser_drop requires target or ref from browser_snapshot");
+    }
+    await requireZedOk(
+      await callZedAutomation("drop", { ref: elementRef, data, mime }),
+    );
+    return textContent(`Dropped onto ${elementRef}`);
+  },
+);
+
+server.tool(
+  "browser_handle_dialog",
+  "Arm handling of JS dialogs (alert/confirm/prompt) in the embedded Zed browser tab. Call BEFORE the action that triggers the dialog; re-arm after navigation.",
+  {
+    accept: z.boolean().optional().describe("Accept (true, default) or dismiss (false) the dialog"),
+    promptText: z.string().optional().describe("Text to enter for a prompt() dialog when accepting"),
+  },
+  async ({ accept, promptText }) => {
+    const result = (await requireZedOk(
+      await callZedAutomation("handle_dialog", { accept: accept ?? true, promptText }),
+    )) as { accept?: boolean; last?: { type: string; message: string } | null };
+    const last = result.last ? ` (last seen: ${result.last.type} "${result.last.message}")` : "";
+    return textContent(`Dialog handling armed: accept=${result.accept}${last}`);
+  },
+);
+
+server.tool(
   "browser_take_screenshot",
   "Take a screenshot (PNG/JPEG) of the embedded Zed browser tab",
   {

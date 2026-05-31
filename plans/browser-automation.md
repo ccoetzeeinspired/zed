@@ -1,7 +1,8 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP7 shipped and verified (15-tool surface; CP7 = parity fills +
-click options); CP8+ roadmap to **full** Playwright MCP parity in §9  
+**Status:** CP0–CP8 shipped and verified (19-tool surface; CP8 = input
+interactions: file_upload, drag, drop, handle_dialog); CP9+ roadmap to **full**
+Playwright MCP parity in §9  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
 **Last updated:** 2026-05-31
@@ -100,8 +101,15 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_evaluate` | `evaluate` | `Runtime.evaluate` `(fn)()` (awaits promises, surfaces `exceptionDetails`); with `ref`, calls `fn` with the element as `this`+arg0. Returns `{result}`. |
 | `browser_select_option` | `select_option` | Set `<select>` option(s) by value/label/text (+ `input`/`change`). Returns `{matched,value}`. |
 | `browser_hover` | `hover` | Scroll element to centre, dispatch CDP `Input.dispatchMouseEvent` `mouseMoved` → real CSS `:hover`. |
+| `browser_navigate_back` | `navigate_back` | WebView2 `GoBack` + wait for load (CP7). |
+| `browser_fill_form` | `fill_form` | Batch fields by kind: text / checkbox-radio / select (CP7). |
+| `browser_close` | `close` | Close the active browser tab (workspace `close_item_by_id`) (CP7). |
+| `browser_file_upload` | `file_upload` | CDP `DOM.setFileInputFiles` (paths on disk) (CP8). |
+| `browser_drag` | `drag` | Mouse drag press→move→release between two element centres (CP8). |
+| `browser_drop` | `drop` | Synthetic HTML5 drop (data/MIME; not files — use file_upload) (CP8). |
+| `browser_handle_dialog` | `handle_dialog` | JS-override of alert/confirm/prompt via `evaluate`; arm-then-trigger (CP8). |
 
-**CP6 Tier 2 complete** — all 12 tools shipped.
+**CP6–CP8 complete** — 19 tools shipped (Tier 1 + Tier 2 parity fills + input interactions).
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -126,6 +134,7 @@ there.
 | **CP5** | MCP adapter + `context_servers` + end-to-end agent | Done |
 | **CP6** | Tier 2 breadth (press_key, scroll, tabs, screenshot, evaluate, select_option, hover) | Done |
 | **CP7** | Parity fills (click options, wait_for textGone, type slowly, navigate_back, fill_form, close) | Done |
+| **CP8** | Input interactions (file_upload, drag, drop, handle_dialog) | Done |
 
 ### Verification log (2026-05-30)
 
@@ -213,6 +222,22 @@ against on-page fixtures (no AX-only inference):
   the full ~3s and returned as it disappeared.
 - `browser_close` — opened a 2nd tab (watched it appear + activate), closed it,
   back to one tab.
+
+### Verification log (CP8 — user-confirmed, step-by-step on example.com)
+
+Driven through the MCP server against a visible on-page panel (file input +
+SRC/TGT/DROP buttons + live readouts); each action **visually confirmed by the
+user** plus a tool-side `evaluate` read-back:
+
+- `file_upload` — uploaded `zed-upload-test.txt`; filename showed on the input;
+  `input.files` = {count 1, name, size 38}.
+- `drag` — SRC→TGT; recorder logged `SRC pointerdown/mousedown` then
+  `TGT pointerup/mouseup` (press on source, release on target).
+- `drop` — synthetic drop delivered `DROPPED_PAYLOAD_42` to the target's `drop`
+  listener.
+- `handle_dialog` — armed accept+text → `confirm()=true`, `prompt()="…"`; armed
+  dismiss → `confirm()=false`, `prompt()=null`; **no dialog box popped** (JS
+  override, by design).
 
 ### Follow-ups discovered during CP7 verification — ALL FIXED + user-verified
 
@@ -402,10 +427,10 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 | `browser_navigate_back` | ✅ `GoBack` | CP7 |
 | `browser_fill_form` | ✅ batch type over refs | CP7 |
 | `browser_close` | ✅ close active tab/page | CP7 |
-| `browser_file_upload` | ➕ CDP `DOM.setFileInputFiles` | CP8 |
-| `browser_drag` | ➕ CDP `Input` drag sequence | CP8 |
-| `browser_drop` | ➕ file/MIME drop | CP8 |
-| `browser_handle_dialog` | ➕ WebView2 `add_ScriptDialogOpening` | CP8 |
+| `browser_file_upload` | ✅ CDP `DOM.setFileInputFiles` | CP8 |
+| `browser_drag` | ✅ CDP `Input` mouse drag (press→move→release) | CP8 |
+| `browser_drop` | ✅ synthetic HTML5 drop (data/MIME; not files — use file_upload) | CP8 |
+| `browser_handle_dialog` | ✅ JS-override (`evaluate`) — arm-then-trigger; not native `ScriptDialogOpening` | CP8 |
 | `browser_mouse_click_xy` / `_move_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | ➕ CDP `Input.dispatchMouseEvent` (vision) | CP9 |
 | `browser_console_messages` | ➕ `GetDevToolsProtocolEventReceiver` buffer | CP10 |
 | `browser_network_requests` / `browser_network_request` | ➕ `Network.*` event buffer (read-only) | CP10 |
@@ -429,9 +454,16 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
   doubleClick/button/modifiers; `browser_wait_for` `textGone`; `browser_type`
   `slowly`; `browser_navigate_back`; `browser_fill_form`; `browser_close`.
   Mostly DOM / existing methods.
-- **CP8 — input interactions.** `browser_file_upload` (`DOM.setFileInputFiles`),
-  `browser_drag` + `browser_drop`, `browser_handle_dialog` (native WebView2
-  `ScriptDialogOpening` event + a pending-action policy: accept/dismiss/text).
+- **CP8 — input interactions. DONE + tool-verified.** `browser_file_upload`
+  (`DOM.setFileInputFiles`), `browser_drag` (mouse press→move→release),
+  `browser_drop` (synthetic HTML5 drop — data/MIME, not files),
+  `browser_handle_dialog`. **Design note:** handle_dialog uses a JS-override
+  installed via `evaluate` (overrides `alert`/`confirm`/`prompt` + records +
+  returns per policy), *not* WebView2's native `ScriptDialogOpening` — chosen
+  for reliability in composition mode (no native binding / default-dialog
+  suppression). Semantics: arm `browser_handle_dialog` *before* the action that
+  triggers the dialog; re-arm after navigation. Covers alert/confirm/prompt
+  (not native chrome dialogs / beforeunload / file chooser).
 - **CP9 — vision / coordinate tools.** `browser_mouse_*_xy` via
   `Input.dispatchMouseEvent` (the hover path already proves this works). Flip the
   coordinate non-goal in §8.

@@ -308,6 +308,54 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
             let ref_id = ref_from_params(&request.params)?;
             commands::hover(browser, &ref_id, cx).await
         }
+        "file_upload" => {
+            let ref_id = ref_from_params(&request.params)?;
+            let files = parse_string_list(
+                request.params.get("paths").or_else(|| request.params.get("files")),
+            )
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("file_upload requires params.paths (a path or array of paths)"))?;
+            commands::file_upload(browser, &ref_id, files, cx).await
+        }
+        "drag" => {
+            let start = request
+                .params
+                .get("startRef")
+                .or_else(|| request.params.get("start"))
+                .or_else(|| request.params.get("from"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("drag requires params.startRef"))?
+                .to_string();
+            let end = request
+                .params
+                .get("endRef")
+                .or_else(|| request.params.get("end"))
+                .or_else(|| request.params.get("to"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("drag requires params.endRef"))?
+                .to_string();
+            commands::drag(browser, &start, &end, cx).await
+        }
+        "drop" => {
+            let ref_id = ref_from_params(&request.params)?;
+            let data = request.params.get("data").and_then(|v| v.as_str()).map(str::to_string);
+            let mime = request.params.get("mime").and_then(|v| v.as_str()).map(str::to_string);
+            commands::drop(browser, &ref_id, data, mime, cx).await
+        }
+        "handle_dialog" => {
+            let accept = request
+                .params
+                .get("accept")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let prompt_text = request
+                .params
+                .get("promptText")
+                .or_else(|| request.params.get("prompt_text"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            commands::handle_dialog(browser, accept, prompt_text, cx).await
+        }
         "navigate" => {
             let url = request
                 .params

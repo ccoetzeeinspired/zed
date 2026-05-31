@@ -416,20 +416,29 @@ address-bar stale-after-nav (fixed via the nav race below), post-nav `evaluate`
 race (`automation_navigate` pre-sets `is_loading`), snapshot cap raised 500→2000
 (`ZED_BROWSER_AUTOMATION_MAX_REFS`), and `type slowly` gained `slowlyDelayMs`.
 
-**Next: full Playwright MCP parity (CP8+).** The plan's §9 has a full parity
-matrix + checkpoint breakdown: file_upload / drag-drop / dialogs (CP8);
-coordinate vision tools (CP9); console + network read-only via
-`GetDevToolsProtocolEventReceiver` buffers (CP10); resize + pdf (CP11); storage
-(CP12); verify_* assertions (CP13); network mocking deferred (CP14). Documented
-divergences (won't replicate): `run_code_unsafe`, `generate_locator`, tracing/
-video/annotate, `get_config`.
+**CP8 done + user-verified (2026-05-31):** input interactions — `browser_file_upload`
+(CDP `DOM.setFileInputFiles`), `browser_drag` (mouse press→move→release),
+`browser_drop` (synthetic HTML5 drop — data/MIME, **not** files), and
+`browser_handle_dialog`. Design note: handle_dialog uses a **JS-override** (an
+`evaluate` installs alert/confirm/prompt overrides + a policy; arm-then-trigger,
+re-arm after nav) rather than WebView2's native `ScriptDialogOpening` — chosen
+for composition-mode reliability; no dialog box pops (intercepted). Verified
+step-by-step on-screen.
+
+**Next: full Playwright MCP parity (CP9+).** The plan's §9 has a full parity
+matrix + checkpoint breakdown: coordinate vision tools (CP9); console + network
+read-only via `GetDevToolsProtocolEventReceiver` buffers (CP10); resize + pdf
+(CP11); storage (CP12); verify_* assertions (CP13); network mocking deferred
+(CP14). Documented divergences (won't replicate): `run_code_unsafe`,
+`generate_locator`, tracing/video/annotate, `get_config`.
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through fifteen MCP tools — `browser_navigate`, `browser_navigate_back`,
+through nineteen MCP tools — `browser_navigate`, `browser_navigate_back`,
 `browser_snapshot`, `browser_click`, `browser_type`, `browser_fill_form`,
 `browser_wait_for`, `browser_press_key`, `browser_scroll`, `browser_tabs`,
 `browser_close`, `browser_take_screenshot`, `browser_evaluate`,
-`browser_select_option`, `browser_hover` — registered as the `zed-browser`
+`browser_select_option`, `browser_hover`, `browser_file_upload`, `browser_drag`,
+`browser_drop`, `browser_handle_dialog` — registered as the `zed-browser`
 context server. Tools hit the page via CDP (accessibility
 snapshot + DOM scripts); coordinate-based control arrives in CP9.
 

@@ -188,6 +188,35 @@ pub fn try_scroll_into_view_backend_node(
     )
 }
 
+// Synthetic HTML5 drop onto the element: build a DataTransfer, set optional
+// data, and dispatch dragenter/dragover/drop. Covers data/MIME drops; cannot
+// carry real File objects (page JS can't construct File from a path) — use
+// browser_file_upload for file inputs.
+const DROP_SCRIPT: &str = r#"function(data, mime) {
+  const dt = new DataTransfer();
+  if (data != null) { dt.setData(mime || 'text/plain', String(data)); }
+  const opts = { bubbles: true, cancelable: true, dataTransfer: dt };
+  this.dispatchEvent(new DragEvent('dragenter', opts));
+  this.dispatchEvent(new DragEvent('dragover', opts));
+  this.dispatchEvent(new DragEvent('drop', opts));
+  return true;
+}"#;
+
+/// One-shot synthetic drop of `data` (MIME `mime`) onto a backend node.
+pub fn try_drop_backend_node(
+    session: &WebView2Session,
+    backend_node_id: i32,
+    data: Option<&str>,
+    mime: Option<&str>,
+    on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+) -> Result<()> {
+    let args = vec![
+        json!({ "value": data }),
+        json!({ "value": mime }),
+    ];
+    invoke_on_backend_node(session, backend_node_id, DROP_SCRIPT, Some(&args), on_done)
+}
+
 // Scroll into view + focus (for slow per-key typing).
 const FOCUS_SCRIPT: &str = r#"function() {
   this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });

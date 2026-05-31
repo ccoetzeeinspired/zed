@@ -11,9 +11,9 @@ use serde_json::Value;
 
 use crate::automation::action::{
     element_for_action, invoke_on_backend_node, try_bounding_rect_backend_node,
-    try_click_backend_node, try_focus_backend_node, try_hover_point_backend_node,
-    try_scroll_into_view_backend_node, try_select_option_backend_node,
-    try_set_checked_backend_node, try_type_backend_node,
+    try_click_backend_node, try_drop_backend_node, try_focus_backend_node,
+    try_hover_point_backend_node, try_scroll_into_view_backend_node,
+    try_select_option_backend_node, try_set_checked_backend_node, try_type_backend_node,
 };
 use crate::automation::cdp::CdpSession;
 use crate::automation::navigate::{WaitForOptions, normalize_navigate_url, wait_for_result};
@@ -606,6 +606,124 @@ pub async fn hover(browser: Entity<BrowserView>, ref_id: &str, cx: &mut AsyncApp
     })
     .await?;
     Ok(serde_json::json!({ "x": x, "y": y }))
+}
+
+/// Scroll an element into view and return its viewport-centre point (CSS px).
+async fn element_center(
+    browser: &Entity<BrowserView>,
+    ref_id: &str,
+    cx: &mut AsyncApp,
+) -> Result<(f64, f64)> {
+    let element = cx.update(|app| resolve_ref_on_browser(browser, ref_id, app))?;
+    let backend_node_id = element.backend_dom_node_id.expect("checked above");
+    let raw = run_one_shot(browser, cx, &format!("center {ref_id}"), move |session, done| {
+        try_hover_point_backend_node(session, backend_node_id, done)
+    })
+    .await?;
+    let point = unwrap_cdp_value(raw);
+    Ok((
+        point.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        point.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
+    ))
+}
+
+/// CP8: upload file(s) to a `<input type=file>` via CDP `DOM.setFileInputFiles`.
+/// `files` are absolute paths that must exist on disk.
+pub async fn file_upload(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    files: Vec<String>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let browser_ref = browser.clone();
+    let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
+    let backend_node_id = element.backend_dom_node_id.expect("checked above");
+    let count = files.len();
+    run_one_shot(&browser, cx, &format!("file_upload {ref_id}"), move |session, done| {
+        CdpSession::new(session).set_file_input_files(backend_node_id, &files, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "uploaded": count }))
+}
+
+/// CP8: mouse-based drag from one element to another (press at source centre,
+/// move, release at target centre). Drives pointer/sortable/canvas DnD; does NOT
+/// trigger HTML5-native DataTransfer drag-drop (a synthetic-mouse limitation).
+pub async fn drag(
+    browser: Entity<BrowserView>,
+    start_ref: &str,
+    end_ref: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (sx, sy) = element_center(&browser, start_ref, cx).await?;
+    let (ex, ey) = element_center(&browser, end_ref, cx).await?;
+
+    // none-button move to the source, press, two interpolated held-button moves
+    // (some DnD libs require movement deltas), then release at the target.
+    dispatch_mouse(&browser, cx, "mouseMoved", sx, sy, "none", 0, 0, 0).await?;
+    dispatch_mouse(&browser, cx, "mousePressed", sx, sy, "left", 1, 1, 0).await?;
+    dispatch_mouse(&browser, cx, "mouseMoved", (sx + ex) / 2.0, (sy + ey) / 2.0, "none", 1, 0, 0).await?;
+    dispatch_mouse(&browser, cx, "mouseMoved", ex, ey, "none", 1, 0, 0).await?;
+    dispatch_mouse(&browser, cx, "mouseReleased", ex, ey, "left", 0, 1, 0).await?;
+
+    Ok(serde_json::json!({ "from": [sx, sy], "to": [ex, ey] }))
+}
+
+/// CP8: synthetic drop of `data` (MIME `mime`, default text/plain) onto an
+/// element. Dispatches dragenter/dragover/drop with a DataTransfer. Cannot
+/// carry real files — use `file_upload` for file inputs.
+pub async fn drop(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    data: Option<String>,
+    mime: Option<String>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let browser_ref = browser.clone();
+    let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
+    let backend_node_id = element.backend_dom_node_id.expect("checked above");
+    run_one_shot(&browser, cx, &format!("drop {ref_id}"), move |session, done| {
+        try_drop_backend_node(session, backend_node_id, data.as_deref(), mime.as_deref(), done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "dropped": true }))
+}
+
+/// CP8: arm JS-dialog handling on the current page. Installs (once per page)
+/// overrides of `alert`/`confirm`/`prompt` that record the dialog and return per
+/// the given policy, then sets that policy. Returns the previously-recorded
+/// dialog (if any). Self-contained (no native dialog binding) — call this
+/// *before* the action that triggers the dialog; re-arm after navigation.
+pub async fn handle_dialog(
+    browser: Entity<BrowserView>,
+    accept: bool,
+    prompt_text: Option<String>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let accept_js = if accept { "true" } else { "false" };
+    let prompt_js = match &prompt_text {
+        Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
+        None => "null".into(),
+    };
+    let expr = format!(
+        "(function(accept, promptText){{ \
+           if(!window.__zedDialogInstalled){{ \
+             window.__zedDialogInstalled=true; window.__zedLastDialog=null; \
+             window.__zedDialogPolicy={{accept:true,promptText:null}}; \
+             const rec=(t,m,d)=>{{window.__zedLastDialog={{type:t,message:String(m==null?'':m),defaultValue:String(d==null?'':d)}};}}; \
+             window.alert=function(m){{rec('alert',m,'');}}; \
+             window.confirm=function(m){{rec('confirm',m,''); return !!window.__zedDialogPolicy.accept;}}; \
+             window.prompt=function(m,d){{rec('prompt',m,d); if(!window.__zedDialogPolicy.accept) return null; return window.__zedDialogPolicy.promptText!=null?window.__zedDialogPolicy.promptText:(d==null?'':d);}}; \
+           }} \
+           window.__zedDialogPolicy={{accept:accept,promptText:promptText}}; \
+           return window.__zedLastDialog; \
+         }})({accept_js}, {prompt_js})"
+    );
+    let raw = run_one_shot(&browser, cx, "handle_dialog", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "armed": true, "accept": accept, "last": unwrap_cdp_value(raw) }))
 }
 
 pub async fn navigate(

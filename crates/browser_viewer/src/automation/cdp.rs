@@ -92,6 +92,42 @@ impl<'a> CdpSession<'a> {
         )
     }
 
+    /// CP8: set the files on a `<input type=file>` by backend node id
+    /// (`DOM.enable` then `DOM.setFileInputFiles`). Paths must exist on disk.
+    pub fn set_file_input_files(
+        &self,
+        backend_node_id: i32,
+        files: &[String],
+        on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+    ) -> Result<()> {
+        let webview = self.session.webview.clone();
+        let params = serde_json::json!({
+            "files": files,
+            "backendNodeId": backend_node_id,
+        })
+        .to_string();
+        let completion: Completion<Value> = Rc::new(RefCell::new(Some(on_done)));
+        let enable_completion = completion.clone();
+        self.call_method(
+            "DOM.enable",
+            "{}",
+            Box::new(move |enable_result| match enable_result {
+                Err(err) => finish(&enable_completion, Err(err)),
+                Ok(_) => {
+                    let set_completion = completion.clone();
+                    let _ = call_devtools_on_webview(
+                        &webview,
+                        "DOM.setFileInputFiles",
+                        &params,
+                        Box::new(move |raw| {
+                            finish(&set_completion, raw.and_then(parse_cdp_response));
+                        }),
+                    );
+                }
+            }),
+        )
+    }
+
     /// Evaluate a JS expression in the page main world (`Runtime.evaluate`).
     pub fn evaluate_expression(
         &self,
