@@ -491,10 +491,16 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
         // Registered once at the top of the test body; nothing inline.
         RecordedAction::HandleDialog { .. } => Vec::new(),
         RecordedAction::VerifyElementVisible { target } => {
-            vec![format!("await expect({}).toBeVisible();", locator(target))]
+            vec![format!(
+                "await expect({}).toBeVisible();",
+                resilient_visible_locator(target)
+            )]
         }
         RecordedAction::VerifyListVisible { target } => {
-            vec![format!("await expect({}).toBeVisible();", locator(target))]
+            vec![format!(
+                "await expect({}).toBeVisible();",
+                resilient_visible_locator(target)
+            )]
         }
         RecordedAction::VerifyTextVisible { text } => {
             vec![format!(
@@ -583,6 +589,32 @@ fn num(v: f64) -> String {
     } else {
         format!("{v}")
     }
+}
+
+/// A *visibility-assertion* locator that is resilient to role/name attribution
+/// differences between our WebView2 snapshot and Playwright's Chromium (the same
+/// element can surface under different roles, or its name can come from text vs
+/// `<label>` vs `placeholder`). When we're relying on role+name (no durable
+/// structural selector), we OR together the standard Playwright accessors that
+/// could resolve the *same* element's accessible name — all derived from the
+/// element's own recorded name, no external heuristics — and `.first()` to stay
+/// single-element (so an over-matching branch can't trigger a strict-mode error
+/// or regress a currently-passing assertion).
+fn resilient_visible_locator(t: &Target) -> String {
+    let primary = locator(t);
+    // A durable structural selector (test-id / unique css) is already robust to
+    // role/name differences — don't dilute it.
+    if t.durable.is_some() || t.name.is_empty() {
+        return primary;
+    }
+    let n = js_str(&t.name);
+    format!(
+        "{primary}\
+         .or(page.getByLabel({n}, {{ exact: true }}))\
+         .or(page.getByPlaceholder({n}, {{ exact: true }}))\
+         .or(page.getByText({n}, {{ exact: true }}))\
+         .first()"
+    )
 }
 
 /// A single-quoted JS string literal with the necessary escapes.
@@ -791,6 +823,38 @@ mod tests {
         );
         let script = render(&r);
         assert!(!script.contains(".nth("));
+    }
+
+    #[test]
+    fn verify_visible_adds_resilient_or_chain_for_role_name_only() {
+        let r = rec(
+            "https://x.com",
+            vec![RecordedAction::VerifyElementVisible {
+                target: Target::new("search", "Search all labels"),
+            }],
+        );
+        let s = render(&r);
+        assert!(
+            s.contains("getByRole('search', { name: 'Search all labels', exact: true })")
+        );
+        assert!(s.contains(".or(page.getByLabel('Search all labels', { exact: true }))"));
+        assert!(s.contains(".or(page.getByPlaceholder('Search all labels', { exact: true }))"));
+        assert!(s.contains(".or(page.getByText('Search all labels', { exact: true }))"));
+        assert!(s.contains(".first()"));
+    }
+
+    #[test]
+    fn verify_visible_keeps_plain_locator_when_durable_present() {
+        let r = rec(
+            "https://x.com",
+            vec![RecordedAction::VerifyElementVisible {
+                target: Target::new("button", "Go")
+                    .with_durable(Some(DurableLoc::TestId("go-btn".into()))),
+            }],
+        );
+        let s = render(&r);
+        assert!(s.contains("await expect(page.getByTestId('go-btn')).toBeVisible();"));
+        assert!(!s.contains(".or("));
     }
 
     #[test]
