@@ -13,6 +13,7 @@ mod keys;
 mod navigate;
 mod session;
 mod snapshot;
+mod tabs;
 mod target;
 
 pub use action::{element_for_action, try_click_backend_node, try_type_backend_node};
@@ -21,7 +22,10 @@ pub use ipc::{DEFAULT_IPC_PORT, init as init_automation_ipc};
 pub use navigate::{WaitForOptions, normalize_navigate_url, wait_for, DEFAULT_NAV_TIMEOUT};
 pub use session::{AutomationSessionState, ElementRef, RefRegistry};
 pub use snapshot::{PageSnapshot, snapshot_from_ax_tree};
-pub use target::{resolve_automation_target, resolve_automation_target_global};
+pub use target::{
+    resolve_automation_target, resolve_automation_target_global,
+    resolve_automation_workspace_global,
+};
 
 use std::sync::Arc;
 use std::time::Instant;

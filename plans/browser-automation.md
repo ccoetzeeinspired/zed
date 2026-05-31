@@ -94,9 +94,10 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_wait_for` | `wait_for` | Load, text in title/body, or sleep seconds |
 | `browser_press_key` | `press_key` | Playwright-style key spec → CDP `Input.dispatchKeyEvent` (keyDown+keyUp); also backs `type`'s `submit:true` |
 | `browser_scroll` | `scroll` | `ref` → `scrollIntoView` (handles inner scrollers); else `window.scrollBy(dx,dy)`. Returns `{x,y,maxY}`. Fork extension (Playwright MCP has no scroll tool). |
+| `browser_tabs` | `tabs` | `action` = list / select / new / close (+ `index`, `url`). Operates on the **workspace** (`items_of_type::<BrowserView>`, `activate_item`, `close_item_by_id`), not CDP. Returns `{tabs:[{index,title,url,active}],count}`. |
 
 Tier 2 remaining (CP6, not started): `browser_select_option`,
-`browser_tabs`, `browser_take_screenshot`, `browser_hover`, `browser_evaluate`.
+`browser_take_screenshot`, `browser_hover`, `browser_evaluate`.
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -119,7 +120,7 @@ there.
 | **CP3** | Type into inputs (incl. React controlled fields) | Done |
 | **CP4** | Navigate + wait-for load/text | Done |
 | **CP5** | MCP adapter + `context_servers` + end-to-end agent | Done |
-| **CP6** | Tier 2 breadth | In progress — `browser_press_key`, `browser_scroll` done |
+| **CP6** | Tier 2 breadth | In progress — `browser_press_key`, `browser_scroll`, `browser_tabs` done |
 
 ### Verification log (2026-05-30)
 
@@ -152,6 +153,15 @@ there.
   `dy:100000` clamped to `y=maxY=5954`; `dy:-100000` → `y=0`; element-into-view
   `ref` (Brand filter) from top → `y=369`; top-nav `ref` from bottom → `y=0`.
   All confirmed by the deterministic `{x,y,maxY}` return (page `window.scrollX/Y`).
+
+### Verification log (CP6, `browser_tabs`)
+
+- **Unit:** `automation::tabs` — `build_json` indexing / count / active marking.
+- **Runtime (via MCP server):** from a single TrueLens tab — `list` (1, active);
+  `new https://www.google.com/` → 2 tabs, new one active; `list` (Google title
+  resolved, active `[1]`); `select 0` → active flips to TrueLens; `close 1` →
+  back to 1 tab. Tab focus + close **visually confirmed by the user** (workspace
+  z-order / WebView2 underlay correct).
 
 ### Known fixes during CP5 dogfood
 
@@ -271,7 +281,8 @@ Priority order from dogfood:
    Verified on Google + Takealot.
 2. ~~**`browser_scroll`**~~ — **Done.** Viewport delta + element-into-view,
    returns `{x,y,maxY}`. Verified on Takealot results.
-3. **`browser_tabs`** — list/switch when multiple browser tabs exist.
+3. ~~**`browser_tabs`**~~ — **Done.** list / select / new / close over workspace
+   browser tabs. Verified end-to-end.
 4. **`browser_take_screenshot`** — PNG for agent context (separate from snapshot).
 5. **`browser_select_option`**, **`browser_evaluate`**, **`browser_hover`**.
 

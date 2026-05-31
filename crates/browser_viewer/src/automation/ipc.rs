@@ -17,9 +17,15 @@ use gpui::{App, AsyncApp, Global};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::BrowserSettings;
 use crate::automation::commands;
 use crate::automation::navigate::{WaitForOptions, DEFAULT_NAV_TIMEOUT};
-use crate::automation::target::resolve_automation_target_global;
+use crate::automation::tabs;
+use crate::automation::target::{
+    resolve_automation_target_global, resolve_automation_workspace_global,
+};
+use gpui::SharedString;
+use settings::Settings as _;
 
 /// Default loopback port for MCP ↔ Zed automation.
 pub const DEFAULT_IPC_PORT: u16 = 19382;
@@ -164,6 +170,13 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
         request.params
     );
 
+    // `tabs` operates on the workspace, not a single page — and `list`/`new`
+    // must work even with zero browser tabs open, so it resolves its own
+    // target ahead of the page-level browser resolution below.
+    if request.method.as_str() == "tabs" {
+        return dispatch_tabs(request.params, cx).await;
+    }
+
     let browser = cx
         .update(|app| resolve_automation_target_global(app))
         .ok_or_else(|| {
@@ -260,6 +273,47 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
         "ping" => Ok(json!({ "status": "ok" })),
         other => Err(anyhow!("unknown IPC method {other:?}")),
     }
+}
+
+async fn dispatch_tabs(params: Value, cx: &mut AsyncApp) -> Result<Value> {
+    let (window, workspace) = cx
+        .update(|app| resolve_automation_workspace_global(app))
+        .ok_or_else(|| anyhow!("No Zed workspace window found"))?;
+
+    let action = params
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("list");
+
+    match action {
+        "list" => tabs::list(&workspace, cx),
+        "select" => {
+            let index = tab_index(&params)?;
+            tabs::select(workspace, window, index, cx).await
+        }
+        "close" => {
+            let index = tab_index(&params)?;
+            tabs::close(workspace, window, index, cx).await
+        }
+        "new" => {
+            let url = match params.get("url").and_then(|v| v.as_str()) {
+                Some(url) => SharedString::new(url.to_string()),
+                None => cx.update(|app| SharedString::new(BrowserSettings::get_global(app).homepage.clone())),
+            };
+            tabs::new_tab(workspace, window, url, cx).await
+        }
+        other => Err(anyhow!(
+            "unknown tabs action {other:?}; use list | select | new | close"
+        )),
+    }
+}
+
+fn tab_index(params: &Value) -> Result<usize> {
+    params
+        .get("index")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .ok_or_else(|| anyhow!("this tabs action requires params.index (a tab number from `list`)"))
 }
 
 fn ref_from_params(params: &Value) -> Result<String> {

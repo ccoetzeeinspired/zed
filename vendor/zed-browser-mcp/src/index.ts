@@ -156,6 +156,41 @@ server.tool(
 );
 
 server.tool(
+  "browser_tabs",
+  "List, select, open, or close browser tabs in the embedded Zed browser",
+  {
+    action: z
+      .enum(["list", "select", "new", "close"])
+      .optional()
+      .describe("Tab operation (defaults to list)"),
+    index: z
+      .number()
+      .int()
+      .optional()
+      .describe("0-based tab index for select/close (from a browser_tabs list)"),
+    url: z
+      .string()
+      .optional()
+      .describe("URL to open for action=new (defaults to the configured homepage)"),
+  },
+  async ({ action, index, url }) => {
+    const params: Record<string, unknown> = {};
+    if (action) params.action = action;
+    if (index != null) params.index = index;
+    if (url) params.url = url;
+    const result = (await requireZedOk(
+      await callZedAutomation("tabs", params),
+    )) as { tabs?: Array<{ index: number; title: string; url: string; active: boolean }>; count?: number };
+    const tabs = result.tabs ?? [];
+    const lines = tabs.map(
+      (t) => `${t.active ? "*" : " "} [${t.index}] ${t.title || "(untitled)"} — ${t.url}`,
+    );
+    const body = lines.length ? lines.join("\n") : "(no browser tabs open)";
+    return textContent(`### Browser tabs (${result.count ?? tabs.length})\n${body}`);
+  },
+);
+
+server.tool(
   "browser_wait_for",
   "Wait for text to appear or a specified time to pass in the embedded Zed browser tab",
   {
