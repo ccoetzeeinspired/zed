@@ -5,9 +5,9 @@
 This is a personal fork of `zed-industries/zed`, hosted at
 `https://github.com/ccoetzeeinspired/zed`. The notes below describe how this
 fork differs from upstream, why those differences exist, and the workflow for
-keeping it in sync. These notes live only on the `pdf-viewer` and
-`claude-only` branches so that `main` stays a byte-for-byte mirror of
-upstream and never produces sync conflicts on this file.
+keeping it in sync. These notes live on `cccl-main` (the fork's canonical main);
+the upstream-mirror branch `main` is kept clean of them so it never conflicts on
+sync.
 
 ## Specs and plans (under `plans/`)
 
@@ -15,10 +15,12 @@ Design documents for in-flight or upcoming features live under `plans/`.
 Read the relevant plan before starting implementation work on the
 corresponding feature.
 
-| Plan                                            | Status        | Branch (future)      |
-|-------------------------------------------------|---------------|----------------------|
-| [`browser-viewer.md`](plans/browser-viewer.md)  | Draft, ready  | `browser-viewer`     |
-| [`browser-automation.md`](plans/browser-automation.md) | CP0–CP5 shipped | `browser-automation` |
+| Plan                                            | Status                                  |
+|-------------------------------------------------|-----------------------------------------|
+| [`browser-viewer.md`](plans/browser-viewer.md)  | Shipped (in `cccl-main`)                |
+| [`browser-automation.md`](plans/browser-automation.md) | CP0–CP13 shipped — full Playwright MCP parity (51 tools) |
+
+All shipped features now live in `cccl-main` (see Branches below).
 
 ## Remotes
 
@@ -29,19 +31,26 @@ corresponding feature.
 
 ## Branches
 
-- **`main`** — tracks `origin/main`, which mirrors `upstream/main`. No local
-  modifications. Only used as a rebase base when syncing.
-- **`pdf-viewer`** — carries the PDF viewer crate, the msvc_spectre_libs
-  build stub, and this CLAUDE.md addition.
-- **`claude-only`** — built on top of `pdf-viewer`; gates the agent panel
-  to claude-acp and vendors the ACP bridge.
-- **`browser-viewer`** — built on top of `claude-only`; adds the in-editor
-  WebView2 browser tab with composition-mode rendering, CDP keyboard,
-  design-mode element picker + drawing overlay + screenshot bundle,
-  and the GPUI scene `Cutout` primitive (see below).
-- **`browser-automation`** — built on top of `browser-viewer`; adds agent
-  MCP control of the embedded browser tab (CDP automation + `zed-browser-mcp`).
-  See [`plans/browser-automation.md`](plans/browser-automation.md).
+The fork moved from a stacked feature-branch chain to a **product-main model**
+(2026-05-31). All the fork's features are now cumulative in `cccl-main`.
+
+- **`cccl-main`** — the fork's **canonical, stable main** and the GitHub
+  **default branch**. Protected: changes land **via PR only** (self-merge is
+  fine; the owner can admin-override in emergencies). Everything branches off it
+  and PRs back into it. Contains the whole fork: PDF viewer, claude-only agent
+  gating + vendored ACP bridge, the WebView2 browser tab (composition rendering,
+  CDP keyboard, design mode, `Cutout` primitive), and the full browser-automation
+  MCP surface (51 Playwright-shaped tools).
+- **`cccl-staging`** — integration branch (direct pushes allowed). Stage/merge
+  work here for a combined check, then PR `cccl-staging` → `cccl-main`. May run
+  ahead of `cccl-main`.
+- **`main`** — upstream mirror only: tracks `origin/main` ⇒ `upstream/main`,
+  byte-for-byte, no fork modifications. Used solely as the merge source when
+  syncing upstream changes into `cccl-main`.
+- **Legacy feature branches** (`pdf-viewer`, `claude-only`, `browser-viewer`,
+  `browser-automation`) — the original stacked chain. Their work is fully folded
+  into `cccl-main` (which was cut from `browser-automation`'s tip). Kept for
+  history; **do not base new work on them** — branch off `cccl-main` instead.
 
 ## What this fork adds, and why
 
@@ -598,44 +607,35 @@ error: only metadata stub found for `dylib` dependency `std` ...
 - **How to apply:** run `cargo clean` once after a toolchain bump,
   then build normally. Costs the ~5 min from-scratch build time.
 
-## Sync workflow — pulling upstream changes into this fork
+## Sync workflow — pulling upstream changes into `cccl-main`
 
-Run this whenever you want to incorporate new upstream Zed commits.
-The branch chain is `main` → `pdf-viewer` → `claude-only` →
-`browser-viewer` → `browser-automation`; each rebases onto its predecessor.
+Run this to incorporate new upstream Zed commits. The model is: keep `main` a
+clean upstream mirror, then **merge** `main` into `cccl-main` via a PR (because
+`cccl-main` is shared + protected — never rebase or force-push it).
 
 ```powershell
-# 1. Update local main from upstream
+# 1. Update the upstream mirror (main stays byte-for-byte upstream)
 git fetch upstream
 git checkout main
 git merge --ff-only upstream/main
-git push origin main                  # keep the fork's main current too
+git push origin main
 
-# 2. Rebase pdf-viewer onto the new main
-git checkout pdf-viewer
-git rebase main
-#    ...resolve conflicts if any...
+# 2. Integrate upstream into cccl-main on a sync branch, then PR it in
+git checkout cccl-main
+git pull
+git checkout -b sync/upstream-<date>
+git merge main                        # MERGE (not rebase) — cccl-main is shared
+#    ...resolve conflicts (see hot spots below)...
 cargo build -j 4                      # verify (see Build notes for why -j 4)
-git push --force-with-lease origin pdf-viewer
-
-# 3. Rebase claude-only onto the new pdf-viewer
-git checkout claude-only
-git rebase pdf-viewer
-cargo build -j 4
-git push --force-with-lease origin claude-only
-
-# 4. Rebase browser-viewer onto the new claude-only
-git checkout browser-viewer
-git rebase claude-only
-cargo build -j 4
-git push --force-with-lease origin browser-viewer
-
-# 5. Rebase browser-automation onto the new browser-viewer
-git checkout browser-automation
-git rebase browser-viewer
-cargo build -j 4
-git push --force-with-lease origin browser-automation
+git push -u origin sync/upstream-<date>
+gh pr create --base cccl-main --head sync/upstream-<date> --title "Sync upstream <date>"
+# review, then merge the PR into cccl-main
 ```
+
+Feature work: `git checkout cccl-main && git pull && git checkout -b feat/<name>`,
+build, push, open a PR into `cccl-main` (optionally stage via `cccl-staging`
+first). A feature branch MAY be rebased onto `cccl-main` before its PR for a
+clean history; `cccl-main` itself is merge-only.
 
 ### Conflict hot spots
 
@@ -665,9 +665,9 @@ Files this fork modifies in code paths upstream churns frequently:
   **`crates/gpui_wgpu/src/wgpu_renderer.rs`** — no-op `Cutouts` arm
   in the `match batch` block; if upstream adds variants there, just
   put ours back next to `Surfaces`.
-- **`agent_panel.rs`** / **`agent_configuration.rs`** etc. (on
-  `claude-only` branch) — the claude-acp gating points. See "Agent
-  panel — gated to Claude Code only" section.
+- **`agent_panel.rs`** / **`agent_configuration.rs`** etc. — the claude-acp
+  gating points (now in `cccl-main`). See "Agent panel — gated to Claude
+  Code only" section.
 - **`crates/settings_content/src/settings_content.rs`** and
   **`crates/settings/src/vscode_import.rs`** — `browser` field added
   alongside other settings. Re-add in the right position.
@@ -682,21 +682,22 @@ conflict — upstream doesn't touch them.
 
 ### Rebase vs. merge
 
-We rebase, not merge. Reasons:
-
-- **Why:** keeps `pdf-viewer` as a clean, linear set of "PDF viewer"
-  commits on top of current upstream. Easier to inspect, easier to
-  eventually open as an upstream PR if desired.
-- **How to apply:** always rebase `pdf-viewer` onto `main`; never merge
-  `main` into `pdf-viewer`. Push with `--force-with-lease`, never plain
-  `--force`.
+- **`cccl-main` is merge-only.** It's shared + protected, so never rebase or
+  force-push it — integrate upstream via the sync PR above (a merge commit).
+- **Feature branches may rebase.** A short-lived `feat/*` branch off `cccl-main`
+  can be rebased onto `cccl-main` before its PR for a clean, linear feature
+  history. Push those with `--force-with-lease`, never plain `--force`.
 
 ## What NOT to do
 
-- **Never push to `upstream`** — you don't have write access, but the
-  attempt will still surprise you. Push only to `origin`.
+- **Never push to `upstream`** — you don't have write access, but the attempt
+  will still surprise you. Push only to `origin`.
+- **Never rebase or force-push `cccl-main` (or `cccl-staging`).** They're shared;
+  changes go in via PR / merge. Direct pushes to `cccl-main` are blocked by
+  branch protection.
 - **Never commit fork-specific changes to `main`.** `main` exists solely to
-  mirror upstream. All fork changes go on `pdf-viewer` (or other feature
-  branches off `main`).
-- **Don't try to upstream the `msvc_spectre_libs` stub.** It's a personal
-  build workaround, not a fix appropriate for the source repo.
+  mirror `upstream/main` byte-for-byte. All fork work goes through `cccl-main`.
+- **Don't base new work on the legacy branches** (`pdf-viewer`, `claude-only`,
+  `browser-viewer`, `browser-automation`) — branch off `cccl-main`.
+- **Don't try to upstream the `msvc_spectre_libs` stub.** It's a personal build
+  workaround, not a fix appropriate for the source repo.
