@@ -635,6 +635,66 @@ server.tool(
   },
 );
 
+// ---- CP13: assertions (verify_*) — pass silently, throw on failure ----
+
+server.tool(
+  "browser_verify_element_visible",
+  "Assert that a snapshot-ref element is visible in the embedded Zed browser tab (errors if not)",
+  {
+    ref: z.string().optional().describe("Snapshot ref to assert visible"),
+    target: z.string().optional().describe("Alias for ref"),
+  },
+  async ({ ref, target }) => {
+    const elementRef = ref ?? target;
+    if (!elementRef) throw new Error("browser_verify_element_visible requires ref");
+    await requireZedOk(await callZedAutomation("verify_element_visible", { ref: elementRef }));
+    return textContent(`✓ ${elementRef} is visible`);
+  },
+);
+
+server.tool(
+  "browser_verify_list_visible",
+  "Assert a snapshot-ref list is visible and has at least one item (errors if not)",
+  {
+    ref: z.string().optional().describe("Snapshot ref of the list"),
+    target: z.string().optional().describe("Alias for ref"),
+  },
+  async ({ ref, target }) => {
+    const elementRef = ref ?? target;
+    if (!elementRef) throw new Error("browser_verify_list_visible requires ref");
+    const r = (await requireZedOk(
+      await callZedAutomation("verify_list_visible", { ref: elementRef }),
+    )) as { items?: number };
+    return textContent(`✓ ${elementRef} is a visible list (${r.items ?? "?"} items)`);
+  },
+);
+
+server.tool(
+  "browser_verify_text_visible",
+  "Assert text is visible on the page in the embedded Zed browser tab (errors if not)",
+  { text: z.string().describe("Text expected to be visible") },
+  async ({ text }) => {
+    await requireZedOk(await callZedAutomation("verify_text_visible", { text }));
+    return textContent(`✓ text ${JSON.stringify(text)} is visible`);
+  },
+);
+
+server.tool(
+  "browser_verify_value",
+  "Assert a snapshot-ref element's value equals the expected value (errors if not)",
+  {
+    ref: z.string().optional().describe("Snapshot ref of the input/element"),
+    target: z.string().optional().describe("Alias for ref"),
+    value: z.string().describe("Expected value"),
+  },
+  async ({ ref, target, value }) => {
+    const elementRef = ref ?? target;
+    if (!elementRef) throw new Error("browser_verify_value requires ref");
+    await requireZedOk(await callZedAutomation("verify_value", { ref: elementRef, value }));
+    return textContent(`✓ ${elementRef} value equals ${JSON.stringify(value)}`);
+  },
+);
+
 server.tool(
   "browser_take_screenshot",
   "Take a screenshot (PNG/JPEG) of the embedded Zed browser tab",

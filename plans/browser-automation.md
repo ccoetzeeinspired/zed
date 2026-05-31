@@ -1,8 +1,8 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP12 shipped and verified (47-tool surface; CP12 = storage —
-cookies / local / session / storage_state, incl. real auth capture+restore);
-CP13 (verify_*) left to **full** Playwright MCP parity (see §9)  
+**Status:** CP0–CP13 shipped and verified — **full Playwright MCP parity reached**
+(51-tool surface; CP13 = verify_* assertions). Only CP14 (network request
+mocking) remains deferred; documented divergences in §9.3.  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
 **Last updated:** 2026-05-31
@@ -116,8 +116,9 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_cookie_get`/`_set`/`_list`/`_delete`/`_clear` | `cookie_*` | CDP `Network` cookies (httpOnly-aware) (CP12). |
 | `browser_localstorage_*` / `browser_sessionstorage_*` (get/set/list/delete/clear) | `storage_*` (+`store`) | `evaluate` over the storage APIs (CP12). |
 | `browser_storage_state` / `browser_set_storage_state` | `storage_state` / `set_storage_state` | Capture/restore cookies + storage (auth reuse); MCP server does file I/O (CP12). |
+| `browser_verify_element_visible` / `_list_visible` / `_text_visible` / `_value` | `verify_*` | DOM assertions — pass or error (CP13). |
 
-**CP6–CP12 complete** — 47 tools shipped.
+**CP6–CP13 complete — 51 tools shipped. Full Playwright MCP parity reached** (all non-divergent tools; see §9 divergences).
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -147,6 +148,7 @@ there.
 | **CP10** | Observation: console + network (read-only, doc-start JS instrumentation) | Done |
 | **CP11** | Emulation + PDF (resize, pdf_save) | Done |
 | **CP12** | Storage (cookies, local/session storage, storage_state) | Done |
+| **CP13** | Test assertions (verify_element/list/text/value) — **full parity reached** | Done |
 
 ### Verification log (2026-05-30)
 
@@ -294,6 +296,15 @@ Driven through the MCP server against a full-viewport overlay that shows a live
   the SPA renders `/` as login regardless of auth, so `/dashboard` is the true
   test. (cookie_get/delete, *storage_get/delete, sessionstorage_* share the
   verified backends.)
+
+### Verification log (CP13 — user-confirmed against a visible fixture)
+
+Battery over a fixture (button "VISIBLE_TEXT_99", a 3-item list, an input
+`EXPECTED_VAL`) — each assertion **passed when true and errored when false**:
+- `verify_element_visible(e2)` ✓; after `display:none` → errored "not visible".
+- `verify_list_visible(e4)` ✓ (3 items).
+- `verify_text_visible("VISIBLE_TEXT_99")` ✓; absent text → errored.
+- `verify_value(e11,"EXPECTED_VAL")` ✓; wrong value → errored with actual.
 
 ### Follow-ups discovered during CP7 verification — ALL FIXED + user-verified
 
@@ -498,7 +509,7 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 | `browser_cookie_*` (get/set/list/delete/clear) | ✅ CDP `Network.*Cookies` (sees/sets httpOnly) | CP12 |
 | `browser_localstorage_*` / `browser_sessionstorage_*` | ✅ `evaluate` over storage APIs (shared backend, `store` param) | CP12 |
 | `browser_storage_state` / `browser_set_storage_state` | ✅ compose cookies + storage to/from JSON (current origin) | CP12 |
-| `browser_verify_element_visible` / `_list_visible` / `_text_visible` / `_value` | ➕ assert over AX snapshot + DOM | CP13 |
+| `browser_verify_element_visible` / `_list_visible` / `_text_visible` / `_value` | ✅ DOM assertions (pass→ok, fail→error); element/list/value by ref, text via innerText | CP13 |
 | `browser_route` / `_unroute` / `_route_list` / `network_state_set` | ➕ CDP `Fetch` interception | CP14 (deferred) |
 | `browser_run_code_unsafe` | ⛔ no Playwright runtime → use `browser_evaluate` | — |
 | `browser_generate_locator` | ⛔ Playwright codegen → use `browser_snapshot` refs | — |
@@ -552,8 +563,11 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
   TrueLens auth session:** captured state → cleared → `/dashboard` kicked to
   login → `set_storage_state` restored cookie+localStorage → `/dashboard` loaded
   authenticated, no re-login.
-- **CP13 — testing assertions.** `browser_verify_*` evaluated against the AX
-  snapshot + DOM. (`generate_locator` stays a divergence.)
+- **CP13 — testing assertions. DONE + user-verified.** `browser_verify_element_visible`
+  / `_list_visible` / `_value` (by snapshot ref) + `_text_visible` (innerText).
+  Pass → `{ok:true}`, fail → error (verified both: assertions correctly errored
+  on absent text, wrong value, and a hidden element). (`generate_locator` stays a
+  divergence.) **This completes full Playwright MCP parity.**
 - **CP14 — network mocking (deferred).** `browser_route`/`_unroute`/`_route_list`/
   `network_state_set` via CDP `Fetch` domain interception.
 

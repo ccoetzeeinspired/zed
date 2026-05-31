@@ -455,13 +455,20 @@ file; MCP server does file I/O; current-origin, not Playwright's multi-origin).
 **Verified on a real TrueLens auth session:** captured → cleared (→ /dashboard
 kicked to login) → restored (→ /dashboard authenticated, no re-login).
 
-**Next: full Playwright MCP parity (CP13 — last one).** §9 has the matrix +
-breakdown: verify_* assertions (CP13); network mocking deferred (CP14).
-Documented divergences (won't replicate): `run_code_unsafe`, `generate_locator`,
-tracing/video/annotate, `get_config`.
+**CP13 done + user-verified (2026-05-31) — FULL PLAYWRIGHT MCP PARITY REACHED.**
+`browser_verify_element_visible` / `_list_visible` / `_value` (by snapshot ref) +
+`_text_visible` (innerText) — DOM assertions that pass (`{ok:true}`) or error.
+Verified both directions (correctly errored on absent text / wrong value /
+hidden element).
+
+**Status: 51-tool surface; CP7–CP13 complete.** Only **CP14** (network request
+mocking via CDP `Fetch`) remains, deferred by choice. Documented divergences
+(intentionally not replicated): `run_code_unsafe` (→ `browser_evaluate`),
+`generate_locator` (→ `browser_snapshot` refs), `annotate` (→ design mode),
+tracing/video/`resume`, `get_config`. See `plans/browser-automation.md` §9.
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through 47 MCP tools registered as the `zed-browser` context server: navigation
+through 51 MCP tools registered as the `zed-browser` context server: navigation
 (`navigate`, `navigate_back`), inspection (`snapshot`, `evaluate`,
 `take_screenshot`), element interaction (`click`, `type`, `fill_form`,
 `select_option`, `hover`, `press_key`, `scroll`, `file_upload`, `drag`, `drop`),
@@ -469,7 +476,9 @@ coordinate "vision" mouse (`mouse_move_xy`/`_click_xy`/`_down`/`_up`/`_drag_xy`/
 `_wheel`), dialogs (`handle_dialog`), tab management (`tabs`, `close`),
 observation (`console_messages`, `network_requests`, `network_request`),
 emulation/output (`resize`, `pdf_save`), storage (`cookie_*`, `localstorage_*`,
-`sessionstorage_*`, `storage_state`, `set_storage_state`), and sync (`wait_for`). Tools hit the page via CDP (accessibility
+`sessionstorage_*`, `storage_state`, `set_storage_state`), assertions
+(`verify_element_visible`/`_list_visible`/`_text_visible`/`_value`), and sync
+(`wait_for`). Tools hit the page via CDP (accessibility
 snapshot + DOM scripts), with coordinate-based control as a fallback.
 
 **Stack:**

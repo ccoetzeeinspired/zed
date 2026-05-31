@@ -484,6 +484,31 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .ok_or_else(|| anyhow!("set_storage_state requires params.state"))?;
             commands::set_storage_state(browser, state, cx).await
         }
+        "verify_element_visible" => {
+            let ref_id = ref_from_params(&request.params)?;
+            commands::verify_element_visible(browser, &ref_id, cx).await
+        }
+        "verify_list_visible" => {
+            let ref_id = ref_from_params(&request.params)?;
+            commands::verify_list_visible(browser, &ref_id, cx).await
+        }
+        "verify_text_visible" => {
+            let text = request
+                .params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("verify_text_visible requires params.text"))?;
+            commands::verify_text_visible(browser, text, cx).await
+        }
+        "verify_value" => {
+            let ref_id = ref_from_params(&request.params)?;
+            let value = request
+                .params
+                .get("value")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("verify_value requires params.value"))?;
+            commands::verify_value(browser, &ref_id, value, cx).await
+        }
         "navigate" => {
             let url = request
                 .params

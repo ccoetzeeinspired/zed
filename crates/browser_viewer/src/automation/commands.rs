@@ -1126,6 +1126,89 @@ pub async fn set_storage_state(
     Ok(serde_json::json!({ "cookies": cookies, "items": items }))
 }
 
+// ---- CP13: assertions (verify_*). Pass → {ok:true}; fail → Err. ----
+
+const VISIBLE_SCRIPT: &str = r#"function() {
+  const r = this.getBoundingClientRect();
+  const s = window.getComputedStyle(this);
+  return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+}"#;
+
+const VALUE_SCRIPT: &str = r#"function() {
+  return ('value' in this) ? String(this.value) : String(this.textContent || '');
+}"#;
+
+const LIST_SCRIPT: &str = r#"function() {
+  const r = this.getBoundingClientRect();
+  const s = window.getComputedStyle(this);
+  const visible = r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+  const items = this.querySelectorAll('li, [role=listitem], [role=option]').length || this.children.length;
+  return { visible: visible, items: items };
+}"#;
+
+async fn eval_on_ref(
+    browser: &Entity<BrowserView>,
+    ref_id: &str,
+    script: &'static str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let element = cx.update(|app| resolve_ref_on_browser(browser, ref_id, app))?;
+    let backend_node_id = element.backend_dom_node_id.expect("checked above");
+    let raw = run_one_shot(browser, cx, &format!("verify {ref_id}"), move |session, done| {
+        invoke_on_backend_node(session, backend_node_id, script, None, done)
+    })
+    .await?;
+    Ok(unwrap_cdp_value(raw))
+}
+
+/// Assert a snapshot-ref element is visible. (We verify by ref — the snapshot is
+/// already role+name keyed — vs Playwright's role+name lookup.)
+pub async fn verify_element_visible(browser: Entity<BrowserView>, ref_id: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let visible = eval_on_ref(&browser, ref_id, VISIBLE_SCRIPT, cx).await?.as_bool().unwrap_or(false);
+    if !visible {
+        return Err(anyhow!("element {ref_id} is not visible"));
+    }
+    Ok(serde_json::json!({ "ok": true, "ref": ref_id }))
+}
+
+/// Assert a snapshot-ref list is visible and has at least one item.
+pub async fn verify_list_visible(browser: Entity<BrowserView>, ref_id: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let res = eval_on_ref(&browser, ref_id, LIST_SCRIPT, cx).await?;
+    let visible = res.get("visible").and_then(|v| v.as_bool()).unwrap_or(false);
+    let items = res.get("items").and_then(|v| v.as_i64()).unwrap_or(0);
+    if !visible {
+        return Err(anyhow!("list {ref_id} is not visible"));
+    }
+    if items == 0 {
+        return Err(anyhow!("list {ref_id} has no visible items"));
+    }
+    Ok(serde_json::json!({ "ok": true, "ref": ref_id, "items": items }))
+}
+
+/// Assert `text` is visible anywhere on the page (`innerText` includes it).
+pub async fn verify_text_visible(browser: Entity<BrowserView>, text: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let needle = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+    let expr = format!("(()=>document.body.innerText.includes({needle}))()");
+    let raw = run_one_shot(&browser, cx, "verify_text", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    if !unwrap_cdp_value(raw).as_bool().unwrap_or(false) {
+        return Err(anyhow!("text {text:?} is not visible on the page"));
+    }
+    Ok(serde_json::json!({ "ok": true, "text": text }))
+}
+
+/// Assert a snapshot-ref element's value (input value, else text) equals `expected`.
+pub async fn verify_value(browser: Entity<BrowserView>, ref_id: &str, expected: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let actual_val = eval_on_ref(&browser, ref_id, VALUE_SCRIPT, cx).await?;
+    let actual = actual_val.as_str().unwrap_or("");
+    if actual != expected {
+        return Err(anyhow!("value mismatch on {ref_id}: expected {expected:?}, got {actual:?}"));
+    }
+    Ok(serde_json::json!({ "ok": true, "ref": ref_id, "value": actual }))
+}
+
 pub async fn navigate(
     browser: Entity<BrowserView>,
     url: &str,
