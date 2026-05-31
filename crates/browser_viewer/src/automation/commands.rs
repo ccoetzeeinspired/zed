@@ -808,6 +808,69 @@ pub async fn mouse_wheel(
     Ok(serde_json::json!({ "x": x, "y": y, "deltaX": delta_x, "deltaY": delta_y }))
 }
 
+// ---- CP10: console + network observation (reads page-side instrumentation) ----
+
+/// Read buffered console messages (`console.*` + uncaught errors). Optional
+/// `level` filter (log/info/warn/error/debug); `clear` empties the buffer after.
+pub async fn console_messages(
+    browser: Entity<BrowserView>,
+    level: Option<String>,
+    clear: bool,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let level_js = match &level {
+        Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
+        None => "null".into(),
+    };
+    let clear_js = if clear { "window.__zedConsole=[];" } else { "" };
+    let expr = format!(
+        "(()=>{{ const a=window.__zedConsole||[]; const lvl={level_js}; \
+          const r=(lvl?a.filter(m=>m.level===lvl):a).slice(); {clear_js} return r; }})()"
+    );
+    let raw = run_one_shot(&browser, cx, "console_messages", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    let messages = unwrap_cdp_value(raw);
+    let count = messages.as_array().map(|a| a.len()).unwrap_or(0);
+    Ok(serde_json::json!({ "messages": messages, "count": count }))
+}
+
+/// Read buffered network requests (fetch / XHR). `clear` empties after reading.
+pub async fn network_requests(
+    browser: Entity<BrowserView>,
+    clear: bool,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let clear_js = if clear { "window.__zedNetwork=[];" } else { "" };
+    let expr = format!(
+        "(()=>{{ const a=window.__zedNetwork||[]; const r=a.slice(); {clear_js} return r; }})()"
+    );
+    let raw = run_one_shot(&browser, cx, "network_requests", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    let requests = unwrap_cdp_value(raw);
+    let count = requests.as_array().map(|a| a.len()).unwrap_or(0);
+    Ok(serde_json::json!({ "requests": requests, "count": count }))
+}
+
+/// Read a single buffered network request by its `id`.
+pub async fn network_request(
+    browser: Entity<BrowserView>,
+    id: i64,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let expr = format!(
+        "(()=>{{ const a=window.__zedNetwork||[]; return a.find(r=>r.id==={id})||null; }})()"
+    );
+    let raw = run_one_shot(&browser, cx, "network_request", move |session, done| {
+        CdpSession::new(session).evaluate_expression(&expr, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "request": unwrap_cdp_value(raw) }))
+}
+
 pub async fn navigate(
     browser: Entity<BrowserView>,
     url: &str,

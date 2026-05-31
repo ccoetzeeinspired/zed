@@ -430,20 +430,30 @@ step-by-step on-screen.
 via CDP `Input.dispatchMouseEvent`. Coords are explicit per call (no cursor
 tracking between calls). Verified on-screen via a coordinate overlay.
 
-**Next: full Playwright MCP parity (CP10+).** The plan's §9 has a full parity
-matrix + checkpoint breakdown: console + network read-only via
-`GetDevToolsProtocolEventReceiver` buffers (CP10); resize + pdf (CP11); storage
-(CP12); verify_* assertions (CP13); network mocking deferred (CP14). Documented
-divergences (won't replicate): `run_code_unsafe`, `generate_locator`, tracing/
-video/annotate, `get_config`.
+**CP10 done + user-verified (2026-05-31):** console + network observation —
+`browser_console_messages`, `browser_network_requests`, `browser_network_request`.
+Implemented via **document-start JS instrumentation** (`automation/instrumentation.rs`,
+injected by `AddScriptToExecuteOnDocumentCreated` next to the design-mode
+script) — transparently wraps `console.*`/error events + `fetch`/`XHR` into
+page-side ring buffers, read back via `evaluate`. Chosen over CDP
+`GetDevToolsProtocolEventReceiver` for composition-mode reliability. Coverage:
+console.* + uncaught errors (not browser-internal); fetch/XHR with status+timing
+(not subresources). Verified against the browser's own DevTools.
+
+**Next: full Playwright MCP parity (CP11+).** The plan's §9 has a full parity
+matrix + checkpoint breakdown: resize + pdf (CP11); storage (CP12); verify_*
+assertions (CP13); network mocking deferred (CP14). Documented divergences
+(won't replicate): `run_code_unsafe`, `generate_locator`, tracing/video/annotate,
+`get_config`.
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through 25 MCP tools registered as the `zed-browser` context server: navigation
+through 28 MCP tools registered as the `zed-browser` context server: navigation
 (`navigate`, `navigate_back`), inspection (`snapshot`, `evaluate`,
 `take_screenshot`), element interaction (`click`, `type`, `fill_form`,
 `select_option`, `hover`, `press_key`, `scroll`, `file_upload`, `drag`, `drop`),
 coordinate "vision" mouse (`mouse_move_xy`/`_click_xy`/`_down`/`_up`/`_drag_xy`/
-`_wheel`), dialogs (`handle_dialog`), tab management (`tabs`, `close`), and
+`_wheel`), dialogs (`handle_dialog`), tab management (`tabs`, `close`),
+observation (`console_messages`, `network_requests`, `network_request`), and
 sync (`wait_for`). Tools hit the page via CDP (accessibility
 snapshot + DOM scripts), with coordinate-based control as a fallback.
 

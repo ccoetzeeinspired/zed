@@ -1,7 +1,7 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP9 shipped and verified (25-tool surface; CP9 = coordinate
-"vision" mouse tools); CP10+ roadmap to **full** Playwright MCP parity in §9  
+**Status:** CP0–CP10 shipped and verified (28-tool surface; CP10 = console +
+network observation); CP11+ roadmap to **full** Playwright MCP parity in §9  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
 **Last updated:** 2026-05-31
@@ -108,8 +108,10 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_drop` | `drop` | Synthetic HTML5 drop (data/MIME; not files — use file_upload) (CP8). |
 | `browser_handle_dialog` | `handle_dialog` | JS-override of alert/confirm/prompt via `evaluate`; arm-then-trigger (CP8). |
 | `browser_mouse_move_xy` / `_click_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | `mouse_*` | Coordinate ("vision") mouse via CDP `Input.dispatchMouseEvent`; explicit viewport CSS-px coords (CP9). |
+| `browser_console_messages` | `console_messages` | Read buffered `console.*` + uncaught errors (doc-start JS instrumentation); `level` filter, `clear` (CP10). |
+| `browser_network_requests` / `browser_network_request` | `network_requests` / `network_request` | Read buffered fetch/XHR (method/status/timing) from JS instrumentation; list or by id (CP10). |
 
-**CP6–CP9 complete** — 25 tools shipped (Tier 1 + Tier 2 + parity fills + input interactions + coordinate vision).
+**CP6–CP10 complete** — 28 tools shipped.
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -136,6 +138,7 @@ there.
 | **CP7** | Parity fills (click options, wait_for textGone, type slowly, navigate_back, fill_form, close) | Done |
 | **CP8** | Input interactions (file_upload, drag, drop, handle_dialog) | Done |
 | **CP9** | Coordinate "vision" mouse tools (move/click/down/up/drag/wheel xy) | Done |
+| **CP10** | Observation: console + network (read-only, doc-start JS instrumentation) | Done |
 
 ### Verification log (2026-05-30)
 
@@ -253,6 +256,15 @@ Driven through the MCP server against a full-viewport overlay that shows a live
 - `mouse_drag_xy(200,550→800,550)` → red start, blue end (button held).
 - `mouse_wheel(deltaY 240)` → `wheel 0,240`.
 
+### Verification log (CP10 — user-confirmed against the browser's own DevTools)
+
+- `console_messages` — triggered `console.log/warn/error("ZED_*_42")`; the tool
+  returned all three with correct levels, and the **same** messages appeared in
+  the user's DevTools Console.
+- `network_requests` — `fetch("…?zedprobe=42")` → tool returned
+  `#1 GET 200 … (489ms)`; the user saw the same request (status 200) in the
+  DevTools Network tab. `network_request(id:1)` returned the full record.
+
 ### Follow-ups discovered during CP7 verification — ALL FIXED + user-verified
 
 Per the "fix anomalies each CP" practice, all four were fixed in the CP7 batch
@@ -300,6 +312,9 @@ crates/browser_viewer/src/
     action.rs       — click/type CDP scripts, actionability
     navigate.rs     — URL normalize, wait-for
     commands.rs     — awaitable MCP/IPC command handlers
+    keys.rs         — Playwright-style key spec → CDP fields (CP6)
+    tabs.rs         — browser_tabs / close over workspace items (CP6/CP7)
+    instrumentation.rs — doc-start console/network JS capture (CP10)
     ipc.rs          — TCP listener + GPUI dispatch loop
   webview2_host.rs  — call_devtools_protocol
   browser_viewer.rs — dev actions + init_automation_ipc
@@ -446,8 +461,8 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 | `browser_drop` | ✅ synthetic HTML5 drop (data/MIME; not files — use file_upload) | CP8 |
 | `browser_handle_dialog` | ✅ JS-override (`evaluate`) — arm-then-trigger; not native `ScriptDialogOpening` | CP8 |
 | `browser_mouse_click_xy` / `_move_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | ✅ CDP `Input.dispatchMouseEvent` (vision; explicit coords) | CP9 |
-| `browser_console_messages` | ➕ `GetDevToolsProtocolEventReceiver` buffer | CP10 |
-| `browser_network_requests` / `browser_network_request` | ➕ `Network.*` event buffer (read-only) | CP10 |
+| `browser_console_messages` | ✅ doc-start JS instrumentation (console.* + errors) read via `evaluate` | CP10 |
+| `browser_network_requests` / `browser_network_request` | ✅ doc-start JS instrumentation (fetch/XHR) read via `evaluate` | CP10 |
 | `browser_resize` | ➕ CDP `Emulation.setDeviceMetricsOverride` | CP11 |
 | `browser_pdf_save` | ➕ CDP `Page.printToPDF` | CP11 |
 | `browser_cookie_*` (get/set/list/delete/clear) | ➕ CDP `Network.*Cookies` | CP12 |
@@ -482,12 +497,18 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
   (move/click/down/up/drag/wheel) via `Input.dispatchMouseEvent`. Coordinates are
   explicit per call (we don't track a cursor between calls) — a small divergence
   from Playwright's implicit-current-position `mouse_down`/`mouse_up`.
-- **CP10 — observation infra (console + network, read-only).** New per-session
-  buffers fed by `GetDevToolsProtocolEventReceiver` (CDP *events*, vs the
-  request/response calls used today): `Runtime.consoleAPICalled`/`Log.entryAdded`
-  → `browser_console_messages`; `Network.requestWillBeSent`/`responseReceived` →
-  `browser_network_requests` + `browser_network_request`. Biggest new-infra CP
-  (enable domains, ring buffer, lifecycle on navigation/tab-close).
+- **CP10 — observation infra (console + network, read-only). DONE + user-verified.**
+  Implemented via **document-start JS instrumentation** (`automation/instrumentation.rs`,
+  injected by `AddScriptToExecuteOnDocumentCreated` alongside the design-mode
+  script) rather than CDP `GetDevToolsProtocolEventReceiver` — chosen for the
+  same composition-mode reliability + no-binding-dependency reasons as
+  handle_dialog. The script transparently wraps `console.*` + error/rejection
+  events and `fetch`/`XHR`, buffering into page-side ring buffers
+  (`window.__zedConsole` / `__zedNetwork`, cap 500); the tools read them via
+  `evaluate`. **Coverage divergence:** console = `console.*` + uncaught errors
+  (not browser-internal logs); network = fetch/XHR with status+timing (not
+  document/image/script subresources, no response bodies/headers). Verified
+  against the browser's own DevTools console + network panels.
 - **CP11 — emulation + PDF.** `browser_resize`
   (`Emulation.setDeviceMetricsOverride`, for responsive testing);
   `browser_pdf_save` (`Page.printToPDF`) — composes with the fork's PDF viewer.

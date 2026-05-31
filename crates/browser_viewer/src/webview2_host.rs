@@ -686,6 +686,26 @@ pub(crate) fn initialize(
                                 }
                             }
 
+                            // CP10: inject the console/network instrumentation
+                            // at document-start too, so browser_console_messages
+                            // / browser_network_requests capture from page load.
+                            let instr_h =
+                                HSTRING::from(crate::automation::instrumentation::SCRIPT);
+                            let instr_handler =
+                                AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(
+                                    Box::new(|_hr, _id| Ok(())),
+                                );
+                            unsafe {
+                                if let Err(err) = webview.AddScriptToExecuteOnDocumentCreated(
+                                    PCWSTR(instr_h.as_ptr()),
+                                    &instr_handler,
+                                ) {
+                                    log::warn!(
+                                        "browser_viewer: automation instrumentation inject failed: {err}"
+                                    );
+                                }
+                            }
+
                             let url_h = HSTRING::from(&url);
                             unsafe {
                                 webview

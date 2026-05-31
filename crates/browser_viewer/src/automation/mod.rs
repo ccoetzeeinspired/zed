@@ -8,6 +8,7 @@
 mod action;
 mod cdp;
 mod commands;
+pub mod instrumentation;
 mod ipc;
 mod keys;
 mod navigate;

@@ -381,6 +381,65 @@ server.tool(
 );
 
 server.tool(
+  "browser_console_messages",
+  "Read buffered console messages (console.* + uncaught errors) from the embedded Zed browser tab",
+  {
+    level: z
+      .enum(["log", "info", "warn", "error", "debug"])
+      .optional()
+      .describe("Only messages of this level"),
+    clear: z.boolean().optional().describe("Clear the console buffer after reading"),
+  },
+  async ({ level, clear }) => {
+    const result = (await requireZedOk(
+      await callZedAutomation("console_messages", { level, clear: clear ?? false }),
+    )) as { messages?: Array<{ level: string; text: string }>; count?: number };
+    const msgs = result.messages ?? [];
+    const body = msgs.length
+      ? msgs.map((m) => `[${m.level}] ${m.text}`).join("\n")
+      : "(no console messages)";
+    return textContent(`### Console (${result.count ?? msgs.length})\n${body}`);
+  },
+);
+
+server.tool(
+  "browser_network_requests",
+  "List network requests (fetch/XHR) captured in the embedded Zed browser tab",
+  {
+    clear: z.boolean().optional().describe("Clear the network buffer after reading"),
+  },
+  async ({ clear }) => {
+    const result = (await requireZedOk(
+      await callZedAutomation("network_requests", { clear: clear ?? false }),
+    )) as {
+      requests?: Array<{ id: number; method: string; url: string; status: number | null; ms: number | null }>;
+      count?: number;
+    };
+    const reqs = result.requests ?? [];
+    const body = reqs.length
+      ? reqs
+          .map((r) => `#${r.id} ${r.method} ${r.status ?? "…"} ${r.url}${r.ms != null ? ` (${r.ms}ms)` : ""}`)
+          .join("\n")
+      : "(no network requests)";
+    return textContent(`### Network (${result.count ?? reqs.length})\n${body}`);
+  },
+);
+
+server.tool(
+  "browser_network_request",
+  "Get one captured network request by id from the embedded Zed browser tab",
+  {
+    id: z.number().int().describe("Request id (from browser_network_requests)"),
+  },
+  async ({ id }) => {
+    const result = (await requireZedOk(
+      await callZedAutomation("network_request", { id }),
+    )) as { request?: unknown };
+    return textContent(JSON.stringify(result.request ?? null, null, 2));
+  },
+);
+
+server.tool(
   "browser_take_screenshot",
   "Take a screenshot (PNG/JPEG) of the embedded Zed browser tab",
   {

@@ -393,6 +393,23 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
             let dy = request.params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
             commands::mouse_wheel(browser, x, y, dx, dy, cx).await
         }
+        "console_messages" => {
+            let level = request.params.get("level").and_then(|v| v.as_str()).map(str::to_string);
+            let clear = request.params.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            commands::console_messages(browser, level, clear, cx).await
+        }
+        "network_requests" => {
+            let clear = request.params.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            commands::network_requests(browser, clear, cx).await
+        }
+        "network_request" => {
+            let id = request
+                .params
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!("network_request requires params.id"))?;
+            commands::network_request(browser, id, cx).await
+        }
         "navigate" => {
             let url = request
                 .params
