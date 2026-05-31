@@ -8,8 +8,18 @@ use serde_json::Value;
 
 use crate::automation::session::{ElementRef, RefRegistry};
 
-/// Maximum refs emitted per snapshot (token / perf guard).
-const MAX_REFS: u32 = 500;
+/// Default maximum refs emitted per snapshot (token / perf guard). Raised from
+/// the original 500 after large pages (e.g. naledi.co.za) exceeded it and left
+/// late elements unaddressable. Override with `ZED_BROWSER_AUTOMATION_MAX_REFS`.
+const DEFAULT_MAX_REFS: usize = 2000;
+
+fn max_refs() -> usize {
+    std::env::var("ZED_BROWSER_AUTOMATION_MAX_REFS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_REFS)
+}
 
 /// Parsed page snapshot for agent consumption.
 #[derive(Debug, Clone)]
@@ -152,6 +162,7 @@ pub fn snapshot_from_ax_tree(
     }
 
     let root_id = find_root_id(&by_id)?;
+    let max_refs = max_refs();
     let mut registry = RefRegistry::new(page_generation);
     let mut lines = Vec::new();
     let mut ref_count = 0usize;
@@ -172,7 +183,7 @@ pub fn snapshot_from_ax_tree(
         let name = node.name_str();
         let include = should_include_in_snapshot(&role, &name);
 
-        if include && registry.ref_count() < MAX_REFS as usize {
+        if include && registry.ref_count() < max_refs {
             let ref_id = registry.allocate_ref();
             registry.insert(
                 ref_id.clone(),

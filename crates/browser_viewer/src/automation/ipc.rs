@@ -226,7 +226,13 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .ok_or_else(|| anyhow!("type requires params.text"))?;
             let submit = request.params.get("submit").and_then(|v| v.as_bool()) == Some(true);
             let slowly = request.params.get("slowly").and_then(|v| v.as_bool()) == Some(true);
-            commands::type_text(browser.clone(), &ref_id, text, submit, slowly, cx).await?;
+            let slowly_delay_ms = request
+                .params
+                .get("slowlyDelayMs")
+                .or_else(|| request.params.get("slowly_delay_ms"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            commands::type_text(browser.clone(), &ref_id, text, submit, slowly, slowly_delay_ms, cx).await?;
             if submit {
                 commands::press_key(browser, "Enter", cx).await?;
             }

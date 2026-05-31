@@ -411,9 +411,10 @@ doubleClick/button/modifiers (non-default routes through CDP
 gains `slowly` (per-char real key events); plus new `browser_navigate_back`
 (WebView2 `GoBack`), `browser_fill_form` (batch text/checkbox/select), and
 `browser_close` (close active tab). Verified step-by-step on-screen by the user.
-Follow-ups logged (see plan §9): address-bar stale-after-nav (cosmetic),
-post-nav `evaluate` execution-context race, ~500-ref snapshot cap, configurable
-`slowly` delay.
+Follow-ups found during CP7 verification — all **fixed + user-verified** (#9–#12):
+address-bar stale-after-nav (fixed via the nav race below), post-nav `evaluate`
+race (`automation_navigate` pre-sets `is_loading`), snapshot cap raised 500→2000
+(`ZED_BROWSER_AUTOMATION_MAX_REFS`), and `type slowly` gained `slowlyDelayMs`.
 
 **Next: full Playwright MCP parity (CP8+).** The plan's §9 has a full parity
 matrix + checkpoint breakdown: file_upload / drag-drop / dialogs (CP8);

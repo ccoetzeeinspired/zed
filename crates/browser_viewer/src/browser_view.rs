@@ -293,6 +293,10 @@ impl BrowserView {
 
     #[cfg(target_os = "windows")]
     pub fn automation_navigate(&self, target: String, cx: &mut Context<Self>) {
+        // Pre-set is_loading so a following wait-for-load can't return before
+        // the NavigationStarting event fires (otherwise the first poll sees the
+        // PREVIOUS load already complete and `evaluate` hits the stale context).
+        self.item.update(cx, |item, _| item.is_loading = true);
         self.navigate_to(target, cx);
     }
 

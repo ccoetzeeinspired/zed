@@ -1,7 +1,7 @@
 //! Awaitable automation commands for MCP / IPC (return results, not fire-and-forget logs).
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::action::{DEFAULT_ACTION_TIMEOUT, RETRY_INTERVAL, SessionAttempt};
 use anyhow::{Result, anyhow};
@@ -238,10 +238,11 @@ pub async fn type_text(
     text: &str,
     keep_focus_for_submit: bool,
     slowly: bool,
+    slowly_delay_ms: u64,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     if slowly {
-        return type_slowly(browser, ref_id, text, cx).await;
+        return type_slowly(browser, ref_id, text, slowly_delay_ms, cx).await;
     }
     let browser_ref = browser.clone();
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
@@ -264,6 +265,7 @@ async fn type_slowly(
     browser: Entity<BrowserView>,
     ref_id: &str,
     text: &str,
+    delay_ms: u64,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let browser_ref = browser.clone();
@@ -274,26 +276,30 @@ async fn type_slowly(
     })
     .await?;
 
-    let chars: Vec<String> = text.chars().map(|c| c.to_string()).collect();
-    let dispatched = browser.update(cx, |view, cx| {
-        view.with_webview_session(cx, |session| {
-            for ch in &chars {
-                let (key, code, vk, text_payload) =
-                    match crate::automation::keys::parse_key(ch) {
-                        Ok(k) => (k.key, k.code, k.windows_virtual_key_code, k.text),
-                        // Char the key table doesn't map (e.g. space, unicode):
-                        // send it as raw text so the renderer still inserts it.
-                        Err(_) => (ch.clone(), String::new(), 0, Some(ch.clone())),
-                    };
+    for ch in text.chars() {
+        let ch = ch.to_string();
+        let (key, code, vk, text_payload) = match crate::automation::keys::parse_key(&ch) {
+            Ok(k) => (k.key, k.code, k.windows_virtual_key_code, k.text),
+            // Char the key table doesn't map (e.g. space, unicode): send it as
+            // raw text so the renderer still inserts it.
+            Err(_) => (ch.clone(), String::new(), 0, Some(ch.clone())),
+        };
+        let dispatched = browser.update(cx, |view, cx| {
+            view.with_webview_session(cx, |session| {
                 let _ = session.dispatch_key_event("keyDown", &key, &code, 0, vk, text_payload.as_deref());
                 let _ = session.dispatch_key_event("keyUp", &key, &code, 0, vk, None);
-            }
-            true
-        })
-        .unwrap_or(false)
-    });
-    if !dispatched {
-        return Err(anyhow!("browser automation type (slowly) {ref_id}: no live WebView2 session"));
+                true
+            })
+            .unwrap_or(false)
+        });
+        if !dispatched {
+            return Err(anyhow!("browser automation type (slowly) {ref_id}: no live WebView2 session"));
+        }
+        if delay_ms > 0 {
+            cx.background_executor()
+                .timer(Duration::from_millis(delay_ms))
+                .await;
+        }
     }
     Ok(())
 }
@@ -676,7 +682,7 @@ pub async fn fill_form(
                 select_option(browser.clone(), &field.ref_id, vec![field.value.clone()], cx).await?;
             }
             _ => {
-                type_text(browser.clone(), &field.ref_id, &field.value, false, false, cx).await?;
+                type_text(browser.clone(), &field.ref_id, &field.value, false, false, 0, cx).await?;
             }
         }
         filled += 1;

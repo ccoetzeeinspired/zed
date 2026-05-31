@@ -106,8 +106,14 @@ server.tool(
       .boolean()
       .optional()
       .describe("Type one character at a time with real key events (for keystroke-driven fields)"),
+    slowlyDelayMs: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Per-character delay in ms when slowly=true (0 = as fast as possible; use to pace human-like input)"),
   },
-  async ({ target, ref, text, submit, slowly }) => {
+  async ({ target, ref, text, submit, slowly, slowlyDelayMs }) => {
     const elementRef = ref ?? target;
     if (!elementRef) {
       throw new Error("browser_type requires target or ref from browser_snapshot");
@@ -119,6 +125,7 @@ server.tool(
         text,
         submit: submit ?? false,
         slowly: slowly ?? false,
+        slowlyDelayMs: slowlyDelayMs ?? 0,
       }),
     );
     return textContent(`Typed into ${elementRef}`);

@@ -214,23 +214,26 @@ against on-page fixtures (no AX-only inference):
 - `browser_close` — opened a 2nd tab (watched it appear + activate), closed it,
   back to one tab.
 
-### Follow-ups discovered during CP7 verification (tracked as separate issues)
+### Follow-ups discovered during CP7 verification — ALL FIXED + user-verified
 
-1. **Address bar (`url_editor`) stale after navigation** — page navigates
-   correctly but the address-bar text doesn't update. Pre-existing, visual only;
-   does not affect automation (tools read `item.url` / `location.href`, not the
-   editor).
-2. **Post-navigation `evaluate` execution-context race** — right after a
-   navigation, `Runtime.evaluate` can resolve against the *old* page context and
-   return stale data; `navigate` can also return before `NavigationStarting`
-   flips `is_loading`. Pre-setting `is_loading` (as `automation_go_back` does)
-   and/or waiting for a fresh execution context would harden it.
-3. **Snapshot ~500-ref cap** — `browser_snapshot` caps at ~500 refs; elements
-   past that on large pages are not surfaced (an appended element was invisible
-   to the snapshot until moved to the front).
-4. **`type slowly` configurable delay** — add an optional per-character delay so
-   `slowly` can defeat anti-bot/legacy-site rapid-input handling (currently
-   instant).
+Per the "fix anomalies each CP" practice, all four were fixed in the CP7 batch
+(issues #9–#12) and re-verified on-screen:
+
+1. **Address bar (`url_editor`) stale after navigation** — ✅ **fixed.** Root
+   cause was the navigation race in #2 below: `item.url` (and the render-time
+   editor sync) lagged because `navigate` returned before `NavigationStarting`.
+   Fixing #2 fixed this; the address bar now tracks the page. Verified
+   (truelens → example.com → bar updated).
+2. **Post-navigation `evaluate` execution-context race** — ✅ **fixed.**
+   `automation_navigate` now pre-sets `is_loading=true` (like `automation_go_back`)
+   so wait-for-load can't return before the nav starts. Verified: immediate
+   `location.href` after navigate returns the new URL, not stale.
+3. **Snapshot ~500-ref cap** — ✅ **fixed.** Raised default to 2000
+   (`ZED_BROWSER_AUTOMATION_MAX_REFS` override). Verified: naledi snapshot now
+   1711 refs and an appended end-of-body marker is reachable (`e1711`).
+4. **`type slowly` configurable delay** — ✅ **done.** Added `slowlyDelayMs`
+   (per-character delay). Verified at 150ms/char (watched typing letter by
+   letter). Use to pace human-like input vs anti-bot/legacy-site handling.
 
 ### Known fixes during CP5 dogfood
 
