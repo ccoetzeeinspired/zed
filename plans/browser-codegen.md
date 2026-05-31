@@ -492,6 +492,48 @@ indices) — not reproduction *now*. A v2 "smart locator" pass (volatile-name
 normalization + href/test-id fallback + frame-aware snapshot + CMP handling) is
 the clear next investment.
 
+#### 4.6.3 Pass 3 — durable-selector capture + a new site (2026-05-31)
+
+Implemented (commit `4d6f378`) a **universal** durable-selector layer: at record
+time, for the acted element, the page computes the most stable selector that
+*uniquely* identifies it (`querySelectorAll().length===1`): `data-testid` → other
+test-id attrs → `id` → link `href` → `name`. Codegen priority: `getByTestId` >
+unique `getByRole(name)` > unique structural selector (replaces positional `.nth`)
+> `.nth(i)`. **Deliberately conservative (Rule: universal, not scenario-fitted):**
+a unique accessible name is *not* overridden by an id/href (those can be
+framework-generated/volatile — React `:r1:`, Ember ids, session hrefs); the
+in-page uniqueness check declines a non-unique href.
+
+Re-drove Guardian/GitHub/MDN through the rebuilt binary + a **new site:
+crates.io** (Ember SPA, chosen to test the safety property). 2× Playwright:
+
+| Flow | Result | Note |
+|---|---|---|
+| crates.io (NEW) | 2/2 ✅ | **Safety confirmed** — used accessible names for the search box + `serde` link, did NOT grab volatile Ember ids. (`serde v1.0.228` heading shows the dynamic-name caveat in a *heading*.) |
+| MDN | 2/2 ✅ | duplicate "Array" links share `/Array` href → non-unique → correctly kept `.nth(0)` |
+| Guardian | 1/2 ⚠️ flaky | one pass, one 30 s timeout — **cold-profile consent overlay/ad-load intermittently blocks the nav click** (finding #2 reconfirmed, now observed firing) |
+| GitHub | 0/2 ❌ | deep nav reproduced (both clicks → `/labels`); only the *assertion* failed |
+
+**Two findings:**
+- **AX role-attribution divergence (GitHub, NEW).** The labels search element
+  snapshotted as a `search` *landmark* named "Search all labels" this session
+  (last campaign: `textbox`, which passed). Playwright's Chromium doesn't expose
+  a `search`-role element with that name → assertion not found. The same logical
+  element surfaces under different roles across snapshots/engines — so a single
+  `getByRole` for an assertion is fragile. **Motivates v3: emit resilient
+  `locator.or(...)` chains** (role+name OR test-id/css OR `getByText`) for
+  assertions, robust to role/name attribution differences.
+- **Consent flakiness is real & intermittent (Guardian).** Confirmed by an
+  actual 30 s timeout on a cold run — not just theoretical. Reinforces the
+  frame-aware-snapshot / `addLocatorHandler` / `storageState`-consent work.
+
+**Honest status of this pass:** the durable-selector change is *safe + correct*
+(validated; no regressions; new-site crates.io green) and adds durability headroom
+(test-id, unique-href disambiguation) — but it did not by itself raise the pass
+rate on these 4, because their failures are consent flakiness and role-attribution
+divergence, which it doesn't target. Those define the next passes: **v3 resilient
+`.or()` assertion locators**, then **consent/iframe handling**.
+
 ### 4.7 Effort / risk
 
 - **Recorder:** small (one hook at the dispatch chokepoint + a Mutex buffer).
