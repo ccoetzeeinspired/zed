@@ -1,6 +1,7 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP6 shipped and verified — full 12-tool Playwright-shaped surface  
+**Status:** CP0–CP6 shipped and verified (12-tool Playwright-shaped surface);
+CP7+ roadmap to **full** Playwright MCP parity in §9  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
 **Last updated:** 2026-05-31
@@ -303,7 +304,7 @@ Zed logs IPC calls as `browser automation IPC: <method> …`. Set
 
 ---
 
-## 8. What's next (CP6)
+## 8. CP6 — Tier 2 (done)
 
 Priority order from dogfood:
 
@@ -321,13 +322,115 @@ Priority order from dogfood:
 Deferred / non-goals:
 
 - Cross-platform (macOS/Linux).
-- Sikuli / coordinate automation.
 - IME and dead-key input via agent.
 - ACP host-side tool execution without MCP (no upstream hook today).
 
+> Note: coordinate/Sikuli automation was previously a non-goal. As of the
+> full-parity decision (§9) it is **in scope** (CP9, vision tools) — ref-based
+> stays primary, coordinate is the fallback.
+
 ---
 
-## 9. Sync notes
+## 9. Full-parity roadmap (CP7+)
+
+**Goal:** literal Playwright MCP parity across every tool that maps onto an
+embedded WebView2 tab, with a small set of **documented divergences** for tools
+bound to Playwright's own runtime/infrastructure (which an embedded browser
+cannot and should not replicate). Decisions taken with the user: include the
+**vision** (coordinate) tools; treat infra-specific tools as divergences with
+analogs; do read-only **network** observation now and defer request mocking.
+
+### 9.1 Parity matrix (every Playwright MCP tool → our disposition)
+
+Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analog noted).
+
+| Playwright tool | Status | Where |
+|-----------------|--------|-------|
+| `browser_navigate` | ✅ | CP4 |
+| `browser_snapshot` | ✅ | CP1 |
+| `browser_click` | 🔧 add doubleClick / button / modifiers | CP7 |
+| `browser_type` | 🔧 add `slowly` | CP7 |
+| `browser_wait_for` | 🔧 add `textGone` | CP7 |
+| `browser_press_key` | ✅ | CP6 |
+| `browser_select_option` | ✅ | CP6 |
+| `browser_hover` | ✅ | CP6 |
+| `browser_evaluate` | ✅ | CP6 |
+| `browser_take_screenshot` | ✅ | CP6 |
+| `browser_scroll` (fork ext.) | ✅ | CP6 |
+| `browser_tabs` | ✅ | CP6 |
+| `browser_navigate_back` | ➕ `GoBack` (exists) | CP7 |
+| `browser_fill_form` | ➕ batch type over refs | CP7 |
+| `browser_close` | ➕ close active tab/page | CP7 |
+| `browser_file_upload` | ➕ CDP `DOM.setFileInputFiles` | CP8 |
+| `browser_drag` | ➕ CDP `Input` drag sequence | CP8 |
+| `browser_drop` | ➕ file/MIME drop | CP8 |
+| `browser_handle_dialog` | ➕ WebView2 `add_ScriptDialogOpening` | CP8 |
+| `browser_mouse_click_xy` / `_move_xy` / `_down` / `_up` / `_drag_xy` / `_wheel` | ➕ CDP `Input.dispatchMouseEvent` (vision) | CP9 |
+| `browser_console_messages` | ➕ `GetDevToolsProtocolEventReceiver` buffer | CP10 |
+| `browser_network_requests` / `browser_network_request` | ➕ `Network.*` event buffer (read-only) | CP10 |
+| `browser_resize` | ➕ CDP `Emulation.setDeviceMetricsOverride` | CP11 |
+| `browser_pdf_save` | ➕ CDP `Page.printToPDF` | CP11 |
+| `browser_cookie_*` (get/set/list/delete/clear) | ➕ CDP `Network.*Cookies` | CP12 |
+| `browser_localstorage_*` / `browser_sessionstorage_*` | ➕ `Runtime.evaluate` over storage APIs | CP12 |
+| `browser_storage_state` / `browser_set_storage_state` | ➕ compose cookies + storage to/from JSON | CP12 |
+| `browser_verify_element_visible` / `_list_visible` / `_text_visible` / `_value` | ➕ assert over AX snapshot + DOM | CP13 |
+| `browser_route` / `_unroute` / `_route_list` / `network_state_set` | ➕ CDP `Fetch` interception | CP14 (deferred) |
+| `browser_run_code_unsafe` | ⛔ no Playwright runtime → use `browser_evaluate` | — |
+| `browser_generate_locator` | ⛔ Playwright codegen → use `browser_snapshot` refs | — |
+| `browser_annotate` | ⛔ Playwright Dashboard → fork **design mode** overlay | — |
+| `browser_start/stop_tracing`, `start/stop_video`, `video_chapter`, `resume` | ⛔ Playwright trace/video infra — not applicable to embedded WebView2 | — |
+| `browser_highlight` / `browser_hide_highlight` | ⛔ (optional later via CDP `Overlay`) | — |
+| `browser_get_config` | ⛔ no equivalent config surface | — |
+
+### 9.2 Checkpoints
+
+- **CP7 — parity fills (no new infra).** `browser_click` doubleClick/button/
+  modifiers; `browser_wait_for` `textGone`; `browser_type` `slowly`;
+  `browser_navigate_back`; `browser_fill_form`; `browser_close`. Mostly DOM /
+  existing methods. Highest leverage, lowest risk.
+- **CP8 — input interactions.** `browser_file_upload` (`DOM.setFileInputFiles`),
+  `browser_drag` + `browser_drop`, `browser_handle_dialog` (native WebView2
+  `ScriptDialogOpening` event + a pending-action policy: accept/dismiss/text).
+- **CP9 — vision / coordinate tools.** `browser_mouse_*_xy` via
+  `Input.dispatchMouseEvent` (the hover path already proves this works). Flip the
+  coordinate non-goal in §8.
+- **CP10 — observation infra (console + network, read-only).** New per-session
+  buffers fed by `GetDevToolsProtocolEventReceiver` (CDP *events*, vs the
+  request/response calls used today): `Runtime.consoleAPICalled`/`Log.entryAdded`
+  → `browser_console_messages`; `Network.requestWillBeSent`/`responseReceived` →
+  `browser_network_requests` + `browser_network_request`. Biggest new-infra CP
+  (enable domains, ring buffer, lifecycle on navigation/tab-close).
+- **CP11 — emulation + PDF.** `browser_resize`
+  (`Emulation.setDeviceMetricsOverride`, for responsive testing);
+  `browser_pdf_save` (`Page.printToPDF`) — composes with the fork's PDF viewer.
+- **CP12 — storage.** Cookies via `Network.getCookies`/`setCookie`/
+  `deleteCookies`/`clearBrowserCookies`; local/session storage via
+  `Runtime.evaluate`; `storage_state`/`set_storage_state` compose both to/from a
+  JSON file. (Unlocks auth/session reuse — the biggest real-capability add.)
+- **CP13 — testing assertions.** `browser_verify_*` evaluated against the AX
+  snapshot + DOM. (`generate_locator` stays a divergence.)
+- **CP14 — network mocking (deferred).** `browser_route`/`_unroute`/`_route_list`/
+  `network_state_set` via CDP `Fetch` domain interception.
+
+### 9.3 Divergences (won't replicate; analogs provided)
+
+`browser_run_code_unsafe` (we run page JS via `browser_evaluate`, not the
+Playwright API); `browser_generate_locator` (use snapshot refs);
+`browser_annotate` (fork design mode); tracing / video / `resume` /
+`browser_get_config` (Playwright-infrastructure-specific). These are recorded so
+"not present" is a deliberate, explained choice rather than a gap.
+
+### 9.4 Verification standard (applies to every CP)
+
+Per the CP6 evidence method: confirm against **ground truth** — tool return
+values, an independent `browser_evaluate` read-back, or a *viewport-resolution*
+screenshot of the affected region. Never infer success from the AX snapshot
+alone. Each new tool ships with a unit test for its pure logic plus a runtime
+check through the real MCP server.
+
+---
+
+## 10. Sync notes
 
 `browser-automation` rebases onto `browser-viewer`. Fork-owned paths
 (`crates/browser_viewer/src/automation/`, `vendor/zed-browser-mcp/`,

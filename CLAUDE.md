@@ -405,6 +405,15 @@ shipped + verified. Load-bearing notes for the Tier 2 additions:
   set. hover uses CDP `Input.dispatchMouseEvent mouseMoved` for real CSS
   `:hover`.
 
+**Next: full Playwright MCP parity (CP7+).** The plan's §9 has a full parity
+matrix + checkpoint breakdown: param fills (click modifiers, wait `textGone`),
+navigate_back / fill_form / close (CP7); file_upload / drag-drop / dialogs
+(CP8); coordinate vision tools (CP9); console + network read-only via
+`GetDevToolsProtocolEventReceiver` buffers (CP10); resize + pdf (CP11); storage
+(CP12); verify_* assertions (CP13); network mocking deferred (CP14). Documented
+divergences (won't replicate): `run_code_unsafe`, `generate_locator`, tracing/
+video/annotate, `get_config`.
+
 **What it does:** The claude-acp agent drives the **embedded browser tab**
 through twelve MCP tools — `browser_navigate`, `browser_snapshot`,
 `browser_click`, `browser_type`, `browser_wait_for`, `browser_press_key`,
