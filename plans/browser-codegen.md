@@ -1,9 +1,12 @@
 # Agent → Runnable Scripts: Record + Codegen (Plan & Testing Strategy)
 
 **Status:** **CP15 v1 shipped + verified (2026-05-31).** Recorder + codegen +
-`browser_record`/`browser_codegen` tools land on `feat/cp15-codegen`. The
-record→codegen→runnable-Playwright claim is **proven** against the canonical
-TrueLens login→dashboard flow (see §4.6 Results below).
+`browser_record`/`browser_codegen` tools land on `feat/cp15-codegen` (commits
+`3ed12d5` + `de8e118`). The record→codegen→runnable-Playwright claim is **proven**:
+the canonical TrueLens login→dashboard flow plus a 5-flow / 5-site campaign now
+run **6/6 green, no-flake** under real Playwright (see §4.6 + §4.6.1). The campaign
+surfaced one residual — locator collisions — and both its forms are fixed
+(`exact: true` + `.nth(i)`).
 **Prereq:** CP0–CP13 shipped (full Playwright MCP parity, 51 tools) — see
 [`browser-automation.md`](browser-automation.md).
 **Branch:** all work lands in `cccl-main` (see `CLAUDE.md` → Branches).
@@ -390,6 +393,52 @@ documented residual; the experiment did not require it.
 (skip login, prove auth reuse) and a search→results flow with autocomplete
 adaptivity. v1 deliberately omits fallback-selector capture (id/data-testid) —
 add it only if a real flow surfaces a role+name collision.
+
+#### 4.6.1 Verification campaign — 5 flows × 5 sites (2026-05-31)
+
+After the canonical case, a self-driven campaign ran 5 multi-navigation flows
+end-to-end (record → codegen → **real** Playwright headless), no human eyeballing,
+verified against ground truth + each spec's pass/fail:
+
+| Flow | Site | Shape |
+|---|---|---|
+| 1 | example.com → iana.org | link nav (2-hop) |
+| 2 | the-internet.herokuapp.com | Form Auth login (3-hop) + assert |
+| 3 | quotes.toscrape.com | tag filter → pagination |
+| 4 | saucedemo.com | login → add-to-cart → cart |
+| 5 | en.wikipedia.org | search+submit → article |
+
+**Initial result: 2/6 pass** (flows 1 + the TrueLens login). All 4 failures were
+the **same residual the plan predicted (§3 hostile DOM / §4.4 durability):
+locator collisions** (Playwright strict-mode), in two distinct forms — which the
+campaign cleanly separated:
+
+1. **Substring over-match (flows 2, 5).** Playwright's default `getByRole` `name`
+   is a case-insensitive **substring**, so `'Secure Area'` also matched
+   `'Welcome to the Secure Area…'` and `'Web scraping'` matched `'Methods to
+   prevent web scraping'`. **Fix: emit `{ name, exact: true }`** — more faithful
+   (our recorded name *is* the full accessible name) and kills the whole class.
+   (`getByText` assertions stay substring on purpose — page text often carries
+   trailing noise like a `×` close glyph.)
+2. **Genuine multiplicity (flows 3, 4).** 4 identical `'inspirational'` links; 6
+   identical `'Add to cart'` buttons. `exact` can't help. **Fix: `.nth(i)`** —
+   `snapshot.rs` computes each ref's `dup_index`/`dup_count` among same-`(role,
+   name)` elements in DOM/AX order (matches Playwright `getByRole` ordering);
+   codegen appends `.nth(i)` only when `dup_count > 1`.
+
+**After both fixes (commit `de8e118`): full suite 6/6 pass, 3× re-run no-flake
+(~7.5 s for all 6).** Both fixes are unit-tested (43 automation tests green incl.
+new nth-codegen + duplicate-index snapshot tests) and were confirmed under real
+Playwright. (Verification note: the `.nth` values were confirmed via the live
+Playwright run with the tool's computed indices; a full re-drive through the
+rebuilt binary just needs a browser tab reopened — a GUI step the agent can't
+trigger.)
+
+**Net learning:** role+name codegen reproduces clean flows verbatim; the *only*
+thing that broke on real sites was locator ambiguity, and both its forms have
+deterministic, now-implemented fixes. Fallback-selector capture (id/data-testid —
+saucedemo exposes perfect `data-test` attrs) remains a v2 nicety for the rare case
+where even `.nth(i)` is too positional (DOM reorders between record and replay).
 
 ### 4.7 Effort / risk
 
