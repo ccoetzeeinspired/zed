@@ -188,6 +188,55 @@ pub fn try_scroll_into_view_backend_node(
     )
 }
 
+// Select `<option>`s in a `<select>` by value, label, or visible text; fire
+// input + change so frameworks observe the change. Returns how many matched and
+// the select's resulting value.
+const SELECT_OPTION_SCRIPT: &str = r#"function(values) {
+  const tag = this.tagName ? this.tagName.toUpperCase() : '';
+  if (tag !== 'SELECT') {
+    throw new Error('element is not a <select>');
+  }
+  const wanted = Array.isArray(values) ? values : [values];
+  let matched = 0;
+  for (const opt of Array.from(this.options)) {
+    const hit = wanted.includes(opt.value) || wanted.includes(opt.label) || wanted.includes(opt.text);
+    opt.selected = hit;
+    if (hit) { matched++; }
+  }
+  this.dispatchEvent(new Event('input', { bubbles: true }));
+  this.dispatchEvent(new Event('change', { bubbles: true }));
+  return { matched: matched, value: this.value };
+}"#;
+
+/// One-shot "select option(s)" on a `<select>` backend node. `values` is a JSON
+/// array of strings (matched against option value/label/text).
+pub fn try_select_option_backend_node(
+    session: &WebView2Session,
+    backend_node_id: i32,
+    values: &[Value],
+    on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+) -> Result<()> {
+    let args = vec![json!({ "value": values })];
+    invoke_on_backend_node(session, backend_node_id, SELECT_OPTION_SCRIPT, Some(&args), on_done)
+}
+
+// Scroll the element to viewport centre and return that centre point in
+// *viewport* CSS px — the coordinate space `Input.dispatchMouseEvent` expects.
+const HOVER_POINT_SCRIPT: &str = r#"function() {
+  this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const r = this.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}"#;
+
+/// One-shot "scroll into view + report viewport-centre point" for hover.
+pub fn try_hover_point_backend_node(
+    session: &WebView2Session,
+    backend_node_id: i32,
+    on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+) -> Result<()> {
+    invoke_on_backend_node(session, backend_node_id, HOVER_POINT_SCRIPT, None, on_done)
+}
+
 /// Run `functionDeclaration` on the node identified by `backend_node_id`.
 pub fn invoke_on_backend_node(
     session: &WebView2Session,

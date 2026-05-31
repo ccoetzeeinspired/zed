@@ -123,6 +123,71 @@ server.tool(
 );
 
 server.tool(
+  "browser_evaluate",
+  "Evaluate JavaScript in the embedded Zed browser tab (optionally against an element)",
+  {
+    function: z
+      .string()
+      .describe("A JS function expression, e.g. () => document.title or el => el.textContent"),
+    ref: z
+      .string()
+      .optional()
+      .describe("Snapshot ref — the function is called with that element as `this` and arg 0"),
+    target: z.string().optional().describe("Alias for ref"),
+  },
+  async ({ function: fn, ref, target }) => {
+    const params: Record<string, unknown> = { function: fn };
+    const elementRef = ref ?? target;
+    if (elementRef) params.ref = elementRef;
+    const result = (await requireZedOk(
+      await callZedAutomation("evaluate", params),
+    )) as { result?: unknown };
+    return textContent(JSON.stringify(result.result ?? null, null, 2));
+  },
+);
+
+server.tool(
+  "browser_select_option",
+  "Select option(s) in a <select> dropdown in the embedded Zed browser tab",
+  {
+    element: z.string().optional().describe("Human-readable element description"),
+    ref: z.string().optional().describe("Snapshot ref of the <select> element"),
+    target: z.string().optional().describe("Alias for ref"),
+    values: z
+      .union([z.string(), z.array(z.string())])
+      .describe("Option value(s), label(s), or visible text to select"),
+  },
+  async ({ ref, target, values }) => {
+    const elementRef = ref ?? target;
+    if (!elementRef) {
+      throw new Error("browser_select_option requires target or ref from browser_snapshot");
+    }
+    const result = (await requireZedOk(
+      await callZedAutomation("select_option", { ref: elementRef, values }),
+    )) as { matched?: number; value?: string };
+    return textContent(`Selected ${result.matched ?? 0} option(s); value=${result.value ?? ""}`);
+  },
+);
+
+server.tool(
+  "browser_hover",
+  "Hover the mouse over an element in the embedded Zed browser tab",
+  {
+    element: z.string().optional().describe("Human-readable element description"),
+    ref: z.string().optional().describe("Snapshot ref of the element to hover"),
+    target: z.string().optional().describe("Alias for ref"),
+  },
+  async ({ ref, target }) => {
+    const elementRef = ref ?? target;
+    if (!elementRef) {
+      throw new Error("browser_hover requires target or ref from browser_snapshot");
+    }
+    await requireZedOk(await callZedAutomation("hover", { ref: elementRef }));
+    return textContent(`Hovered ${elementRef}`);
+  },
+);
+
+server.tool(
   "browser_take_screenshot",
   "Take a screenshot (PNG/JPEG) of the embedded Zed browser tab",
   {

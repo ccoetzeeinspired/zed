@@ -10,8 +10,9 @@ use gpui::{AsyncApp, Entity};
 use serde_json::Value;
 
 use crate::automation::action::{
-    element_for_action, try_bounding_rect_backend_node, try_click_backend_node,
-    try_scroll_into_view_backend_node, try_type_backend_node,
+    element_for_action, invoke_on_backend_node, try_bounding_rect_backend_node,
+    try_click_backend_node, try_hover_point_backend_node, try_scroll_into_view_backend_node,
+    try_select_option_backend_node, try_type_backend_node,
 };
 use crate::automation::cdp::CdpSession;
 use crate::automation::navigate::{WaitForOptions, normalize_navigate_url, wait_for_result};
@@ -362,6 +363,116 @@ pub async fn screenshot(
         "image/png"
     };
     Ok(serde_json::json!({ "data": data, "mimeType": mime, "bytes": data.len() }))
+}
+
+/// CP6: evaluate JS in the page. `function` is a JS function expression
+/// (`() => …` or `el => …`); with `ref_id` it's called with the element as both
+/// `this` and the first argument. Returns `{ result: <json value> }`.
+pub async fn evaluate(
+    browser: Entity<BrowserView>,
+    function: String,
+    ref_id: Option<String>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    if let Some(ref_id) = ref_id {
+        let browser_ref = browser.clone();
+        let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, &ref_id, app))?;
+        let backend_node_id = element.backend_dom_node_id.expect("checked above");
+        // Bind the element as `this` and pass it as the first arg too, so both
+        // `function() { this… }` and `el => el…` styles work.
+        let decl = format!("function() {{ return ({function}).call(this, this); }}");
+        let raw = run_one_shot(&browser, cx, &format!("evaluate {ref_id}"), move |session, done| {
+            invoke_on_backend_node(session, backend_node_id, &decl, None, done)
+        })
+        .await?;
+        return Ok(serde_json::json!({ "result": unwrap_cdp_value(raw) }));
+    }
+
+    // Page-level evaluate: run the function and (await any promise it returns).
+    let expr = format!("({function})()");
+    let params = serde_json::json!({
+        "expression": expr,
+        "returnByValue": true,
+        "awaitPromise": true,
+    })
+    .to_string();
+    // Use the raw CDP string so we can surface `exceptionDetails` (which
+    // `parse_cdp_response` would otherwise drop when it extracts `result`).
+    let raw = run_one_shot(&browser, cx, "evaluate", move |session, done| {
+        session.call_devtools_protocol(
+            "Runtime.evaluate",
+            &params,
+            Box::new(move |s| {
+                done(s.and_then(|s| {
+                    serde_json::from_str::<Value>(s.trim())
+                        .map_err(|e| anyhow!("evaluate response parse: {e}"))
+                }));
+            }),
+        )
+    })
+    .await?;
+
+    if let Some(details) = raw.get("exceptionDetails") {
+        let msg = details
+            .get("exception")
+            .and_then(|e| e.get("description"))
+            .and_then(|v| v.as_str())
+            .or_else(|| details.get("text").and_then(|v| v.as_str()))
+            .unwrap_or("evaluate threw");
+        return Err(anyhow!("{msg}"));
+    }
+    let result = raw
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(serde_json::json!({ "result": result }))
+}
+
+/// CP6: select `<option>`(s) in a `<select>` by value / label / text.
+pub async fn select_option(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    values: Vec<String>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let browser_ref = browser.clone();
+    let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
+    let backend_node_id = element.backend_dom_node_id.expect("checked above");
+    let args: Vec<Value> = values.iter().map(|v| Value::from(v.as_str())).collect();
+    let ref_label = ref_id.to_string();
+    let raw = run_one_shot(&browser, cx, &format!("select {ref_label}"), move |session, done| {
+        try_select_option_backend_node(session, backend_node_id, &args, done)
+    })
+    .await?;
+    let result = unwrap_cdp_value(raw);
+    if result.get("matched").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
+        return Err(anyhow!("no <option> in {ref_label} matched {values:?}"));
+    }
+    Ok(result)
+}
+
+/// CP6: hover the mouse over an element (scrolls it into view, then dispatches a
+/// CDP `mouseMoved` at its centre so CSS `:hover` menus / tooltips trigger).
+pub async fn hover(browser: Entity<BrowserView>, ref_id: &str, cx: &mut AsyncApp) -> Result<Value> {
+    let browser_ref = browser.clone();
+    let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
+    let backend_node_id = element.backend_dom_node_id.expect("checked above");
+
+    let point_raw = run_one_shot(&browser, cx, &format!("hover-point {ref_id}"), move |session, done| {
+        try_hover_point_backend_node(session, backend_node_id, done)
+    })
+    .await?;
+    let point = unwrap_cdp_value(point_raw);
+    let x = point.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = point.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let params = serde_json::json!({ "type": "mouseMoved", "x": x, "y": y, "buttons": 0 }).to_string();
+    run_one_shot(&browser, cx, &format!("hover {ref_id}"), move |session, done| {
+        CdpSession::new(session).call_method("Input.dispatchMouseEvent", &params, done)
+    })
+    .await?;
+    Ok(serde_json::json!({ "x": x, "y": y }))
 }
 
 pub async fn navigate(

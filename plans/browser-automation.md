@@ -1,9 +1,9 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP5 shipped and dogfooded; CP6 (Tier 2 tools) next  
+**Status:** CP0–CP6 shipped and verified — full 12-tool Playwright-shaped surface  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
-**Last updated:** 2026-05-30
+**Last updated:** 2026-05-31
 
 ---
 
@@ -83,7 +83,7 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 
 ---
 
-## 3. Shipped tool surface (Tier 1)
+## 3. Shipped tool surface (Tier 1 + Tier 2)
 
 | MCP tool | Rust IPC method | Notes |
 |----------|-----------------|-------|
@@ -96,9 +96,11 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_scroll` | `scroll` | `ref` → `scrollIntoView` (handles inner scrollers); else `window.scrollBy(dx,dy)`. Returns `{x,y,maxY}`. Fork extension (Playwright MCP has no scroll tool). |
 | `browser_tabs` | `tabs` | `action` = list / select / new / close (+ `index`, `url`). Operates on the **workspace** (`items_of_type::<BrowserView>`, `activate_item`, `close_item_by_id`), not CDP. Returns `{tabs:[{index,title,url,active}],count}`. |
 | `browser_take_screenshot` | `screenshot` | CDP `Page.captureScreenshot`. `fullPage` (captureBeyondViewport), `ref` (element clip in page coords), `type` png/jpeg + `quality`. Returns an MCP image content block. |
+| `browser_evaluate` | `evaluate` | `Runtime.evaluate` `(fn)()` (awaits promises, surfaces `exceptionDetails`); with `ref`, calls `fn` with the element as `this`+arg0. Returns `{result}`. |
+| `browser_select_option` | `select_option` | Set `<select>` option(s) by value/label/text (+ `input`/`change`). Returns `{matched,value}`. |
+| `browser_hover` | `hover` | Scroll element to centre, dispatch CDP `Input.dispatchMouseEvent` `mouseMoved` → real CSS `:hover`. |
 
-Tier 2 remaining (CP6, not started): `browser_select_option`,
-`browser_hover`, `browser_evaluate`.
+**CP6 Tier 2 complete** — all 12 tools shipped.
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -121,7 +123,7 @@ there.
 | **CP3** | Type into inputs (incl. React controlled fields) | Done |
 | **CP4** | Navigate + wait-for load/text | Done |
 | **CP5** | MCP adapter + `context_servers` + end-to-end agent | Done |
-| **CP6** | Tier 2 breadth | In progress — `browser_press_key`, `browser_scroll`, `browser_tabs`, `browser_take_screenshot` done |
+| **CP6** | Tier 2 breadth (press_key, scroll, tabs, screenshot, evaluate, select_option, hover) | Done |
 
 ### Verification log (2026-05-30)
 
@@ -170,9 +172,26 @@ there.
   rejects zero-size).
 - **Runtime (Takealot homepage, decoded PNGs inspected):** viewport (326 KB,
   valid PNG sig, above-the-fold render); `fullPage` (3.16 MB, full scrollable
-  page incl. footer); element `ref=e101` (1.7 KB, just the search box). Confirms
-  CDP `Page.captureScreenshot` works in composition-mode WebView2 — no
+  page incl. footer — footer legibly confirmed via a bottom-of-page viewport
+  capture); element `ref=e101` (1.7 KB, just the search box). Confirms CDP
+  `Page.captureScreenshot` works in composition-mode WebView2 — no
   `CapturePreview` fallback needed.
+
+### Verification log (CP6, `browser_evaluate` / `browser_select_option` / `browser_hover`)
+
+- **Unit:** `automation::ipc` — `parse_string_list` (string | array | reject).
+- **Runtime (via MCP server, Amazon.co.za + injected control `<select>`):**
+  - `evaluate` page-level `() => ({math:6*7,…})` → `42` + real title/url/ua;
+    element-level `el => …` on the select ref → `"SELECT with 3 options"`.
+  - `select_option ["Large"]` → `{matched:1, value:"large"}`, independently
+    cross-checked via `evaluate` reading `.value` → `"large"`.
+  - `hover` the select, then `evaluate document.querySelectorAll(":hover")` →
+    chain ends at `SELECT#__zed_test_sel` (real CSS `:hover`, not just an event).
+
+**Evidence method (adopted this run):** verify against ground truth — return
+values, an independent `evaluate` read-back, or a *viewport-resolution*
+screenshot of the region (full-page PNGs downscale too far to read fine text).
+Don't infer success from the AX snapshot alone.
 
 ### Known fixes during CP5 dogfood
 
@@ -296,7 +315,8 @@ Priority order from dogfood:
    browser tabs. Verified end-to-end.
 4. ~~**`browser_take_screenshot`**~~ — **Done.** CDP `Page.captureScreenshot`;
    viewport / full-page / element. Verified (PNGs inspected).
-5. **`browser_select_option`**, **`browser_evaluate`**, **`browser_hover`**.
+5. ~~**`browser_select_option`**, **`browser_evaluate`**, **`browser_hover`**~~ —
+   **Done.** Verified end-to-end. **CP6 complete.**
 
 Deferred / non-goals:
 

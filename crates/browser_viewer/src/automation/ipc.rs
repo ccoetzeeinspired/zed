@@ -254,6 +254,32 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .map(str::to_string);
             commands::screenshot(browser, full_page, format, quality, ref_id, cx).await
         }
+        "evaluate" => {
+            let function = request
+                .params
+                .get("function")
+                .or_else(|| request.params.get("expression"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("evaluate requires params.function"))?
+                .to_string();
+            let ref_id = request
+                .params
+                .get("ref")
+                .or_else(|| request.params.get("target"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            commands::evaluate(browser, function, ref_id, cx).await
+        }
+        "select_option" => {
+            let ref_id = ref_from_params(&request.params)?;
+            let values = parse_string_list(request.params.get("values"))
+                .ok_or_else(|| anyhow!("select_option requires params.values (string or array)"))?;
+            commands::select_option(browser, &ref_id, values, cx).await
+        }
+        "hover" => {
+            let ref_id = ref_from_params(&request.params)?;
+            commands::hover(browser, &ref_id, cx).await
+        }
         "navigate" => {
             let url = request
                 .params
@@ -348,6 +374,20 @@ fn ref_from_params(params: &Value) -> Result<String> {
         .ok_or_else(|| anyhow!("missing ref/target — run browser_snapshot first"))
 }
 
+/// Accept either a single string or an array of strings (for `select_option`).
+fn parse_string_list(value: Option<&Value>) -> Option<Vec<String>> {
+    match value? {
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +396,16 @@ mod tests {
     fn ipc_response_serializes_ok() {
         let line = ipc_ok_response(json!("1"), json!({ "yaml": "- button" }));
         assert!(line.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn parse_string_list_accepts_string_and_array() {
+        assert_eq!(parse_string_list(Some(&json!("M"))), Some(vec!["M".to_string()]));
+        assert_eq!(
+            parse_string_list(Some(&json!(["S", "L"]))),
+            Some(vec!["S".to_string(), "L".to_string()])
+        );
+        assert_eq!(parse_string_list(Some(&json!(42))), None);
+        assert_eq!(parse_string_list(None), None);
     }
 }

@@ -386,24 +386,31 @@ collisions, prefer the fork's behaviour and re-read this section.
 admin dashboard via claude-acp MCP tools). CP6 (scroll, tabs, screenshot, etc.)
 not started. Full write-up: [`plans/browser-automation.md`](plans/browser-automation.md).
 
-**CP6 progress (2026-05-31):** `browser_press_key` + `browser_scroll` +
-`browser_tabs` shipped + verified (Google + Takealot + TrueLens). press_key
-backs `browser_type`'s `submit:true`. Gotcha baked in: Enter needs `text:"\r"`
-or Chromium skips `keypress` and form-submit silently no-ops (see
-`automation/keys.rs`). scroll returns `{x,y,maxY}`; `ref` mode uses
-`scrollIntoView` (handles inner scrollers). tabs (`automation/tabs.rs`) operates
-on the workspace (`items_of_type::<BrowserView>` / `activate_item` /
-`close_item_by_id`), not CDP — action = list/select/new/close.
-`browser_take_screenshot` uses CDP `Page.captureScreenshot` (viewport /
-`fullPage` / element `ref` clip, png|jpeg), returns an MCP image block — works
-in composition-mode WebView2, no `CapturePreview` fallback needed. Remaining
-Tier 2: select, evaluate, hover.
+**CP6 complete (2026-05-31):** the full 12-tool Playwright-shaped surface is
+shipped + verified. Load-bearing notes for the Tier 2 additions:
+- `browser_press_key` (`automation/keys.rs`) backs `browser_type`'s
+  `submit:true`. Gotcha: Enter needs `text:"\r"` or Chromium skips the
+  `keypress`/`char` event and form-submit silently no-ops (keydown alone still
+  fires, so arrows/suggestion-select work — symptom is "Enter does nothing").
+- `browser_scroll` returns `{x,y,maxY}`; `ref` mode uses `scrollIntoView`
+  (handles inner scroll containers), else `window.scrollBy`.
+- `browser_tabs` (`automation/tabs.rs`) operates on the **workspace**
+  (`items_of_type::<BrowserView>` / `activate_item` / `close_item_by_id`), not
+  CDP — action = list/select/new/close. `resolve_automation_workspace_global`
+  in `target.rs` picks its workspace.
+- `browser_take_screenshot` uses CDP `Page.captureScreenshot` (viewport /
+  `fullPage` / element `ref` clip, png|jpeg) → MCP image block. Works in
+  composition-mode WebView2; no `CapturePreview` fallback needed.
+- `browser_evaluate` / `browser_select_option` / `browser_hover` round out the
+  set. hover uses CDP `Input.dispatchMouseEvent mouseMoved` for real CSS
+  `:hover`.
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through nine MCP tools — `browser_navigate`, `browser_snapshot`,
+through twelve MCP tools — `browser_navigate`, `browser_snapshot`,
 `browser_click`, `browser_type`, `browser_wait_for`, `browser_press_key`,
-`browser_scroll`, `browser_tabs`, `browser_take_screenshot` — registered as the
-`zed-browser` context server. Tools hit the page via CDP (accessibility
+`browser_scroll`, `browser_tabs`, `browser_take_screenshot`, `browser_evaluate`,
+`browser_select_option`, `browser_hover` — registered as the `zed-browser`
+context server. Tools hit the page via CDP (accessibility
 snapshot + DOM scripts), not Sikuli-style coordinates.
 
 **Stack:**
