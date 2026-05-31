@@ -20,7 +20,10 @@ use serde_json::{Value, json};
 use crate::BrowserSettings;
 use crate::automation::commands;
 use crate::automation::navigate::{WaitForOptions, DEFAULT_NAV_TIMEOUT};
+use crate::automation::recorder::{self, FormFieldRec, RecordedAction, Target};
 use crate::automation::tabs;
+use crate::browser_view::BrowserView;
+use gpui::Entity;
 use crate::automation::target::{
     resolve_automation_target_global, resolve_automation_workspace_global,
 };
@@ -191,7 +194,27 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
             anyhow!("No active Zed browser tab. Open one with browser: new tab first.")
         })?;
 
-    match request.method.as_str() {
+    // CP15: `record` start/stop/status + `codegen` are meta-controls — handle
+    // them before the recordable-action path so they aren't themselves recorded.
+    if request.method.as_str() == "record" {
+        return dispatch_record(&request.params, &browser, cx).await;
+    }
+    if request.method.as_str() == "codegen" {
+        let (script, storage_state) = recorder::codegen();
+        return Ok(json!({ "script": script, "storageState": storage_state }));
+    }
+
+    // CP15: resolve ref→role+name *before* the action runs (refs invalidate on
+    // navigation), then commit it to the recording buffer only on success.
+    let pending = if recorder::is_recording() {
+        capture_pending_action(request.method.as_str(), &request.params, &browser, cx)
+    } else {
+        None
+    };
+    // Most arms move `browser` by value; keep a handle for the post-action URL.
+    let browser_for_commit = browser.clone();
+
+    let result = match request.method.as_str() {
         "snapshot" => {
             let snapshot = commands::snapshot(browser, cx).await?;
             Ok(json!({
@@ -570,7 +593,313 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
         }
         "ping" => Ok(json!({ "status": "ok" })),
         other => Err(anyhow!("unknown IPC method {other:?}")),
+    };
+
+    // CP15: commit the recorded action with its post-action URL on success.
+    if result.is_ok() {
+        if let Some(action) = pending {
+            let url = cx.update(|app| {
+                browser_for_commit
+                    .read(app)
+                    .item()
+                    .read(app)
+                    .url()
+                    .to_string()
+            });
+            recorder::push(action, url);
+        }
     }
+
+    result
+}
+
+/// Handle `browser_record` (start / stop / status).
+async fn dispatch_record(
+    params: &Value,
+    browser: &Entity<BrowserView>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let action = params
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("status");
+    match action {
+        "start" => {
+            let capture_ss = params
+                .get("captureStorageState")
+                .or_else(|| params.get("capture_storage_state"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let storage_state = if capture_ss {
+                Some(commands::storage_state(browser.clone(), cx).await?)
+            } else {
+                None
+            };
+            let start_url =
+                cx.update(|app| browser.read(app).item().read(app).url().to_string());
+            recorder::start(start_url, storage_state);
+            Ok(json!({ "recording": true, "storageStateCaptured": capture_ss }))
+        }
+        "stop" => {
+            let count = recorder::stop();
+            Ok(json!({ "recording": false, "actions": count }))
+        }
+        "status" => Ok(recorder::status_json()),
+        other => Err(anyhow!(
+            "unknown record action {other:?}; use start | stop | status"
+        )),
+    }
+}
+
+/// Resolve a snapshot ref to its durable `{role, name}` target (for recording).
+fn resolve_target(
+    browser: &Entity<BrowserView>,
+    ref_id: &str,
+    cx: &mut AsyncApp,
+) -> Option<Target> {
+    cx.update(|app| {
+        browser
+            .read(app)
+            .item()
+            .read(app)
+            .resolve_automation_ref(ref_id)
+            .map(|e| Target::new(e.role, e.name))
+    })
+}
+
+/// Build a [`RecordedAction`] for a recordable method, resolving any refs to
+/// role+name *before* the action runs. Returns `None` for non-recordable
+/// methods (snapshot, evaluate, screenshot, storage, tabs, …).
+fn capture_pending_action(
+    method: &str,
+    params: &Value,
+    browser: &Entity<BrowserView>,
+    cx: &mut AsyncApp,
+) -> Option<RecordedAction> {
+    let target = |ref_id: &str, cx: &mut AsyncApp| resolve_target(browser, ref_id, cx);
+    match method {
+        "navigate" => {
+            let url = params.get("url").and_then(|v| v.as_str())?.to_string();
+            Some(RecordedAction::Navigate { url })
+        }
+        "navigate_back" => Some(RecordedAction::NavigateBack),
+        "click" => {
+            let ref_id = ref_str(params)?;
+            let target = target(&ref_id, cx)?;
+            let button = params
+                .get("button")
+                .and_then(|v| v.as_str())
+                .unwrap_or("left")
+                .to_string();
+            let double = params
+                .get("doubleClick")
+                .or_else(|| params.get("double"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let modifiers = parse_string_list(params.get("modifiers")).unwrap_or_default();
+            Some(RecordedAction::Click {
+                target,
+                button,
+                double,
+                modifiers,
+            })
+        }
+        "type" => {
+            let ref_id = ref_str(params)?;
+            let target = target(&ref_id, cx)?;
+            let text = params.get("text").and_then(|v| v.as_str())?.to_string();
+            let submit = params.get("submit").and_then(|v| v.as_bool()) == Some(true);
+            let slowly = params.get("slowly").and_then(|v| v.as_bool()) == Some(true);
+            let delay_ms = params
+                .get("slowlyDelayMs")
+                .or_else(|| params.get("slowly_delay_ms"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Some(RecordedAction::Type {
+                target,
+                text,
+                submit,
+                slowly,
+                delay_ms,
+            })
+        }
+        "press_key" => {
+            let key = params.get("key").and_then(|v| v.as_str())?.to_string();
+            Some(RecordedAction::PressKey { key })
+        }
+        "hover" => {
+            let ref_id = ref_str(params)?;
+            Some(RecordedAction::Hover {
+                target: target(&ref_id, cx)?,
+            })
+        }
+        "scroll" => {
+            let ref_id = params
+                .get("ref")
+                .or_else(|| params.get("target"))
+                .and_then(|v| v.as_str());
+            if let Some(ref_id) = ref_id {
+                Some(RecordedAction::ScrollTo {
+                    target: target(ref_id, cx)?,
+                })
+            } else {
+                let dx = params.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let dy = params.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                Some(RecordedAction::ScrollBy { dx, dy })
+            }
+        }
+        "select_option" => {
+            let ref_id = ref_str(params)?;
+            let values = parse_string_list(params.get("values"))?;
+            Some(RecordedAction::SelectOption {
+                target: target(&ref_id, cx)?,
+                values,
+            })
+        }
+        "file_upload" => {
+            let ref_id = ref_str(params)?;
+            let paths =
+                parse_string_list(params.get("paths").or_else(|| params.get("files")))?;
+            Some(RecordedAction::FileUpload {
+                target: target(&ref_id, cx)?,
+                paths,
+            })
+        }
+        "drag" => {
+            let start = params
+                .get("startRef")
+                .or_else(|| params.get("start"))
+                .or_else(|| params.get("from"))
+                .and_then(|v| v.as_str())?;
+            let end = params
+                .get("endRef")
+                .or_else(|| params.get("end"))
+                .or_else(|| params.get("to"))
+                .and_then(|v| v.as_str())?;
+            Some(RecordedAction::Drag {
+                from: target(start, cx)?,
+                to: target(end, cx)?,
+            })
+        }
+        "fill_form" => {
+            let arr = params.get("fields").and_then(|v| v.as_array())?;
+            let mut fields = Vec::with_capacity(arr.len());
+            for item in arr {
+                let ref_id = item
+                    .get("ref")
+                    .or_else(|| item.get("target"))
+                    .and_then(|v| v.as_str())?;
+                let value = match item.get("value") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Bool(b)) => b.to_string(),
+                    Some(Value::Number(n)) => n.to_string(),
+                    _ => String::new(),
+                };
+                let kind = item.get("type").and_then(|v| v.as_str()).map(str::to_string);
+                fields.push(FormFieldRec {
+                    target: target(ref_id, cx)?,
+                    value,
+                    kind,
+                });
+            }
+            Some(RecordedAction::FillForm { fields })
+        }
+        "handle_dialog" => {
+            let accept = params.get("accept").and_then(|v| v.as_bool()).unwrap_or(true);
+            let prompt_text = params
+                .get("promptText")
+                .or_else(|| params.get("prompt_text"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Some(RecordedAction::HandleDialog {
+                accept,
+                prompt_text,
+            })
+        }
+        "mouse_move_xy" => Some(RecordedAction::MouseMoveXy {
+            x: num_opt(params, &["x"])?,
+            y: num_opt(params, &["y"])?,
+        }),
+        "mouse_click_xy" => Some(RecordedAction::MouseClickXy {
+            x: num_opt(params, &["x"])?,
+            y: num_opt(params, &["y"])?,
+            button: button_from_params(params),
+            double: params
+                .get("doubleClick")
+                .or_else(|| params.get("double"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        }),
+        "mouse_down" => Some(RecordedAction::MouseDownXy {
+            x: num_opt(params, &["x"])?,
+            y: num_opt(params, &["y"])?,
+            button: button_from_params(params),
+        }),
+        "mouse_up" => Some(RecordedAction::MouseUpXy {
+            x: num_opt(params, &["x"])?,
+            y: num_opt(params, &["y"])?,
+            button: button_from_params(params),
+        }),
+        "mouse_drag_xy" => Some(RecordedAction::MouseDragXy {
+            sx: num_opt(params, &["startX", "x1", "fromX"])?,
+            sy: num_opt(params, &["startY", "y1", "fromY"])?,
+            ex: num_opt(params, &["endX", "x2", "toX"])?,
+            ey: num_opt(params, &["endY", "y2", "toY"])?,
+        }),
+        "mouse_wheel" => Some(RecordedAction::MouseWheel {
+            dx: params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            dy: params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        }),
+        "wait_for" => {
+            let text = params.get("text").and_then(|v| v.as_str());
+            let text_gone = params
+                .get("textGone")
+                .or_else(|| params.get("text_gone"))
+                .and_then(|v| v.as_str());
+            if let Some(text) = text {
+                Some(RecordedAction::WaitForText {
+                    text: text.to_string(),
+                })
+            } else {
+                text_gone.map(|t| RecordedAction::WaitForTextGone { text: t.to_string() })
+            }
+        }
+        "verify_element_visible" => Some(RecordedAction::VerifyElementVisible {
+            target: target(&ref_str(params)?, cx)?,
+        }),
+        "verify_list_visible" => Some(RecordedAction::VerifyListVisible {
+            target: target(&ref_str(params)?, cx)?,
+        }),
+        "verify_text_visible" => {
+            let text = params.get("text").and_then(|v| v.as_str())?.to_string();
+            Some(RecordedAction::VerifyTextVisible { text })
+        }
+        "verify_value" => {
+            let ref_id = ref_str(params)?;
+            let value = params.get("value").and_then(|v| v.as_str())?.to_string();
+            Some(RecordedAction::VerifyValue {
+                target: target(&ref_id, cx)?,
+                value,
+            })
+        }
+        // Not recorded: snapshot, evaluate, screenshot, drop (no PW analog),
+        // console/network, resize, pdf_save, cookies/storage, set_storage_state.
+        _ => None,
+    }
+}
+
+/// Ref/target string from params (no error — recording is best-effort).
+fn ref_str(params: &Value) -> Option<String> {
+    params
+        .get("ref")
+        .or_else(|| params.get("target"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// First present numeric param among `keys` (no error — for recording).
+fn num_opt(params: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|k| params.get(*k).and_then(|v| v.as_f64()))
 }
 
 async fn dispatch_tabs(params: Value, cx: &mut AsyncApp) -> Result<Value> {

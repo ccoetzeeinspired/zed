@@ -1,6 +1,9 @@
 # Agent → Runnable Scripts: Record + Codegen (Plan & Testing Strategy)
 
-**Status:** Proposal / candidate checkpoint (**CP15**). Nothing implemented yet.
+**Status:** **CP15 v1 shipped + verified (2026-05-31).** Recorder + codegen +
+`browser_record`/`browser_codegen` tools land on `feat/cp15-codegen`. The
+record→codegen→runnable-Playwright claim is **proven** against the canonical
+TrueLens login→dashboard flow (see §4.6 Results below).
 **Prereq:** CP0–CP13 shipped (full Playwright MCP parity, 51 tools) — see
 [`browser-automation.md`](browser-automation.md).
 **Branch:** all work lands in `cccl-main` (see `CLAUDE.md` → Branches).
@@ -327,6 +330,66 @@ Keep it opt-in start/stop so the agent scopes exactly the a–e it wants capture
 6. **Canonical first case:** the TrueLens login → `/dashboard` flow (known; and
    `storage_state` seeding already proven this session). Then a search→results
    flow (Takealot) which also exercises autocomplete adaptivity.
+
+#### 4.6 Results — RUN + PROVEN (2026-05-31)
+
+The canonical case was executed end-to-end. The agent drove
+`https://truelens.co.za/` (login → dashboard) through the MCP tools with
+`browser_record` on, then `browser_codegen` emitted this spec **verbatim**
+(zero hand-editing):
+
+```ts
+import { test, expect } from '@playwright/test';
+
+test('recorded flow', async ({ page }) => {
+  await page.goto('https://truelens.co.za/');
+  await page.waitForLoadState();
+  await page.getByRole('textbox', { name: 'Email' }).fill('c@admin.com');
+  await page.getByRole('textbox', { name: 'Password' }).fill('12');
+  await page.getByRole('button', { name: 'Sign In' }).click();
+  await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible();
+  await page.waitForLoadState();
+});
+```
+
+Run under **real Playwright 1.60 Chromium, headless**:
+
+| Metric | Result |
+|---|---|
+| Actions recorded | 5 (navigate, type, type, click, verify) |
+| Manual edits to run | **0** |
+| Pass under real Playwright | **1/1**, then **3/3** re-runs — **no flake** (~1.4 s) |
+| Locator collisions | 0 — every `getByRole(role,{name})` resolved uniquely |
+| LLM reconstruction | none — locators recorded from `RefRegistry` at action time |
+
+So every ephemeral `eN` ref became a durable accessibility-first locator, and the
+run's `verify_*` became the spec's own `expect(...)` assertion. **The claim
+holds for a well-structured flow.**
+
+**One honest residual observed (timing, §3).** The post-click `waitForLoadState()`
+emitted *after* the assertion rather than right after the click: the `click`
+command returns before the async nav to `/dashboard` settles, so the recorder
+captured the click's post-action URL as still `/` and only saw the URL change at
+the next (verify) action. **Harmless** here — Playwright's web-first
+`expect().toBeVisible()` auto-waits — but a real artifact. Fix ideas for v2: read
+`page_generation`/`is_loading` after consequential actions before capturing the
+URL, or emit a defensive `waitForLoadState()` after every `click`. Left as a
+documented residual; the experiment did not require it.
+
+**Repro harness (for the next session):**
+- MCP stdio client: `C:\Users\darks\AppData\Local\Temp\mcp-client.mjs` — accepts
+  a JSON array (or a file path) of `{name, arguments}` calls; does the
+  initialize handshake then runs each `tools/call`.
+- Playwright runner scaffold: `D:\src\zed\target\cp15-pw\` (config + `tests/`);
+  `npx playwright test --project=chromium`. The emitted spec also lands at
+  `D:\src\zed\target\cp15-truelens-login.spec.ts`.
+- Browser tab must be opened by hand (`browser: new tab`) — the agent can't
+  trigger that GUI action headlessly.
+
+**Not yet exercised (next):** the `captureStorageState:true` seeded variant
+(skip login, prove auth reuse) and a search→results flow with autocomplete
+adaptivity. v1 deliberately omits fallback-selector capture (id/data-testid) —
+add it only if a real flow surfaces a role+name collision.
 
 ### 4.7 Effort / risk
 

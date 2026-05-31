@@ -12,6 +12,7 @@ pub mod instrumentation;
 mod ipc;
 mod keys;
 mod navigate;
+mod recorder;
 mod session;
 mod snapshot;
 mod tabs;
