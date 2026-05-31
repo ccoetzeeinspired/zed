@@ -534,6 +534,45 @@ rate on these 4, because their failures are consent flakiness and role-attributi
 divergence, which it doesn't target. Those define the next passes: **v3 resilient
 `.or()` assertion locators**, then **consent/iframe handling**.
 
+#### 4.6.4 Pass 4 — resilient `.or()` assertion locators + a new site (2026-05-31)
+
+Implemented (commit `fb3401e`) **resilient visibility-assertion locators**. When a
+`verify_element_visible`/`_list_visible` relies on role+name (no durable
+structural selector), codegen emits:
+`getByRole(role,{name,exact}).or(getByLabel(name)).or(getByPlaceholder(name)).or(getByText(name)).first()`.
+Principle (universal, Rule-#2-clean — no external heuristics, no site
+assumptions): an accessible name comes from one of a few standard sources (text /
+`<label>` / `placeholder`), so OR the standard Playwright accessors **derived from
+the element's own recorded name**; `.first()` keeps it single (an over-matching
+branch can't strict-mode or regress a passing assertion).
+
+Verified on the rebuilt binary; **also proved the automation layer can open its own
+tab via `browser_tabs new` (MCP) — no GUI step needed**, so passes are now fully
+headless-driveable. Re-drove Guardian/GitHub/MDN/crates.io + a **new site:
+npmjs.com**. 2× Playwright:
+
+| Flow | Result | Note |
+|---|---|---|
+| **GitHub** | **2/2 ✅ (was 0/2)** | **Pass-4 fix confirmed** — the `getByPlaceholder` branch matches the `search`-landmark element whose `getByRole('search')` didn't reproduce |
+| MDN | 2/2 ✅ | — |
+| crates.io | 2/2 ✅ | — |
+| Guardian | 1/2 ⚠️ | consent-overlay flakiness (unchanged; not targeted this pass) |
+| **npmjs (NEW)** | 0/2 ❌ | **site-side bot detection** — npmjs serves Playwright-headless a "Performing security verification" interstitial; the real page never loads (heading count 0). Our embedded WebView2 (real, non-headless Chromium) passed it fine. |
+
+**New finding — headless bot-walls (npmjs).** Some real sites block Playwright
+headless (Cloudflare-style challenge) and serve a verification interstitial, so a
+recorded flow can't reproduce *headless* regardless of locator quality. This is
+the §3 "different engine" residual in its strongest form. Not a codegen defect and
+**not ours to "fix"** (evasion isn't a universal codegen concern, Rule #2);
+mitigations are run-environment, not code: run Playwright **headed**, with a real
+user-data-dir/profile, or seed `storageState`. Worth surfacing to the user as a
+capability of the *runner*, not the generator.
+
+**Cumulative real-site scorecard (deterministic reproduction, excluding
+site-side bot-walls + consent flakiness):** GitHub, MDN, crates.io, TrueLens,
+example→iana, the-internet, quotes, wikipedia = **green**. Open levers:
+**consent/iframe handling** (Guardian) and **headed/profile runner mode** (npmjs).
+
 ### 4.7 Effort / risk
 
 - **Recorder:** small (one hook at the dispatch chokepoint + a Mutex buffer).
