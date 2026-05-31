@@ -151,6 +151,20 @@ pub async fn close(
     snapshot_json(&workspace, cx)
 }
 
+/// CP7 `browser_close`: close the active browser tab in the workspace.
+pub async fn close_active(
+    workspace: Entity<Workspace>,
+    window: AnyWindowHandle,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let tabs = cx.update(|app| collect_tabs(&workspace, app));
+    let index = tabs
+        .iter()
+        .position(|(_, row)| row.active)
+        .ok_or_else(|| anyhow!("no active browser tab to close"))?;
+    close(workspace, window, index, cx).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

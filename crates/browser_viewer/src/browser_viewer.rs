@@ -222,6 +222,7 @@ pub fn init(cx: &mut App) {
                     automation::WaitForOptions {
                         wait_load: true,
                         text: None,
+                        text_gone: None,
                         timeout: automation::DEFAULT_NAV_TIMEOUT,
                     },
                     window,
@@ -249,6 +250,7 @@ pub fn init(cx: &mut App) {
                     automation::WaitForOptions {
                         wait_load: true,
                         text: Some(text),
+                        text_gone: None,
                         timeout: automation::DEFAULT_NAV_TIMEOUT,
                     },
                     window,

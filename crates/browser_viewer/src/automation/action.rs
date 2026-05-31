@@ -188,6 +188,44 @@ pub fn try_scroll_into_view_backend_node(
     )
 }
 
+// Scroll into view + focus (for slow per-key typing).
+const FOCUS_SCRIPT: &str = r#"function() {
+  this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  this.focus();
+  return true;
+}"#;
+
+/// One-shot "scroll into view + focus" on a backend node.
+pub fn try_focus_backend_node(
+    session: &WebView2Session,
+    backend_node_id: i32,
+    on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+) -> Result<()> {
+    invoke_on_backend_node(session, backend_node_id, FOCUS_SCRIPT, None, on_done)
+}
+
+// Set a checkbox/radio checked state and fire input + change.
+const SET_CHECKED_SCRIPT: &str = r#"function(checked) {
+  if (typeof this.checked !== 'boolean') {
+    throw new Error('element is not checkable');
+  }
+  this.checked = !!checked;
+  this.dispatchEvent(new Event('input', { bubbles: true }));
+  this.dispatchEvent(new Event('change', { bubbles: true }));
+  return this.checked;
+}"#;
+
+/// One-shot "set checked" on a checkbox/radio backend node.
+pub fn try_set_checked_backend_node(
+    session: &WebView2Session,
+    backend_node_id: i32,
+    checked: bool,
+    on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+) -> Result<()> {
+    let args = vec![json!({ "value": checked })];
+    invoke_on_backend_node(session, backend_node_id, SET_CHECKED_SCRIPT, Some(&args), on_done)
+}
+
 // Select `<option>`s in a `<select>` by value, label, or visible text; fire
 // input + change so frameworks observe the change. Returns how many matched and
 // the select's resulting value.

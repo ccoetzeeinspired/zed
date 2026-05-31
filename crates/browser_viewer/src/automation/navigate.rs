@@ -21,6 +21,8 @@ pub struct WaitForOptions {
     pub wait_load: bool,
     /// Wait until this substring appears in the document title or body text.
     pub text: Option<String>,
+    /// Wait until this substring is *absent* from the document title and body.
+    pub text_gone: Option<String>,
     pub timeout: Duration,
 }
 
@@ -29,6 +31,7 @@ impl Default for WaitForOptions {
         Self {
             wait_load: true,
             text: None,
+            text_gone: None,
             timeout: DEFAULT_NAV_TIMEOUT,
         }
     }
@@ -137,6 +140,7 @@ pub async fn wait_for_result(
         .text
         .as_deref()
         .map(|t| format!("text {t:?}"))
+        .or_else(|| options.text_gone.as_deref().map(|t| format!("text-gone {t:?}")))
         .unwrap_or_else(|| "load".to_string());
 
     loop {
@@ -161,7 +165,24 @@ pub async fn wait_for_result(
             }
         }
 
-        if load_ready && text_ready {
+        // text_gone: ready when the needle is in neither the title nor the body.
+        let mut gone_ready = options.text_gone.is_none();
+        if let Some(ref needle) = options.text_gone {
+            if !state.title.contains(needle.as_str()) && load_ready {
+                let rx = browser.update(cx, |view, cx| {
+                    view.with_webview_session(cx, |session| {
+                        evaluate_bool(session, &page_contains_text_expression(needle))
+                    })
+                });
+                if let Some(rx) = rx {
+                    if let Ok(Ok(false)) = rx.await {
+                        gone_ready = true;
+                    }
+                }
+            }
+        }
+
+        if load_ready && text_ready && gone_ready {
             log::info!(
                 "browser automation wait for {label} OK (title={:?}, url={})",
                 state.title,

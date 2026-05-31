@@ -1,7 +1,7 @@
 # Browser Automation — Status & Specification
 
-**Status:** CP0–CP6 shipped and verified (12-tool Playwright-shaped surface);
-CP7+ roadmap to **full** Playwright MCP parity in §9  
+**Status:** CP0–CP7 shipped and verified (15-tool surface; CP7 = parity fills +
+click options); CP8+ roadmap to **full** Playwright MCP parity in §9  
 **Branch:** `browser-automation` (off `browser-viewer`)  
 **Platform:** Windows only (WebView2 / CDP)  
 **Last updated:** 2026-05-31
@@ -125,6 +125,7 @@ there.
 | **CP4** | Navigate + wait-for load/text | Done |
 | **CP5** | MCP adapter + `context_servers` + end-to-end agent | Done |
 | **CP6** | Tier 2 breadth (press_key, scroll, tabs, screenshot, evaluate, select_option, hover) | Done |
+| **CP7** | Parity fills (click options, wait_for textGone, type slowly, navigate_back, fill_form, close) | Done |
 
 ### Verification log (2026-05-30)
 
@@ -193,6 +194,43 @@ there.
 values, an independent `evaluate` read-back, or a *viewport-resolution*
 screenshot of the region (full-page PNGs downscale too far to read fine text).
 Don't infer success from the AX snapshot alone.
+
+### Verification log (CP7 — user-confirmed, step-by-step on naledi.co.za)
+
+Each step driven through the MCP server and **visually confirmed by the user**
+against on-page fixtures (no AX-only inference):
+
+- `navigate_back` — naledi → example.com → `GoBack` → back to naledi (page
+  watched changing each time).
+- `type slowly` — text appeared in a visible input via per-char key events
+  (instant in practice; see follow-up on a configurable delay).
+- `fill_form` — text box, checkbox, and `<select>` all changed together
+  (`FORM-FILLED` / ticked / "Large").
+- click options — on-page click-log captured: right → `auxclick`+`contextmenu`
+  (button=2); double → `click(detail1)`,`click(detail2)`,`dblclick`; shift →
+  `click shift=true`.
+- `wait_for textGone` — a banner scheduled to vanish at ~3s; the call blocked
+  the full ~3s and returned as it disappeared.
+- `browser_close` — opened a 2nd tab (watched it appear + activate), closed it,
+  back to one tab.
+
+### Follow-ups discovered during CP7 verification (tracked as separate issues)
+
+1. **Address bar (`url_editor`) stale after navigation** — page navigates
+   correctly but the address-bar text doesn't update. Pre-existing, visual only;
+   does not affect automation (tools read `item.url` / `location.href`, not the
+   editor).
+2. **Post-navigation `evaluate` execution-context race** — right after a
+   navigation, `Runtime.evaluate` can resolve against the *old* page context and
+   return stale data; `navigate` can also return before `NavigationStarting`
+   flips `is_loading`. Pre-setting `is_loading` (as `automation_go_back` does)
+   and/or waiting for a fresh execution context would harden it.
+3. **Snapshot ~500-ref cap** — `browser_snapshot` caps at ~500 refs; elements
+   past that on large pages are not surfaced (an appended element was invisible
+   to the snapshot until moved to the front).
+4. **`type slowly` configurable delay** — add an optional per-character delay so
+   `slowly` can defeat anti-bot/legacy-site rapid-input handling (currently
+   instant).
 
 ### Known fixes during CP5 dogfood
 
@@ -348,9 +386,9 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 |-----------------|--------|-------|
 | `browser_navigate` | ✅ | CP4 |
 | `browser_snapshot` | ✅ | CP1 |
-| `browser_click` | 🔧 add doubleClick / button / modifiers | CP7 |
-| `browser_type` | 🔧 add `slowly` | CP7 |
-| `browser_wait_for` | 🔧 add `textGone` | CP7 |
+| `browser_click` | ✅ doubleClick / button / modifiers | CP7 |
+| `browser_type` | ✅ `slowly` | CP7 |
+| `browser_wait_for` | ✅ `textGone` | CP7 |
 | `browser_press_key` | ✅ | CP6 |
 | `browser_select_option` | ✅ | CP6 |
 | `browser_hover` | ✅ | CP6 |
@@ -358,9 +396,9 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 | `browser_take_screenshot` | ✅ | CP6 |
 | `browser_scroll` (fork ext.) | ✅ | CP6 |
 | `browser_tabs` | ✅ | CP6 |
-| `browser_navigate_back` | ➕ `GoBack` (exists) | CP7 |
-| `browser_fill_form` | ➕ batch type over refs | CP7 |
-| `browser_close` | ➕ close active tab/page | CP7 |
+| `browser_navigate_back` | ✅ `GoBack` | CP7 |
+| `browser_fill_form` | ✅ batch type over refs | CP7 |
+| `browser_close` | ✅ close active tab/page | CP7 |
 | `browser_file_upload` | ➕ CDP `DOM.setFileInputFiles` | CP8 |
 | `browser_drag` | ➕ CDP `Input` drag sequence | CP8 |
 | `browser_drop` | ➕ file/MIME drop | CP8 |
@@ -384,10 +422,10 @@ Legend: ✅ shipped · 🔧 enhance existing · ➕ new · ⛔ divergence (analo
 
 ### 9.2 Checkpoints
 
-- **CP7 — parity fills (no new infra).** `browser_click` doubleClick/button/
-  modifiers; `browser_wait_for` `textGone`; `browser_type` `slowly`;
-  `browser_navigate_back`; `browser_fill_form`; `browser_close`. Mostly DOM /
-  existing methods. Highest leverage, lowest risk.
+- **CP7 — parity fills (no new infra). DONE + user-verified.** `browser_click`
+  doubleClick/button/modifiers; `browser_wait_for` `textGone`; `browser_type`
+  `slowly`; `browser_navigate_back`; `browser_fill_form`; `browser_close`.
+  Mostly DOM / existing methods.
 - **CP8 — input interactions.** `browser_file_upload` (`DOM.setFileInputFiles`),
   `browser_drag` + `browser_drop`, `browser_handle_dialog` (native WebView2
   `ScriptDialogOpening` event + a pending-action policy: accept/dismiss/text).

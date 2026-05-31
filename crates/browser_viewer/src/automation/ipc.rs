@@ -176,6 +176,14 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
     if request.method.as_str() == "tabs" {
         return dispatch_tabs(request.params, cx).await;
     }
+    // `close` acts on the active tab via the workspace (window + workspace), not
+    // a page-level CDP target.
+    if request.method.as_str() == "close" {
+        let (window, workspace) = cx
+            .update(|app| resolve_automation_workspace_global(app))
+            .ok_or_else(|| anyhow!("No Zed workspace window found"))?;
+        return tabs::close_active(workspace, window, cx).await;
+    }
 
     let browser = cx
         .update(|app| resolve_automation_target_global(app))
@@ -193,7 +201,20 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
         }
         "click" => {
             let ref_id = ref_from_params(&request.params)?;
-            commands::click(browser, &ref_id, cx).await?;
+            let button = request
+                .params
+                .get("button")
+                .and_then(|v| v.as_str())
+                .unwrap_or("left")
+                .to_string();
+            let double = request
+                .params
+                .get("doubleClick")
+                .or_else(|| request.params.get("double"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let modifiers = parse_string_list(request.params.get("modifiers")).unwrap_or_default();
+            commands::click(browser, &ref_id, &button, double, &modifiers, cx).await?;
             Ok(json!({ "ref": ref_id }))
         }
         "type" => {
@@ -204,7 +225,8 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("type requires params.text"))?;
             let submit = request.params.get("submit").and_then(|v| v.as_bool()) == Some(true);
-            commands::type_text(browser.clone(), &ref_id, text, submit, cx).await?;
+            let slowly = request.params.get("slowly").and_then(|v| v.as_bool()) == Some(true);
+            commands::type_text(browser.clone(), &ref_id, text, submit, slowly, cx).await?;
             if submit {
                 commands::press_key(browser, "Enter", cx).await?;
             }
@@ -289,29 +311,49 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
             let final_url = commands::navigate(browser, url, cx).await?;
             Ok(json!({ "url": final_url }))
         }
+        "navigate_back" => {
+            let url = commands::navigate_back(browser, cx).await?;
+            Ok(json!({ "url": url }))
+        }
+        "fill_form" => {
+            let fields = parse_form_fields(request.params.get("fields"))?;
+            commands::fill_form(browser, fields, cx).await
+        }
         "wait_for" => {
-            if let Some(secs) = request.params.get("time").and_then(|v| v.as_f64()) {
-                if secs > 0.0 {
-                    cx.background_executor()
-                        .timer(Duration::from_secs_f64(secs))
-                        .await;
-                }
-                return Ok(json!({ "waited_seconds": secs }));
-            }
             let text = request
                 .params
                 .get("text")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let text_gone = request
+                .params
+                .get("textGone")
+                .or_else(|| request.params.get("text_gone"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // `time` is only a plain sleep when no text criterion is given.
+            if text.is_none() && text_gone.is_none() {
+                if let Some(secs) = request.params.get("time").and_then(|v| v.as_f64()) {
+                    if secs > 0.0 {
+                        cx.background_executor()
+                            .timer(Duration::from_secs_f64(secs))
+                            .await;
+                    }
+                    return Ok(json!({ "waited_seconds": secs }));
+                }
+            }
+            let wait_load = request
+                .params
+                .get("wait_load")
+                .and_then(|v| v.as_bool())
+                // When waiting on text(Gone), don't also block on a load event.
+                .unwrap_or(text.is_none() && text_gone.is_none());
             commands::wait_for(
                 browser,
                 WaitForOptions {
-                    wait_load: request
-                        .params
-                        .get("wait_load")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
+                    wait_load,
                     text,
+                    text_gone,
                     timeout: DEFAULT_NAV_TIMEOUT,
                 },
                 cx,
@@ -372,6 +414,31 @@ fn ref_from_params(params: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| anyhow!("missing ref/target — run browser_snapshot first"))
+}
+
+/// Parse `fill_form` `fields`: `[{ ref|target, value, type? }, …]`.
+fn parse_form_fields(value: Option<&Value>) -> Result<Vec<commands::FormField>> {
+    let arr = value
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("fill_form requires params.fields (array)"))?;
+    let mut fields = Vec::with_capacity(arr.len());
+    for item in arr {
+        let ref_id = item
+            .get("ref")
+            .or_else(|| item.get("target"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("each fill_form field needs a ref"))?
+            .to_string();
+        let value = match item.get("value") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Bool(b)) => b.to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        };
+        let kind = item.get("type").and_then(|v| v.as_str()).map(str::to_string);
+        fields.push(commands::FormField { ref_id, value, kind });
+    }
+    Ok(fields)
 }
 
 /// Accept either a single string or an array of strings (for `select_option`).

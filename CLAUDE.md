@@ -405,22 +405,32 @@ shipped + verified. Load-bearing notes for the Tier 2 additions:
   set. hover uses CDP `Input.dispatchMouseEvent mouseMoved` for real CSS
   `:hover`.
 
-**Next: full Playwright MCP parity (CP7+).** The plan's §9 has a full parity
-matrix + checkpoint breakdown: param fills (click modifiers, wait `textGone`),
-navigate_back / fill_form / close (CP7); file_upload / drag-drop / dialogs
-(CP8); coordinate vision tools (CP9); console + network read-only via
+**CP7 done + user-verified (2026-05-31):** parity fills — `browser_click` gains
+doubleClick/button/modifiers (non-default routes through CDP
+`Input.dispatchMouseEvent`); `browser_wait_for` gains `textGone`; `browser_type`
+gains `slowly` (per-char real key events); plus new `browser_navigate_back`
+(WebView2 `GoBack`), `browser_fill_form` (batch text/checkbox/select), and
+`browser_close` (close active tab). Verified step-by-step on-screen by the user.
+Follow-ups logged (see plan §9): address-bar stale-after-nav (cosmetic),
+post-nav `evaluate` execution-context race, ~500-ref snapshot cap, configurable
+`slowly` delay.
+
+**Next: full Playwright MCP parity (CP8+).** The plan's §9 has a full parity
+matrix + checkpoint breakdown: file_upload / drag-drop / dialogs (CP8);
+coordinate vision tools (CP9); console + network read-only via
 `GetDevToolsProtocolEventReceiver` buffers (CP10); resize + pdf (CP11); storage
 (CP12); verify_* assertions (CP13); network mocking deferred (CP14). Documented
 divergences (won't replicate): `run_code_unsafe`, `generate_locator`, tracing/
 video/annotate, `get_config`.
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
-through twelve MCP tools — `browser_navigate`, `browser_snapshot`,
-`browser_click`, `browser_type`, `browser_wait_for`, `browser_press_key`,
-`browser_scroll`, `browser_tabs`, `browser_take_screenshot`, `browser_evaluate`,
+through fifteen MCP tools — `browser_navigate`, `browser_navigate_back`,
+`browser_snapshot`, `browser_click`, `browser_type`, `browser_fill_form`,
+`browser_wait_for`, `browser_press_key`, `browser_scroll`, `browser_tabs`,
+`browser_close`, `browser_take_screenshot`, `browser_evaluate`,
 `browser_select_option`, `browser_hover` — registered as the `zed-browser`
 context server. Tools hit the page via CDP (accessibility
-snapshot + DOM scripts), not Sikuli-style coordinates.
+snapshot + DOM scripts); coordinate-based control arrives in CP9.
 
 **Stack:**
 

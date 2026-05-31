@@ -59,14 +59,29 @@ server.tool(
       .string()
       .optional()
       .describe("Alias for target — snapshot ref (e.g. e14)"),
+    doubleClick: z.boolean().optional().describe("Perform a double-click"),
+    button: z
+      .enum(["left", "right", "middle"])
+      .optional()
+      .describe("Mouse button (default left)"),
+    modifiers: z
+      .array(z.enum(["Alt", "Control", "Meta", "Shift"]))
+      .optional()
+      .describe("Modifier keys to hold during the click"),
   },
-  async ({ target, ref }) => {
+  async ({ target, ref, doubleClick, button, modifiers }) => {
     const elementRef = ref ?? target;
     if (!elementRef) {
       throw new Error("browser_click requires target or ref from browser_snapshot");
     }
     await requireZedOk(
-      await callZedAutomation("click", { ref: elementRef, target: elementRef }),
+      await callZedAutomation("click", {
+        ref: elementRef,
+        target: elementRef,
+        doubleClick: doubleClick ?? false,
+        button: button ?? "left",
+        modifiers: modifiers ?? [],
+      }),
     );
     return textContent(`Clicked ${elementRef}`);
   },
@@ -87,8 +102,12 @@ server.tool(
       .boolean()
       .optional()
       .describe("Whether to press Enter after typing"),
+    slowly: z
+      .boolean()
+      .optional()
+      .describe("Type one character at a time with real key events (for keystroke-driven fields)"),
   },
-  async ({ target, ref, text, submit }) => {
+  async ({ target, ref, text, submit, slowly }) => {
     const elementRef = ref ?? target;
     if (!elementRef) {
       throw new Error("browser_type requires target or ref from browser_snapshot");
@@ -99,6 +118,7 @@ server.tool(
         target: elementRef,
         text,
         submit: submit ?? false,
+        slowly: slowly ?? false,
       }),
     );
     return textContent(`Typed into ${elementRef}`);
@@ -304,24 +324,72 @@ server.tool(
     textGone: z
       .string()
       .optional()
-      .describe("Text to wait to disappear (not implemented — use snapshot)"),
+      .describe("Text to wait to disappear from the page"),
   },
   async ({ time, text, textGone }) => {
     if (textGone) {
-      throw new Error(
-        "textGone is not implemented yet — take a fresh browser_snapshot instead",
-      );
-    }
-    if (time != null && time > 0) {
-      await requireZedOk(await callZedAutomation("wait_for", { time }));
-      return textContent(`Waited ${time}s`);
+      await requireZedOk(await callZedAutomation("wait_for", { textGone }));
+      return textContent(`Text gone ${JSON.stringify(textGone)}`);
     }
     if (text) {
       await requireZedOk(await callZedAutomation("wait_for", { text }));
       return textContent(`Found text ${JSON.stringify(text)}`);
     }
+    if (time != null && time > 0) {
+      await requireZedOk(await callZedAutomation("wait_for", { time }));
+      return textContent(`Waited ${time}s`);
+    }
     await requireZedOk(await callZedAutomation("wait_for", { wait_load: true }));
     return textContent("Page load complete");
+  },
+);
+
+server.tool(
+  "browser_navigate_back",
+  "Go back to the previous page in the embedded Zed browser tab",
+  {},
+  async () => {
+    const result = (await requireZedOk(
+      await callZedAutomation("navigate_back"),
+    )) as { url?: string };
+    return textContent(`Navigated back to ${result.url ?? ""}`);
+  },
+);
+
+server.tool(
+  "browser_fill_form",
+  "Fill multiple form fields in one call in the embedded Zed browser tab",
+  {
+    fields: z
+      .array(
+        z.object({
+          ref: z.string().describe("Snapshot ref of the field"),
+          value: z
+            .union([z.string(), z.boolean()])
+            .describe("Text for inputs, option for selects, or boolean for checkboxes/radios"),
+          type: z
+            .enum(["textbox", "checkbox", "radio", "combobox", "select"])
+            .optional()
+            .describe("Field kind (default textbox)"),
+        }),
+      )
+      .describe("The fields to fill"),
+  },
+  async ({ fields }) => {
+    const result = (await requireZedOk(
+      await callZedAutomation("fill_form", { fields }),
+    )) as { filled?: number };
+    return textContent(`Filled ${result.filled ?? 0} field(s)`);
+  },
+);
+
+server.tool(
+  "browser_close",
+  "Close the active browser tab in the embedded Zed browser",
+  {},
+  async () => {
+    await requireZedOk(await callZedAutomation("close"));
+    return textContent("Closed the active browser tab");
   },
 );
 

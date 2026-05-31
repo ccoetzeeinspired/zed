@@ -11,8 +11,9 @@ use serde_json::Value;
 
 use crate::automation::action::{
     element_for_action, invoke_on_backend_node, try_bounding_rect_backend_node,
-    try_click_backend_node, try_hover_point_backend_node, try_scroll_into_view_backend_node,
-    try_select_option_backend_node, try_type_backend_node,
+    try_click_backend_node, try_focus_backend_node, try_hover_point_backend_node,
+    try_scroll_into_view_backend_node, try_select_option_backend_node,
+    try_set_checked_backend_node, try_type_backend_node,
 };
 use crate::automation::cdp::CdpSession;
 use crate::automation::navigate::{WaitForOptions, normalize_navigate_url, wait_for_result};
@@ -132,22 +133,103 @@ pub async fn snapshot(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result
     Ok(snapshot)
 }
 
+/// Click an element. `button` is "left"/"right"/"middle"; with the default
+/// (left, no double-click, no modifiers) this uses the proven DOM `.click()`
+/// path (actionability auto-wait + form.requestSubmit). Any non-default option
+/// routes through CDP `Input.dispatchMouseEvent` at the element centre so
+/// right-click context menus, double-click, and modifier-clicks behave like a
+/// real pointer.
 pub async fn click(
     browser: Entity<BrowserView>,
     ref_id: &str,
+    button: &str,
+    double: bool,
+    modifiers: &[String],
     cx: &mut AsyncApp,
 ) -> Result<()> {
+    if button == "left" && !double && modifiers.is_empty() {
+        let browser_ref = browser.clone();
+        let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
+        let backend_node_id = element.backend_dom_node_id.expect("checked above");
+        let ref_id = ref_id.to_string();
+        let attempt = Arc::new(
+            move |session: &crate::webview2_host::WebView2Session,
+                  on_done: Box<dyn FnOnce(Result<()>) + 'static>| {
+                try_click_backend_node(session, backend_node_id, on_done)
+            },
+        );
+        return run_with_actionability_wait_result(cx, browser, "click", &ref_id, attempt).await;
+    }
+
+    // Coordinate / button / modifier click via CDP mouse events.
+    let mods = modifier_mask(modifiers)?;
+    let (btn, buttons) = button_codes(button)?;
     let browser_ref = browser.clone();
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
-    let ref_id = ref_id.to_string();
-    let attempt = Arc::new(
-        move |session: &crate::webview2_host::WebView2Session,
-              on_done: Box<dyn FnOnce(Result<()>) + 'static>| {
-            try_click_backend_node(session, backend_node_id, on_done)
-        },
-    );
-    run_with_actionability_wait_result(cx, browser, "click", &ref_id, attempt).await
+    let point_raw = run_one_shot(&browser, cx, &format!("click-point {ref_id}"), move |session, done| {
+        try_hover_point_backend_node(session, backend_node_id, done)
+    })
+    .await?;
+    let point = unwrap_cdp_value(point_raw);
+    let x = point.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = point.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+    let clicks = if double { 2 } else { 1 };
+    for cc in 1..=clicks {
+        dispatch_mouse(&browser, cx, "mousePressed", x, y, btn, buttons, cc, mods).await?;
+        dispatch_mouse(&browser, cx, "mouseReleased", x, y, btn, 0, cc, mods).await?;
+    }
+    Ok(())
+}
+
+/// CDP modifier bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8) from modifier names.
+fn modifier_mask(modifiers: &[String]) -> Result<i64> {
+    let mut mask = 0;
+    for m in modifiers {
+        mask |= match m.to_ascii_lowercase().as_str() {
+            "alt" | "option" => 1,
+            "control" | "ctrl" => 2,
+            "meta" | "cmd" | "command" => 4,
+            "shift" => 8,
+            other => return Err(anyhow!("unknown modifier {other:?}")),
+        };
+    }
+    Ok(mask)
+}
+
+/// CDP mouse button name + `buttons` bitmask (left=1, right=2, middle=4).
+fn button_codes(button: &str) -> Result<(&'static str, i64)> {
+    Ok(match button {
+        "left" => ("left", 1),
+        "right" => ("right", 2),
+        "middle" => ("middle", 4),
+        other => return Err(anyhow!("unknown button {other:?}")),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_mouse(
+    browser: &Entity<BrowserView>,
+    cx: &mut AsyncApp,
+    kind: &str,
+    x: f64,
+    y: f64,
+    button: &str,
+    buttons: i64,
+    click_count: i64,
+    modifiers: i64,
+) -> Result<()> {
+    let params = serde_json::json!({
+        "type": kind, "x": x, "y": y, "button": button,
+        "buttons": buttons, "clickCount": click_count, "modifiers": modifiers,
+    })
+    .to_string();
+    run_one_shot(browser, cx, "mouse", move |session, done| {
+        CdpSession::new(session).call_method("Input.dispatchMouseEvent", &params, done)
+    })
+    .await?;
+    Ok(())
 }
 
 pub async fn type_text(
@@ -155,8 +237,12 @@ pub async fn type_text(
     ref_id: &str,
     text: &str,
     keep_focus_for_submit: bool,
+    slowly: bool,
     cx: &mut AsyncApp,
 ) -> Result<()> {
+    if slowly {
+        return type_slowly(browser, ref_id, text, cx).await;
+    }
     let browser_ref = browser.clone();
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
@@ -169,6 +255,47 @@ pub async fn type_text(
         },
     );
     run_with_actionability_wait_result(cx, browser, "type", &ref_id, attempt).await
+}
+
+/// Type character-by-character via real CDP key events (focus, then keyDown/
+/// keyUp per char). More faithful than the bulk value-setter for frameworks
+/// that key off keystrokes.
+async fn type_slowly(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    text: &str,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let browser_ref = browser.clone();
+    let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
+    let backend_node_id = element.backend_dom_node_id.expect("checked above");
+    run_one_shot(&browser, cx, &format!("focus {ref_id}"), move |session, done| {
+        try_focus_backend_node(session, backend_node_id, done)
+    })
+    .await?;
+
+    let chars: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+    let dispatched = browser.update(cx, |view, cx| {
+        view.with_webview_session(cx, |session| {
+            for ch in &chars {
+                let (key, code, vk, text_payload) =
+                    match crate::automation::keys::parse_key(ch) {
+                        Ok(k) => (k.key, k.code, k.windows_virtual_key_code, k.text),
+                        // Char the key table doesn't map (e.g. space, unicode):
+                        // send it as raw text so the renderer still inserts it.
+                        Err(_) => (ch.clone(), String::new(), 0, Some(ch.clone())),
+                    };
+                let _ = session.dispatch_key_event("keyDown", &key, &code, 0, vk, text_payload.as_deref());
+                let _ = session.dispatch_key_event("keyUp", &key, &code, 0, vk, None);
+            }
+            true
+        })
+        .unwrap_or(false)
+    });
+    if !dispatched {
+        return Err(anyhow!("browser automation type (slowly) {ref_id}: no live WebView2 session"));
+    }
+    Ok(())
 }
 
 /// CP6: press a key (Playwright-style spec) on the focused element / page.
@@ -489,12 +616,89 @@ pub async fn navigate(
         WaitForOptions {
             wait_load: true,
             text: None,
+            text_gone: None,
             timeout: crate::automation::DEFAULT_NAV_TIMEOUT,
         },
         cx,
     )
     .await?;
     Ok(target)
+}
+
+/// CP7: navigate back in history (WebView2 `GoBack`), then wait for load.
+/// Returns the resulting URL. Errors if there is no back entry.
+pub async fn navigate_back(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result<String> {
+    let went_back = browser.update(cx, |view, cx| view.automation_go_back(cx));
+    if !went_back {
+        return Err(anyhow!("no back history on this tab"));
+    }
+    wait_for_result(
+        browser.clone(),
+        WaitForOptions {
+            wait_load: true,
+            text: None,
+            text_gone: None,
+            timeout: crate::automation::DEFAULT_NAV_TIMEOUT,
+        },
+        cx,
+    )
+    .await?;
+    let url = cx.update(|app| browser.read(app).item().read(app).url().to_string());
+    Ok(url)
+}
+
+/// A single field for `fill_form`. `kind` is "textbox" (default) / "checkbox" /
+/// "radio" / "combobox" / "select"; `value` is the text, option, or boolean.
+pub struct FormField {
+    pub ref_id: String,
+    pub value: String,
+    pub kind: Option<String>,
+}
+
+/// CP7: fill several fields in one call. Routes each field by kind: checkbox/
+/// radio → set checked; combobox/select → select option; else → type text.
+pub async fn fill_form(
+    browser: Entity<BrowserView>,
+    fields: Vec<FormField>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let mut filled = 0u64;
+    for field in &fields {
+        match field.kind.as_deref() {
+            Some("checkbox") | Some("radio") => {
+                let checked = !matches!(
+                    field.value.to_ascii_lowercase().as_str(),
+                    "" | "false" | "0" | "off" | "no" | "unchecked"
+                );
+                set_checked(browser.clone(), &field.ref_id, checked, cx).await?;
+            }
+            Some("combobox") | Some("select") => {
+                select_option(browser.clone(), &field.ref_id, vec![field.value.clone()], cx).await?;
+            }
+            _ => {
+                type_text(browser.clone(), &field.ref_id, &field.value, false, false, cx).await?;
+            }
+        }
+        filled += 1;
+    }
+    Ok(serde_json::json!({ "filled": filled }))
+}
+
+/// Set a checkbox/radio checked state (used by `fill_form`).
+async fn set_checked(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    checked: bool,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let browser_ref = browser.clone();
+    let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
+    let backend_node_id = element.backend_dom_node_id.expect("checked above");
+    run_one_shot(&browser, cx, &format!("check {ref_id}"), move |session, done| {
+        try_set_checked_backend_node(session, backend_node_id, checked, done)
+    })
+    .await?;
+    Ok(())
 }
 
 pub async fn wait_for(

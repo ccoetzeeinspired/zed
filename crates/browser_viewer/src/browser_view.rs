@@ -296,6 +296,19 @@ impl BrowserView {
         self.navigate_to(target, cx);
     }
 
+    /// CP7: navigate back in history. Returns `false` (no-op) if there is no
+    /// back entry. Pre-sets `is_loading` so a following wait-for-load doesn't
+    /// race the `NavigationStarting` event.
+    #[cfg(target_os = "windows")]
+    pub fn automation_go_back(&self, cx: &mut Context<Self>) -> bool {
+        if !self.item.read(cx).can_go_back {
+            return false;
+        }
+        self.item.update(cx, |item, _| item.is_loading = true);
+        self.go_back(cx);
+        true
+    }
+
     #[cfg(target_os = "windows")]
     fn navigate_to(&self, target: String, cx: &mut Context<Self>) {
         self.item.update(cx, |item, _| {
