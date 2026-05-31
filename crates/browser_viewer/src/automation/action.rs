@@ -157,6 +157,22 @@ const SCROLL_INTO_VIEW_SCRIPT: &str = r#"function() {
   return { x: window.scrollX, y: window.scrollY, maxY: Math.max(0, el.scrollHeight - el.clientHeight) };
 }"#;
 
+// Page-coordinate bounding box of the element (CSS px, document-relative), for
+// use as a `Page.captureScreenshot` clip with `captureBeyondViewport: true`.
+const BOUNDING_RECT_SCRIPT: &str = r#"function() {
+  const r = this.getBoundingClientRect();
+  return { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height };
+}"#;
+
+/// One-shot "measure this element's page-coordinate bounding box".
+pub fn try_bounding_rect_backend_node(
+    session: &WebView2Session,
+    backend_node_id: i32,
+    on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
+) -> Result<()> {
+    invoke_on_backend_node(session, backend_node_id, BOUNDING_RECT_SCRIPT, None, on_done)
+}
+
 /// One-shot "scroll this element into view" on a backend DOM node.
 pub fn try_scroll_into_view_backend_node(
     session: &WebView2Session,

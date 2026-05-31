@@ -231,6 +231,29 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
             let pos = commands::scroll(browser, ref_id, dx, dy, cx).await?;
             Ok(pos)
         }
+        "screenshot" => {
+            let full_page = request
+                .params
+                .get("full_page")
+                .or_else(|| request.params.get("fullPage"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let format = request
+                .params
+                .get("type")
+                .or_else(|| request.params.get("format"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("png")
+                .to_string();
+            let quality = request.params.get("quality").and_then(|v| v.as_i64());
+            let ref_id = request
+                .params
+                .get("ref")
+                .or_else(|| request.params.get("target"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            commands::screenshot(browser, full_page, format, quality, ref_id, cx).await
+        }
         "navigate" => {
             let url = request
                 .params

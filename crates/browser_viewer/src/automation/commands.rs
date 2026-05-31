@@ -10,8 +10,8 @@ use gpui::{AsyncApp, Entity};
 use serde_json::Value;
 
 use crate::automation::action::{
-    element_for_action, try_click_backend_node, try_scroll_into_view_backend_node,
-    try_type_backend_node,
+    element_for_action, try_bounding_rect_backend_node, try_click_backend_node,
+    try_scroll_into_view_backend_node, try_type_backend_node,
 };
 use crate::automation::cdp::CdpSession;
 use crate::automation::navigate::{WaitForOptions, normalize_navigate_url, wait_for_result};
@@ -292,6 +292,78 @@ fn unwrap_cdp_value(v: Value) -> Value {
     v.get("value").cloned().unwrap_or(v)
 }
 
+/// Build a `Page.captureScreenshot` clip (page coords + scale) from a measured
+/// element rect. Errors if the element has no layout box.
+fn clip_from_rect(rect: &Value) -> Result<Value> {
+    let num = |k: &str| rect.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let (width, height) = (num("width"), num("height"));
+    if width <= 0.0 || height <= 0.0 {
+        return Err(anyhow!("element has no layout box to screenshot"));
+    }
+    Ok(serde_json::json!({
+        "x": num("x"),
+        "y": num("y"),
+        "width": width,
+        "height": height,
+        "scale": 1.0,
+    }))
+}
+
+/// CP6: screenshot the page via CDP `Page.captureScreenshot`. Returns
+/// `{ data: <base64>, mimeType, bytes }`.
+///
+/// - `full_page` → `captureBeyondViewport` (whole scrollable page).
+/// - `ref_id` → clip to that element's page-coordinate box (implies
+///   beyond-viewport so off-screen elements still capture).
+/// - `format` is `"png"` or `"jpeg"`; `quality` applies to jpeg only.
+pub async fn screenshot(
+    browser: Entity<BrowserView>,
+    full_page: bool,
+    format: String,
+    quality: Option<i64>,
+    ref_id: Option<String>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let mut params = serde_json::Map::new();
+    params.insert("format".into(), Value::from(format.clone()));
+    let mut beyond_viewport = full_page;
+
+    if let Some(ref_id) = ref_id {
+        let browser_ref = browser.clone();
+        let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, &ref_id, app))?;
+        let backend_node_id = element.backend_dom_node_id.expect("checked above");
+        let rect_raw = run_one_shot(&browser, cx, &format!("rect {ref_id}"), move |session, done| {
+            try_bounding_rect_backend_node(session, backend_node_id, done)
+        })
+        .await?;
+        params.insert("clip".into(), clip_from_rect(&unwrap_cdp_value(rect_raw))?);
+        // A page-coordinate clip only resolves correctly beyond the viewport.
+        beyond_viewport = true;
+    }
+
+    params.insert("captureBeyondViewport".into(), Value::Bool(beyond_viewport));
+    if format == "jpeg" {
+        params.insert("quality".into(), Value::from(quality.unwrap_or(80)));
+    }
+    let params_str = Value::Object(params).to_string();
+
+    let raw = run_one_shot(&browser, cx, "screenshot", move |session, done| {
+        CdpSession::new(session).call_method("Page.captureScreenshot", &params_str, done)
+    })
+    .await?;
+
+    let data = raw
+        .get("data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Page.captureScreenshot returned no data"))?;
+    let mime = if format == "jpeg" {
+        "image/jpeg"
+    } else {
+        "image/png"
+    };
+    Ok(serde_json::json!({ "data": data, "mimeType": mime, "bytes": data.len() }))
+}
+
 pub async fn navigate(
     browser: Entity<BrowserView>,
     url: &str,
@@ -340,5 +412,20 @@ mod tests {
     fn unwrap_cdp_value_passes_through_unwrapped() {
         let plain = json!({ "x": 1, "y": 2 });
         assert_eq!(unwrap_cdp_value(plain.clone()), plain);
+    }
+
+    #[test]
+    fn clip_from_rect_builds_scaled_clip() {
+        let rect = json!({ "x": 10.0, "y": 20.0, "width": 300.0, "height": 150.0 });
+        let clip = clip_from_rect(&rect).unwrap();
+        assert_eq!(clip["x"], 10.0);
+        assert_eq!(clip["width"], 300.0);
+        assert_eq!(clip["scale"], 1.0);
+    }
+
+    #[test]
+    fn clip_from_rect_rejects_zero_size() {
+        let rect = json!({ "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0 });
+        assert!(clip_from_rect(&rect).is_err());
     }
 }

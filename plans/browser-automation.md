@@ -95,9 +95,10 @@ Override port with env `ZED_BROWSER_AUTOMATION_PORT`.
 | `browser_press_key` | `press_key` | Playwright-style key spec → CDP `Input.dispatchKeyEvent` (keyDown+keyUp); also backs `type`'s `submit:true` |
 | `browser_scroll` | `scroll` | `ref` → `scrollIntoView` (handles inner scrollers); else `window.scrollBy(dx,dy)`. Returns `{x,y,maxY}`. Fork extension (Playwright MCP has no scroll tool). |
 | `browser_tabs` | `tabs` | `action` = list / select / new / close (+ `index`, `url`). Operates on the **workspace** (`items_of_type::<BrowserView>`, `activate_item`, `close_item_by_id`), not CDP. Returns `{tabs:[{index,title,url,active}],count}`. |
+| `browser_take_screenshot` | `screenshot` | CDP `Page.captureScreenshot`. `fullPage` (captureBeyondViewport), `ref` (element clip in page coords), `type` png/jpeg + `quality`. Returns an MCP image content block. |
 
 Tier 2 remaining (CP6, not started): `browser_select_option`,
-`browser_take_screenshot`, `browser_hover`, `browser_evaluate`.
+`browser_hover`, `browser_evaluate`.
 
 **Key-dispatch gotcha (learned in CP6):** Enter must carry `text:"\r"` in the
 keyDown, or Chromium never fires the `keypress`/`char` event — `keydown` alone
@@ -120,7 +121,7 @@ there.
 | **CP3** | Type into inputs (incl. React controlled fields) | Done |
 | **CP4** | Navigate + wait-for load/text | Done |
 | **CP5** | MCP adapter + `context_servers` + end-to-end agent | Done |
-| **CP6** | Tier 2 breadth | In progress — `browser_press_key`, `browser_scroll`, `browser_tabs` done |
+| **CP6** | Tier 2 breadth | In progress — `browser_press_key`, `browser_scroll`, `browser_tabs`, `browser_take_screenshot` done |
 
 ### Verification log (2026-05-30)
 
@@ -162,6 +163,16 @@ there.
   resolved, active `[1]`); `select 0` → active flips to TrueLens; `close 1` →
   back to 1 tab. Tab focus + close **visually confirmed by the user** (workspace
   z-order / WebView2 underlay correct).
+
+### Verification log (CP6, `browser_take_screenshot`)
+
+- **Unit:** `automation::commands` — `clip_from_rect` (builds scaled clip;
+  rejects zero-size).
+- **Runtime (Takealot homepage, decoded PNGs inspected):** viewport (326 KB,
+  valid PNG sig, above-the-fold render); `fullPage` (3.16 MB, full scrollable
+  page incl. footer); element `ref=e101` (1.7 KB, just the search box). Confirms
+  CDP `Page.captureScreenshot` works in composition-mode WebView2 — no
+  `CapturePreview` fallback needed.
 
 ### Known fixes during CP5 dogfood
 
@@ -283,7 +294,8 @@ Priority order from dogfood:
    returns `{x,y,maxY}`. Verified on Takealot results.
 3. ~~**`browser_tabs`**~~ — **Done.** list / select / new / close over workspace
    browser tabs. Verified end-to-end.
-4. **`browser_take_screenshot`** — PNG for agent context (separate from snapshot).
+4. ~~**`browser_take_screenshot`**~~ — **Done.** CDP `Page.captureScreenshot`;
+   viewport / full-page / element. Verified (PNGs inspected).
 5. **`browser_select_option`**, **`browser_evaluate`**, **`browser_hover`**.
 
 Deferred / non-goals:

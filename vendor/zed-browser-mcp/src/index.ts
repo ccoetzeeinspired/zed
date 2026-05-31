@@ -123,6 +123,46 @@ server.tool(
 );
 
 server.tool(
+  "browser_take_screenshot",
+  "Take a screenshot (PNG/JPEG) of the embedded Zed browser tab",
+  {
+    fullPage: z
+      .boolean()
+      .optional()
+      .describe("Capture the full scrollable page instead of just the viewport"),
+    type: z.enum(["png", "jpeg"]).optional().describe("Image format (default png)"),
+    quality: z
+      .number()
+      .int()
+      .min(0)
+      .max(100)
+      .optional()
+      .describe("JPEG quality 0-100 (jpeg only)"),
+    ref: z
+      .string()
+      .optional()
+      .describe("Snapshot ref (e.g. e14) to screenshot just that element"),
+    target: z.string().optional().describe("Alias for ref"),
+  },
+  async ({ fullPage, type, quality, ref, target }) => {
+    const params: Record<string, unknown> = {};
+    if (fullPage != null) params.full_page = fullPage;
+    if (type) params.type = type;
+    if (quality != null) params.quality = quality;
+    const elementRef = ref ?? target;
+    if (elementRef) params.ref = elementRef;
+    const result = (await requireZedOk(
+      await callZedAutomation("screenshot", params),
+    )) as { data: string; mimeType: string };
+    return {
+      content: [
+        { type: "image" as const, data: result.data, mimeType: result.mimeType },
+      ],
+    };
+  },
+);
+
+server.tool(
   "browser_scroll",
   "Scroll the embedded Zed browser tab — by a pixel delta, or to bring a snapshot element into view",
   {
