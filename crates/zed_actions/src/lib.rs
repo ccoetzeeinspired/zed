@@ -580,9 +580,40 @@ pub mod agent {
         /// Annotated screenshot (selected-element outline + freehand strokes
         /// composited onto the page capture), base64-encoded PNG.
         pub annotated_png_base64: SharedString,
+        /// Freehand strokes exported as SVG in viewport-local coordinates.
+        /// This gives the agent textual/vector context even if image input is
+        /// unavailable or ignored by the active ACP backend.
+        #[serde(default)]
+        pub drawing_svg: SharedString,
         /// Whether the user drew freehand annotations.
         pub has_drawing: bool,
     }
+
+    /// Resolve a target element in the active embedded browser tab.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct BrowserResolveElement {
+        /// Query kind: selected, selector, text_exact, text_contains, or role_and_name.
+        pub query_kind: SharedString,
+        /// Query payload. For role_and_name use "role|name".
+        pub query: SharedString,
+    }
+
+    /// Click the currently previewed element in the active embedded browser tab.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct BrowserClickResolvedElement {
+        /// Optional request id. Empty means click the current preview.
+        pub request_id: SharedString,
+    }
+
+    /// Clear the visible browser agent cursor in the active embedded browser tab.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct BrowserClearAgentCursor;
 }
 
 pub mod assistant {

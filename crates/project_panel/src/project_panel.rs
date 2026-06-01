@@ -60,10 +60,10 @@ use std::{
 };
 use theme_settings::ThemeSettings;
 use ui::{
-    Color, ContextMenu, ContextMenuEntry, DecoratedIcon, Icon, IconDecoration, IconDecorationKind,
-    IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, Label, LabelSize, ListItem,
-    ListItemSpacing, ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate,
-    Tooltip, WithScrollbar, prelude::*, v_flex,
+    Color, ContextMenu, ContextMenuEntry, DecoratedIcon, Icon, IconButtonShape, IconDecoration,
+    IconDecorationKind, IndentGuideColors, IndentGuideLayout, Indicator, KeyBinding, Label,
+    LabelSize, ListItem, ListItemSpacing, ProjectEmptyState, ScrollAxes, ScrollableHandle,
+    Scrollbars, StickyCandidate, Tab, Tooltip, WithScrollbar, prelude::*, v_flex,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -6710,6 +6710,37 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
+                        .w_full()
+                        .child(
+                            h_flex()
+                                .id("project-panel-toolbar")
+                                .h(Tab::container_height(cx))
+                                .w_full()
+                                .px_1p5()
+                                .justify_end()
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border)
+                                .child(
+                                    IconButton::new(
+                                        "project-panel-collapse-all",
+                                        IconName::ListCollapse,
+                                    )
+                                    .shape(IconButtonShape::Square)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(|_, cx| {
+                                        Tooltip::for_action("Collapse All", &CollapseAllEntries, cx)
+                                    })
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.collapse_all_entries(
+                                                &CollapseAllEntries,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                ),
+                        )
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {

@@ -66,6 +66,7 @@ pub enum MentionUri {
     MergeConflict {
         file_path: String,
     },
+    Browser,
     Skill {
         name: String,
         source: String,
@@ -289,6 +290,8 @@ impl MentionUri {
                 } else if path.starts_with("/agent/merge-conflict") {
                     let file_path = single_query_param(&url, "path")?.unwrap_or_default();
                     Ok(Self::MergeConflict { file_path })
+                } else if path == "/agent/browser/current" {
+                    Ok(Self::Browser)
                 } else if path.starts_with("/agent/skill") {
                     let mut name = None;
                     let mut source = None;
@@ -359,6 +362,7 @@ impl MentionUri {
                     .to_string_lossy();
                 format!("Merge Conflict ({name})")
             }
+            MentionUri::Browser => "Zed Browser".to_string(),
             MentionUri::Selection {
                 abs_path: path,
                 line_range,
@@ -450,6 +454,7 @@ impl MentionUri {
             MentionUri::Fetch { .. } => IconName::ToolWeb.path().into(),
             MentionUri::GitDiff { .. } => IconName::GitBranch.path().into(),
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
+            MentionUri::Browser => IconName::ToolWeb.path().into(),
             MentionUri::Skill { .. } => IconName::Sparkle.path().into(),
         }
     }
@@ -564,6 +569,7 @@ impl MentionUri {
                 url.query_pairs_mut().append_pair("path", file_path);
                 url
             }
+            MentionUri::Browser => Url::parse("zed:///agent/browser/current").unwrap(),
             MentionUri::Skill {
                 name,
                 source,
@@ -837,6 +843,16 @@ mod tests {
         let parsed = MentionUri::parse(&serialized, PathStyle::local()).unwrap();
 
         assert_eq!(parsed, skill_uri);
+    }
+
+    #[test]
+    fn test_parse_browser_uri() {
+        let browser_uri = "zed:///agent/browser/current";
+        let parsed = MentionUri::parse(browser_uri, PathStyle::local()).unwrap();
+
+        assert_eq!(parsed, MentionUri::Browser);
+        assert_eq!(parsed.name(), "Zed Browser");
+        assert_eq!(parsed.to_uri().to_string(), browser_uri);
     }
 
     #[test]

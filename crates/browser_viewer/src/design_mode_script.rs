@@ -34,8 +34,6 @@ pub const SCRIPT: &str = r#"
         console.warn(TAG, 'chrome.webview not available — design mode disabled');
         return;
     }
-    window.__zedDesignMode = true;
-    console.log(TAG, 'installed at', location.href);
 
     const OVERLAY_BORDER = '2px solid rgb(0, 255, 136)';
     let overlay = null;
@@ -55,6 +53,9 @@ pub const SCRIPT: &str = r#"
     let armed = false;
     let hovered = null;
     let selected = null;
+    let agentPageRevision = 1;
+    let agentSnapshotCounter = 1;
+    let agentRefCounter = 1;
 
     function post(msg) {
         try { window.chrome.webview.postMessage(JSON.stringify(msg)); }
@@ -159,6 +160,472 @@ pub const SCRIPT: &str = r#"
         if (overlay) overlay.style.display = 'none';
     }
 
+    function visible(el) {
+        if (!(el instanceof Element)) return false;
+        const rect = el.getBoundingClientRect();
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 &&
+            style.visibility !== 'hidden' && style.display !== 'none';
+    }
+
+    function norm(s) {
+        return (s || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function elementText(el) {
+        return norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+    }
+
+    function roleOf(el) {
+        const explicit = el.getAttribute('role');
+        if (explicit) return explicit;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'button') return 'button';
+        if (tag === 'a' && el.hasAttribute('href')) return 'link';
+        if (tag === 'input') {
+            const type = (el.getAttribute('type') || 'text').toLowerCase();
+            if (type === 'submit' || type === 'button') return 'button';
+            return 'textbox';
+        }
+        return null;
+    }
+
+    function accessibleName(el) {
+        return norm(el.getAttribute('aria-label') || el.value || elementText(el));
+    }
+
+    function serializeAgentTarget(el, confidence) {
+        const rect = el.getBoundingClientRect();
+        return {
+            selector: cssPath(el),
+            tag: el.tagName.toLowerCase(),
+            text: elementText(el).slice(0, 500),
+            role: roleOf(el),
+            accessibleName: accessibleName(el).slice(0, 500),
+            rect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height },
+            source: detectReactSource(el),
+            confidence,
+        };
+    }
+
+    function allVisibleElements() {
+        return Array.from(document.querySelectorAll('body *')).filter(visible);
+    }
+
+    function bumpAgentPageRevision() {
+        agentPageRevision += 1;
+    }
+
+    function installAgentPageRevisionObserver() {
+        try {
+            const root = document.documentElement;
+            if (!root) {
+                document.addEventListener('DOMContentLoaded', installAgentPageRevisionObserver, { once: true });
+                return;
+            }
+            new MutationObserver(bumpAgentPageRevision).observe(root, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                characterData: true,
+            });
+        } catch (err) {
+            console.warn(TAG, 'page revision observer unavailable', err);
+        }
+    }
+
+    function roleOfForSnapshot(el) {
+        const explicit = roleOf(el);
+        if (explicit) return explicit;
+        const tag = el.tagName.toUpperCase();
+        const mapped = {
+            H1: 'heading',
+            H2: 'heading',
+            H3: 'heading',
+            H4: 'heading',
+            H5: 'heading',
+            H6: 'heading',
+            UL: 'list',
+            OL: 'list',
+            LI: 'listitem',
+            MAIN: 'main',
+            NAV: 'navigation',
+            FORM: 'form',
+            SECTION: el.getAttribute('aria-label') ? 'region' : null,
+            ARTICLE: 'article',
+        }[tag];
+        return mapped || null;
+    }
+
+    function isSnapshotVisible(el) {
+        if (!visible(el)) return false;
+        return getComputedStyle(el).opacity !== '0';
+    }
+
+    function isInteractiveSnapshotElement(el) {
+        return el.matches('button, a[href], input, textarea, select, [role], [tabindex], summary, label');
+    }
+
+    function snapshotNodeForElement(el, depth) {
+        if (!isSnapshotVisible(el) || depth > 6) return null;
+        const role = roleOfForSnapshot(el);
+        const text = elementText(el).slice(0, 220);
+        const interactive = isInteractiveSnapshotElement(el);
+        const children = [];
+        for (const child of Array.from(el.children || [])) {
+            const childNode = snapshotNodeForElement(child, depth + 1);
+            if (childNode) children.push(childNode);
+        }
+        if (!role && !interactive && !text && children.length === 0) return null;
+        if (!role && !interactive && children.length === 1 && !text) return children[0];
+        const rect = el.getBoundingClientRect();
+        const node = {
+            role: role || (text ? 'text' : null),
+            name: interactive ? accessibleName(el).slice(0, 220) : null,
+            text: interactive ? null : text,
+            selector: interactive ? cssPath(el) : null,
+            rect: interactive ? { x: rect.left, y: rect.top, w: rect.width, h: rect.height } : null,
+            children,
+            disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+            editable: el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el.isContentEditable,
+        };
+        if (interactive) node.ref = `e${agentRefCounter++}`;
+        return node;
+    }
+
+    function collectAgentSnapshot(requestId) {
+        try {
+            agentRefCounter = 1;
+            const rootElement = document.querySelector('main') || document.body;
+            const snapshotId = `snap-${agentSnapshotCounter++}`;
+            const rootNode = rootElement ? snapshotNodeForElement(rootElement, 0) : null;
+            post({
+                kind: 'agent_snapshot_result',
+                requestId,
+                snapshot: {
+                    snapshotId,
+                    pageRevision: agentPageRevision,
+                    url: location.href,
+                    title: document.title || '',
+                    root: rootNode ? [rootNode] : [],
+                },
+            });
+        } catch (err) {
+            post({
+                kind: 'agent_snapshot_result',
+                requestId,
+                snapshot: {
+                    snapshotId: `snap-${agentSnapshotCounter++}`,
+                    pageRevision: agentPageRevision,
+                    url: location.href,
+                    title: document.title || '',
+                    root: [],
+                    reason: String(err && err.message || err),
+                },
+            });
+        }
+    }
+
+    function isDirectlyInteractive(el) {
+        return el.matches('button, a[href], input, textarea, select, [role], [tabindex], summary, label');
+    }
+
+    function isUsefulSnapshotElement(el) {
+        if (!isDirectlyInteractive(el)) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 4 || rect.height < 4) return false;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'input') {
+            const type = (el.getAttribute('type') || 'text').toLowerCase();
+            if (type === 'hidden') return false;
+        }
+        if (Array.from(el.children || []).some(child => visible(child) && isDirectlyInteractive(child))) {
+            const role = roleOf(el);
+            return role === 'button' || role === 'link' || role === 'textbox';
+        }
+        return Boolean(roleOf(el) || accessibleName(el) || elementText(el));
+    }
+
+    function collectVisibleElements(requestId) {
+        try {
+            const seen = new Set();
+            const elements = allVisibleElements()
+                .filter(isUsefulSnapshotElement)
+                .sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    return (ar.top - br.top) || (ar.left - br.left);
+                })
+                .map(el => serializeAgentTarget(el, 'strong'))
+                .filter(target => {
+                    if (seen.has(target.selector)) return false;
+                    seen.add(target.selector);
+                    target.text = String(target.text || '').slice(0, 180);
+                    target.accessibleName = String(target.accessibleName || '').slice(0, 180);
+                    return true;
+                })
+                .slice(0, 80);
+            post({
+                kind: 'agent_visible_elements_result',
+                requestId,
+                snapshot: {
+                    url: location.href,
+                    title: document.title || '',
+                    elements,
+                },
+            });
+        } catch (err) {
+            post({
+                kind: 'agent_visible_elements_result',
+                requestId,
+                snapshot: {
+                    url: location.href,
+                    title: document.title || '',
+                    elements: [],
+                },
+            });
+        }
+    }
+
+    function agentCandidateScore(el, query, needle) {
+        const rect = el.getBoundingClientRect();
+        const text = elementText(el).toLowerCase();
+        const name = accessibleName(el).toLowerCase();
+        const role = roleOf(el);
+        let score = 0;
+        if (query.type === 'text_exact' && text === needle) score -= 10000;
+        if (query.type === 'text_contains' && (text === needle || name === needle)) score -= 8000;
+        if (role === 'button' || role === 'link' || role === 'textbox') score -= 3000;
+        if (el.matches('button, a[href], input, textarea, select, [role], [tabindex]')) score -= 2000;
+        if (Array.from(el.children || []).some(child => elementText(child).toLowerCase().includes(needle))) {
+            score += 4000;
+        }
+        score += Math.min(text.length, 2000);
+        score += Math.min(rect.width * rect.height, 100000) / 100;
+        return score;
+    }
+
+    function sortAgentCandidates(elements, query, needle) {
+        return elements.sort((a, b) => agentCandidateScore(a, query, needle) - agentCandidateScore(b, query, needle));
+    }
+
+    function resolveAgentTarget(requestId, query) {
+        try {
+            let candidates = [];
+            if (!query || !query.type) {
+                post({ kind: 'agent_target_not_found', requestId, reason: 'Missing query type' });
+                return;
+            }
+            if (query.type === 'selected') {
+                if (!selected || !visible(selected)) {
+                    post({ kind: 'agent_target_not_found', requestId, reason: 'No selected element' });
+                    return;
+                }
+                candidates = [serializeAgentTarget(selected, 'exact')];
+            } else if (query.type === 'selector') {
+                candidates = Array.from(document.querySelectorAll(query.selector || ''))
+                    .filter(visible)
+                    .map(el => serializeAgentTarget(el, 'exact'));
+            } else if (query.type === 'text_exact' || query.type === 'text_contains') {
+                const needle = norm(query.text).toLowerCase();
+                const elements = allVisibleElements().filter(el => {
+                    const hay = elementText(el).toLowerCase();
+                    return query.type === 'text_exact' ? hay === needle : hay.includes(needle);
+                });
+                candidates = sortAgentCandidates(elements, query, needle)
+                    .map(el => serializeAgentTarget(el, query.type === 'text_exact' ? 'exact' : 'strong'));
+            } else if (query.type === 'role_and_name') {
+                const role = norm(query.role).toLowerCase();
+                const name = norm(query.name).toLowerCase();
+                const elements = allVisibleElements().filter(el => {
+                    return (roleOf(el) || '').toLowerCase() === role &&
+                        accessibleName(el).toLowerCase().includes(name);
+                });
+                candidates = sortAgentCandidates(elements, query, name)
+                    .map(el => serializeAgentTarget(el, 'strong'));
+            } else if (query.type === 'point') {
+                const el = document.elementFromPoint(query.x, query.y);
+                candidates = el && visible(el) ? [serializeAgentTarget(el, 'exact')] : [];
+            }
+
+            if (candidates.length === 0) {
+                post({ kind: 'agent_target_not_found', requestId, reason: 'No visible element matched' });
+            } else if (candidates.length === 1) {
+                post({ kind: 'agent_target_resolved', requestId, target: candidates[0] });
+            } else {
+                post({ kind: 'agent_target_ambiguous', requestId, candidates: candidates.slice(0, 8) });
+            }
+        } catch (err) {
+            post({ kind: 'agent_target_not_found', requestId, reason: String(err && err.message || err) });
+        }
+    }
+
+    function setNativeValue(el, value) {
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype :
+            el instanceof HTMLInputElement ? HTMLInputElement.prototype : null;
+        const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value') &&
+            Object.getOwnPropertyDescriptor(proto, 'value').set;
+        if (setter) setter.call(el, value);
+        else el.value = value;
+    }
+
+    function typeIntoAgentTarget(requestId, selector, text) {
+        try {
+            const el = document.querySelector(selector || '');
+            if (!el || !visible(el)) {
+                post({ kind: 'agent_type_text_result', requestId, ok: false, reason: 'Target is not visible' });
+                return;
+            }
+
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+
+            if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+                setNativeValue(el, text);
+                try {
+                    el.setSelectionRange(String(text).length, String(text).length);
+                } catch (_) {}
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    composed: true,
+                    inputType: 'insertText',
+                    data: text,
+                }));
+                el.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                const valueMatches = el.value === text;
+                const valid = typeof el.checkValidity === 'function' ? el.checkValidity() : true;
+                const reason = !valueMatches ? `Observed value did not match requested text: ${el.value}` :
+                    !valid ? (el.validationMessage || 'Field validation failed') : null;
+                post({ kind: 'agent_type_text_result', requestId, ok: valueMatches && valid, value: el.value, reason });
+                return;
+            }
+
+            if (el.isContentEditable) {
+                el.textContent = text;
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    composed: true,
+                    inputType: 'insertText',
+                    data: text,
+                }));
+                post({ kind: 'agent_type_text_result', requestId, ok: el.textContent === text, value: el.textContent || '' });
+                return;
+            }
+
+            post({ kind: 'agent_type_text_result', requestId, ok: false, reason: `Target <${el.tagName.toLowerCase()}> cannot receive text` });
+        } catch (err) {
+            post({ kind: 'agent_type_text_result', requestId, ok: false, reason: String(err && err.message || err) });
+        }
+    }
+
+    function disabledForAction(el) {
+        return Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
+    }
+
+    function editableForAction(el) {
+        return el instanceof HTMLInputElement ||
+            el instanceof HTMLTextAreaElement ||
+            el.isContentEditable;
+    }
+
+    function receivesEvents(el) {
+        const rect = el.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        return Boolean(hit && (hit === el || el.contains(hit) || hit.contains(el)));
+    }
+
+    function actionabilityForSelector(requestId, selector, requiresEditable) {
+        try {
+            const el = document.querySelector(selector || '');
+            const attached = Boolean(el);
+            const isVisible = attached && visible(el);
+            const stable = true;
+            const enabled = attached && !disabledForAction(el);
+            const editable = attached && editableForAction(el);
+            const events = attached && isVisible && receivesEvents(el);
+            let reason = null;
+            if (!attached) reason = 'Element is detached';
+            else if (!isVisible) reason = 'Element is not visible';
+            else if (!stable) reason = 'Element is not stable';
+            else if (!enabled) reason = 'Element is disabled';
+            else if (requiresEditable && !editable) reason = 'Element is not editable';
+            else if (!events) reason = 'Element does not receive events';
+            post({
+                kind: 'agent_actionability_result',
+                requestId,
+                ok: !reason,
+                selector,
+                checks: {
+                    attached,
+                    visible: Boolean(isVisible),
+                    stable,
+                    enabled: Boolean(enabled),
+                    editable: Boolean(editable),
+                    receivesEvents: Boolean(events),
+                },
+                reason,
+            });
+        } catch (err) {
+            post({
+                kind: 'agent_actionability_result',
+                requestId,
+                ok: false,
+                selector,
+                checks: {
+                    attached: false,
+                    visible: false,
+                    stable: false,
+                    enabled: false,
+                    editable: false,
+                    receivesEvents: false,
+                },
+                reason: String(err && err.message || err),
+            });
+        }
+    }
+
+    function collectPageState(requestId) {
+        try {
+            const active = document.activeElement instanceof Element ? document.activeElement : null;
+            const messageElements = Array.from(document.querySelectorAll(
+                '[role="alert"], [aria-live], .toast, .error, .invalid, [data-error], input, textarea, select'
+            ));
+            const messages = [];
+            for (const el of messageElements) {
+                if (!visible(el)) continue;
+                if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+                    if (el.validationMessage) messages.push(el.validationMessage);
+                    continue;
+                }
+                const text = norm(elementText(el));
+                if (text) messages.push(text);
+            }
+            post({
+                kind: 'agent_page_state_result',
+                requestId,
+                state: {
+                    url: location.href,
+                    title: document.title || '',
+                    activeSelector: active ? cssPath(active) : null,
+                    activeValue: active && 'value' in active ? String(active.value || '') : null,
+                    messages: Array.from(new Set(messages)).slice(0, 8),
+                }
+            });
+        } catch (err) {
+            post({
+                kind: 'agent_page_state_result',
+                requestId,
+                state: {
+                    url: location.href,
+                    title: document.title || '',
+                    messages: [String(err && err.message || err)],
+                }
+            });
+        }
+    }
+
     // Capture-phase swallow. Every event the page could navigate on,
     // we intercept first. preventDefault stops the default action
     // (form submit, anchor navigation); stopImmediatePropagation stops
@@ -225,10 +692,31 @@ pub const SCRIPT: &str = r#"
                rect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height } });
     }, true);
 
+    window.addEventListener('popstate', bumpAgentPageRevision, true);
+    window.addEventListener('hashchange', bumpAgentPageRevision, true);
+
     window.chrome.webview.addEventListener('message', evt => {
         const msg = evt.data;
         console.log(TAG, 'host message:', msg);
-        if (msg === 'activate') {
+        let parsed = null;
+        if (typeof msg === 'string' && msg[0] === '{') {
+            try { parsed = JSON.parse(msg); } catch (_) {}
+        }
+        if (parsed && parsed.kind === 'find_element') {
+            resolveAgentTarget(parsed.requestId, parsed.query);
+        } else if (parsed && parsed.kind === 'snapshot') {
+            collectAgentSnapshot(parsed.requestId);
+        } else if (parsed && parsed.kind === 'visible_elements') {
+            collectVisibleElements(parsed.requestId);
+        } else if (parsed && parsed.kind === 'actionability') {
+            actionabilityForSelector(parsed.requestId, parsed.selector, Boolean(parsed.requiresEditable));
+        } else if (parsed && parsed.kind === 'type_text') {
+            typeIntoAgentTarget(parsed.requestId, parsed.selector, parsed.text || '');
+        } else if (parsed && parsed.kind === 'page_state') {
+            collectPageState(parsed.requestId);
+        } else if (parsed && parsed.kind === 'clear_agent_cursor') {
+            post({ kind: 'agent_target_not_found', requestId: parsed.requestId, reason: 'cleared' });
+        } else if (msg === 'activate') {
             armed = true;
             ensureOverlay();
         } else if (msg === 'deactivate') {
@@ -238,6 +726,80 @@ pub const SCRIPT: &str = r#"
         }
     });
 
+    installAgentPageRevisionObserver();
+    window.__zedDesignMode = true;
+    console.log(TAG, 'installed at', location.href);
     post({ kind: 'ready' });
 })();
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::SCRIPT;
+
+    #[test]
+    fn agent_listener_is_registered_before_installed_sentinel() {
+        let listener = SCRIPT
+            .find("window.chrome.webview.addEventListener('message'")
+            .expect("script should install the host-message listener");
+        let sentinel = SCRIPT
+            .find("window.__zedDesignMode = true")
+            .expect("script should mark itself installed");
+
+        assert!(
+            listener < sentinel,
+            "script must not mark itself installed before the host-message listener exists"
+        );
+    }
+
+    #[test]
+    fn fallible_dom_revision_observer_is_not_installed_before_agent_listener() {
+        let observer_install = SCRIPT
+            .find("installAgentPageRevisionObserver();")
+            .expect("script should install page revision observer");
+        let listener = SCRIPT
+            .find("window.chrome.webview.addEventListener('message'")
+            .expect("script should install the host-message listener");
+
+        assert!(
+            listener < observer_install,
+            "page revision observer must not be able to abort before host-message listener install"
+        );
+    }
+
+    #[test]
+    fn design_mode_activation_and_picking_are_installed_before_ready() {
+        let pick_events = SCRIPT
+            .find("const PICK_EVENTS = [")
+            .expect("script should define picking events");
+        let hover = SCRIPT
+            .find("document.addEventListener('mousemove'")
+            .expect("script should install hover preview listener");
+        let activate = SCRIPT
+            .find("msg === 'activate'")
+            .expect("script should handle design-mode activation");
+        let ready = SCRIPT
+            .find("post({ kind: 'ready' });")
+            .expect("script should signal readiness");
+
+        assert!(pick_events < ready, "element picking must be installed before ready");
+        assert!(hover < ready, "hover preview must be installed before ready");
+        assert!(activate < ready, "activation handler must be installed before ready");
+    }
+
+    #[test]
+    fn page_revision_observer_handles_early_document_without_aborting_install() {
+        assert!(
+            SCRIPT.contains("const root = document.documentElement;"),
+            "observer should read documentElement into a guarded root"
+        );
+        assert!(
+            SCRIPT.contains("if (!root)"),
+            "observer should handle documentElement being unavailable at document-created time"
+        );
+        assert!(
+            SCRIPT.contains("console.warn(TAG, 'page revision observer unavailable', err);"),
+            "observer failures should be contained instead of aborting script install"
+        );
+    }
+}

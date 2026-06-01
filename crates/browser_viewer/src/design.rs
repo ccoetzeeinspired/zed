@@ -5,13 +5,13 @@
 //! `design_mode_script.rs`); we parse them into [`DesignInbound`]
 //! variants and apply state changes in `BrowserItem`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Where in the document an element sits, in CSS pixels relative to
 /// the viewport. Matches `Element.getBoundingClientRect()` semantics:
 /// `(x, y)` is the top-left, `(w, h)` is size — both float, both can
 /// be negative when the element is scrolled off-screen.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ElementRect {
     pub x: f32,
     pub y: f32,
@@ -23,7 +23,7 @@ pub struct ElementRect {
 /// by the script's `detectReactSource` cascade — `_debugSource` is the
 /// gold path, `data-source-*` attributes come next, then coarse
 /// component / testid hints.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ElementSource {
     #[serde(default)]

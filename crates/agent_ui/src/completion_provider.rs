@@ -166,24 +166,28 @@ pub(crate) enum PromptContextType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptContextAction {
     AddSelections,
+    AddBrowser,
 }
 
 impl PromptContextAction {
     pub fn keyword(&self) -> &'static str {
         match self {
             Self::AddSelections => "selection",
+            Self::AddBrowser => "browser",
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
             Self::AddSelections => "Selection",
+            Self::AddBrowser => "Browser",
         }
     }
 
     pub fn icon(&self) -> IconName {
         match self {
             Self::AddSelections => IconName::Reader,
+            Self::AddBrowser => IconName::ToolWeb,
         }
     }
 }
@@ -369,9 +373,10 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
     fn completion_for_entry(
         entry: PromptContextEntry,
         source_range: Range<Anchor>,
+        source: Arc<T>,
         editor: WeakEntity<Editor>,
         mention_set: WeakEntity<MentionSet>,
-        workspace: &Entity<Workspace>,
+        workspace: Entity<Workspace>,
         cx: &mut App,
     ) -> Option<Completion> {
         match entry {
@@ -392,12 +397,61 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                 group: None,
             }),
             PromptContextEntry::Action(action) => {
+                if action == PromptContextAction::AddBrowser {
+                    return Some(Self::completion_for_browser(
+                        source_range,
+                        source,
+                        editor,
+                        mention_set,
+                        workspace,
+                        cx,
+                    ));
+                }
+
                 let selection = workspace.update(cx, |workspace, cx| {
                     AgentContextSource::from_active(workspace, cx)?
                         .read_selection(workspace, false, cx)
                 });
                 Self::completion_for_action(action, source_range, editor, mention_set, selection)
             }
+        }
+    }
+
+    fn completion_for_browser(
+        source_range: Range<Anchor>,
+        source: Arc<T>,
+        editor: WeakEntity<Editor>,
+        mention_set: WeakEntity<MentionSet>,
+        workspace: Entity<Workspace>,
+        cx: &mut App,
+    ) -> Completion {
+        let uri = MentionUri::Browser;
+        let new_text = format!("{} ", uri.as_link());
+        let new_text_len = new_text.len();
+        let icon_path = uri.icon_path(cx);
+        Completion {
+            replace_range: source_range.clone(),
+            new_text,
+            label: CodeLabel::plain(uri.name(), None),
+            documentation: Some(CompletionDocumentation::SingleLine(
+                "Active embedded Zed browser via zed-browser tools".into(),
+            )),
+            source: project::CompletionSource::Custom,
+            icon_path: Some(icon_path),
+            match_start: None,
+            snippet_deduplication_key: None,
+            insert_text_mode: None,
+            confirm: Some(confirm_completion_callback(
+                "Zed Browser".into(),
+                source_range.start,
+                new_text_len - 1,
+                uri,
+                source,
+                editor,
+                mention_set,
+                workspace,
+            )),
+            group: None,
         }
     }
 
@@ -701,6 +755,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                     )
                 }
             },
+            PromptContextAction::AddBrowser => return None,
         };
 
         Some(Completion {
@@ -1211,6 +1266,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         let mut entries = vec![
             PromptContextEntry::Mode(PromptContextType::File),
             PromptContextEntry::Mode(PromptContextType::Symbol),
+            PromptContextEntry::Action(PromptContextAction::AddBrowser),
         ];
 
         if self.source.supports_context(PromptContextType::Thread, cx) {
@@ -1637,9 +1693,10 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                         Self::completion_for_entry(
                                             entry,
                                             source_range.clone(),
+                                            source.clone(),
                                             editor.clone(),
                                             mention_set.clone(),
-                                            &workspace,
+                                            workspace.clone(),
                                             cx,
                                         )
                                     }

@@ -23,7 +23,8 @@ use settings::{LanguageModelProviderSetting, LanguageModelSelection};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
+        AddSelectionToThread, BrowserClearAgentCursor, BrowserClickResolvedElement,
+        BrowserResolveElement, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
         ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SendDesignBundleToAgent,
     },
@@ -588,6 +589,32 @@ pub fn init(cx: &mut App) {
                         });
                     }
                 })
+                .register_action(|workspace, action: &BrowserResolveElement, window, cx| {
+                    relay_to_active_browser_or_toast(
+                        workspace,
+                        Box::new(action.clone()),
+                        window,
+                        cx,
+                    );
+                })
+                .register_action(
+                    |workspace, action: &BrowserClickResolvedElement, window, cx| {
+                        relay_to_active_browser_or_toast(
+                            workspace,
+                            Box::new(action.clone()),
+                            window,
+                            cx,
+                        );
+                    },
+                )
+                .register_action(|workspace, action: &BrowserClearAgentCursor, window, cx| {
+                    relay_to_active_browser_or_toast(
+                        workspace,
+                        Box::new(action.clone()),
+                        window,
+                        cx,
+                    );
+                })
                 .register_action(
                     |workspace: &mut Workspace, _: &AddSelectionToThread, window, cx| {
                         let active_editor = workspace
@@ -710,6 +737,13 @@ fn build_design_bundle_blocks(action: &SendDesignBundleToAgent) -> Vec<acp::Cont
             "\nThe attached screenshot shows the page with the selected element \
              outlined and the user's freehand annotation drawn on top.\n",
         );
+        if !action.drawing_svg.is_empty() {
+            text.push_str(
+                "\nFreehand annotation SVG, in viewport-local screenshot coordinates:\n```svg\n",
+            );
+            text.push_str(action.drawing_svg.as_ref());
+            text.push_str("\n```\n");
+        }
     } else {
         text.push_str(
             "\nThe attached screenshot shows the page with the selected element \
@@ -753,6 +787,45 @@ fn build_design_bundle_blocks(action: &SendDesignBundleToAgent) -> Vec<acp::Cont
     }
 
     blocks
+}
+
+#[cfg(test)]
+fn content_block_text(block: &acp::ContentBlock) -> Option<&str> {
+    match block {
+        acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+        _ => None,
+    }
+}
+
+fn relay_to_active_browser_or_toast(
+    workspace: &mut Workspace,
+    action: Box<dyn Action>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(active_item) = workspace.active_item(cx) else {
+        show_no_active_browser_toast(workspace, cx);
+        return;
+    };
+
+    if active_item.agent_browser_context(cx).is_some() {
+        active_item.relay_action(action, window, cx);
+    } else {
+        show_no_active_browser_toast(workspace, cx);
+    }
+}
+
+fn show_no_active_browser_toast(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    struct NoActiveBrowserToast;
+
+    workspace.show_toast(
+        workspace::Toast::new(
+            workspace::notifications::NotificationId::unique::<NoActiveBrowserToast>(),
+            "No active Zed browser tab is open. Open one with browser::NewTab.",
+        )
+        .autohide(),
+        cx,
+    );
 }
 
 fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::ContentBlock> {
@@ -1463,7 +1536,9 @@ impl AgentPanel {
             // Agent rather than Zed's native agent. The Zed Agent entry
             // is also removed from the picker below, so this is the
             // only way users reach the panel.
-            selected_agent: Agent::Custom { id: "claude-acp".into() },
+            selected_agent: Agent::Custom {
+                id: "claude-acp".into(),
+            },
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
@@ -6412,6 +6487,32 @@ mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    #[test]
+    fn design_bundle_with_drawing_includes_vector_annotation_context() {
+        let action = SendDesignBundleToAgent {
+            prompt: "Move this CTA below the hero".into(),
+            selector: "main > button".into(),
+            page_url: "https://example.test".into(),
+            outer_html: "<button>Buy</button>".into(),
+            source_hint: Some("src/app.tsx:42".into()),
+            annotated_png_base64: "iVBORw0KGgo=".into(),
+            drawing_svg: "<svg><path d=\"M1 2 L3 4\"/></svg>".into(),
+            has_drawing: true,
+        };
+
+        let blocks = build_design_bundle_blocks(&action);
+        let combined_text = blocks
+            .iter()
+            .filter_map(content_block_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            combined_text.contains("Freehand annotation SVG"),
+            "drawing submissions need textual/vector annotation context when images are unavailable"
+        );
     }
 
     #[gpui::test]

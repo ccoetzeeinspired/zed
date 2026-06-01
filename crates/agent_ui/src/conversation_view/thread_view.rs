@@ -9904,6 +9904,7 @@ pub(crate) fn open_link(
             MentionUri::TerminalSelection { .. } => {}
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
+            MentionUri::Browser => {}
             MentionUri::Skill {
                 skill_file_path, ..
             } => {
