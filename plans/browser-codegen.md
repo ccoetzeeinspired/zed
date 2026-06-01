@@ -644,6 +644,48 @@ headless, confirming the codegen handles the e-retail browse class broadly.
 
 **Scorecard add:** eBay → green. Real-site reproduction now green on 11 sites.
 
+#### 4.6.7 Pass 7 — frame-aware snapshot / iframe support (2026-05-31)
+
+Implemented (commit `221cb77`) full **frame awareness**, fixing the longest-standing
+residual (cross-origin consent, e.g. Guardian's Sourcepoint CMP).
+
+**Enabling finding (overturned §4.6.4's assumption):** WebView2 **flattens OOPIFs
+into the top CDP session**. Cross-origin child frames are reachable from the top
+session for *both* reading (`Accessibility.getFullAXTree({frameId})`) *and* acting
+(`DOM.resolveNode` on a cross-frame `backendNodeId`). A probe confirmed Guardian's
+`sourcepoint.theguardian.com` consent frame returns **128 AX nodes**, and its
+button `resolveNode`'d — so the existing click/type path works cross-frame with no
+session routing.
+
+**What shipped:**
+- `commands::snapshot` enumerates frames (`Page.getFrameTree`) + per-frame
+  `getFullAXTree({frameId})`, combined into one ref registry (`snapshot.rs`
+  `FrameAx`/`snapshot_from_frames`/`append_frame`). Child frames render under an
+  `iframe "<url>"` label; refs are numbered continuously; dup `(role,name)`
+  indices are computed **per frame** (the scope `getByRole` runs in).
+- `ElementRef.frame_selector` + `Target::root()` → codegen scopes the locator
+  (and the resilient `.or()` chain) through `page.frameLocator(<sel>)` for
+  in-frame elements. The iframe selector is read from the element's **real
+  attributes** via `DOM.describeNode` (id/data-testid/title/name/src) — *not* the
+  frame document URL (which differs from the `src` attribute for srcdoc/dynamic
+  editors; that bug cost a debug cycle on TinyMCE).
+- Actions need no change — `backendNodeId` resolves cross-frame.
+
+**Verified (with the user in the loop):**
+- Cross-origin consent now appears in the snapshot as refs and is **dismissible**
+  — confirmed live on Guardian (Sourcepoint, cross-origin) and lolesports
+  (main-frame), the banner disappearing on-screen.
+- A generated `frameLocator` spec —
+  `page.frameLocator('iframe[id="mce_0_ifr"]').getByRole('paragraph')` (TinyMCE
+  iframe) — passes real Playwright **3/3**.
+- 49 automation unit tests pass (incl. 2 new frameLocator-codegen tests).
+
+**Residual:** the iframe selector relies on the iframe element carrying a stable
+attribute (id/title/name/src) — fine for consent CMPs (stable message-id'd iframes)
+and most embeds; a fully attribute-less dynamic iframe would fall back to the frame
+URL. This closes the cross-origin-consent lever from §4.6.4; the remaining
+non-green real case is npmjs (headless bot-wall — a runner/environment matter).
+
 ### 4.7 Effort / risk
 
 - **Recorder:** small (one hook at the dispatch chokepoint + a Mutex buffer).
