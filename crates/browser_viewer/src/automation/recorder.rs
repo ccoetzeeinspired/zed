@@ -42,6 +42,9 @@ pub struct Target {
     /// Preferred over a positional `.nth(i)`, and (for a `data-testid`) over the
     /// accessible name too.
     pub durable: Option<DurableLoc>,
+    /// CSS selector of the owning `<iframe>` when this element is in a child
+    /// frame. Codegen scopes the locator through `page.frameLocator(<sel>)`.
+    pub frame_selector: Option<String>,
 }
 
 impl Target {
@@ -51,6 +54,7 @@ impl Target {
             name: name.into(),
             index: None,
             durable: None,
+            frame_selector: None,
         }
     }
 
@@ -64,6 +68,21 @@ impl Target {
     pub fn with_durable(mut self, durable: Option<DurableLoc>) -> Self {
         self.durable = durable;
         self
+    }
+
+    /// Attach the owning iframe selector (if this element is in a child frame).
+    pub fn with_frame(mut self, frame_selector: Option<String>) -> Self {
+        self.frame_selector = frame_selector;
+        self
+    }
+
+    /// The Playwright locator root: `page`, or `page.frameLocator(<sel>)` when
+    /// the element lives in a child frame.
+    fn root(&self) -> String {
+        match &self.frame_selector {
+            Some(sel) => format!("page.frameLocator({})", js_str(sel)),
+            None => "page".to_string(),
+        }
     }
 }
 
@@ -528,16 +547,17 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
 /// fix genuine multiplicity — N truly identical elements — which still needs
 /// `.nth(i)`/a fallback selector; see the codegen plan §4.4.)
 fn locator(t: &Target) -> String {
+    let root = t.root();
     // 1. data-testid → Playwright's most durable locator. Test ids are an
     //    intentional, stable contract, so prefer one even over a unique name.
     if let Some(DurableLoc::TestId(v)) = &t.durable {
-        return format!("page.getByTestId({})", js_str(v));
+        return format!("{root}.getByTestId({})", js_str(v));
     }
     let base = if t.name.is_empty() {
-        format!("page.getByRole({})", js_str(&t.role))
+        format!("{root}.getByRole({})", js_str(&t.role))
     } else {
         format!(
-            "page.getByRole({}, {{ name: {}, exact: true }})",
+            "{root}.getByRole({}, {{ name: {}, exact: true }})",
             js_str(&t.role),
             js_str(&t.name)
         )
@@ -553,7 +573,7 @@ fn locator(t: &Target) -> String {
     //    selector is a semantic disambiguator — strictly better than guessing by
     //    DOM position.
     if let Some(DurableLoc::Css(sel)) = &t.durable {
-        return format!("page.locator({})", js_str(sel));
+        return format!("{root}.locator({})", js_str(sel));
     }
     // 4. Last resort: positional index.
     format!("{base}.nth({})", t.index.unwrap_or(0))
@@ -608,11 +628,12 @@ fn resilient_visible_locator(t: &Target) -> String {
         return primary;
     }
     let n = js_str(&t.name);
+    let root = t.root();
     format!(
         "{primary}\
-         .or(page.getByLabel({n}, {{ exact: true }}))\
-         .or(page.getByPlaceholder({n}, {{ exact: true }}))\
-         .or(page.getByText({n}, {{ exact: true }}))\
+         .or({root}.getByLabel({n}, {{ exact: true }}))\
+         .or({root}.getByPlaceholder({n}, {{ exact: true }}))\
+         .or({root}.getByText({n}, {{ exact: true }}))\
          .first()"
     )
 }
@@ -808,6 +829,38 @@ mod tests {
         let s = render(&r);
         assert!(s.contains("await page.locator('a[href=\"/world\"]').click();"));
         assert!(!s.contains(".nth("));
+    }
+
+    #[test]
+    fn frame_target_scopes_through_frame_locator() {
+        let r = rec(
+            "https://x.com",
+            vec![RecordedAction::Click {
+                target: Target::new("button", "Accept all")
+                    .with_frame(Some("iframe[src=\"https://cmp.example/consent\"]".into())),
+                button: "left".into(),
+                double: false,
+                modifiers: vec![],
+            }],
+        );
+        let s = render(&r);
+        assert!(s.contains(
+            "await page.frameLocator('iframe[src=\"https://cmp.example/consent\"]').getByRole('button', { name: 'Accept all', exact: true }).click();"
+        ));
+    }
+
+    #[test]
+    fn frame_verify_scopes_or_chain_through_frame_locator() {
+        let r = rec(
+            "https://x.com",
+            vec![RecordedAction::VerifyElementVisible {
+                target: Target::new("heading", "Privacy")
+                    .with_frame(Some("iframe#cmp".into())),
+            }],
+        );
+        let s = render(&r);
+        assert!(s.contains("page.frameLocator('iframe#cmp').getByRole('heading', { name: 'Privacy', exact: true })"));
+        assert!(s.contains(".or(page.frameLocator('iframe#cmp').getByText('Privacy', { exact: true }))"));
     }
 
     #[test]

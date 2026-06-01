@@ -666,7 +666,9 @@ fn resolve_target(
             .map(|e| {
                 // Only emit .nth(i) when the role+name was actually ambiguous.
                 let index = (e.dup_count > 1).then_some(e.dup_index);
-                Target::new(e.role, e.name).with_index(index)
+                Target::new(e.role, e.name)
+                    .with_index(index)
+                    .with_frame(e.frame_selector)
             })
     })
 }

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -137,38 +137,115 @@ impl AxNode {
     }
 }
 
-/// Build a snapshot from the WebView2/CDP `Accessibility.getFullAXTree` result.
-pub fn snapshot_from_ax_tree(
-    cdp_result: Value,
-    page_generation: u64,
-) -> Result<PageSnapshot> {
-    let tree: AxTreeResponse = if cdp_result.get("nodes").is_some() {
-        serde_json::from_value(cdp_result)
+/// One frame's AX tree plus how to reach it from Playwright.
+pub struct FrameAx {
+    /// `Accessibility.getFullAXTree` result for this frame (`{ nodes: [...] }`).
+    pub ax: Value,
+    /// URL of the frame (shown in the snapshot label for child frames).
+    pub url: String,
+    /// CSS selector for the owning `<iframe>` element; `None` for the main frame.
+    pub owner_selector: Option<String>,
+}
+
+/// Build a snapshot from a single AX tree (main frame only). Thin wrapper over
+/// [`snapshot_from_frames`] — used by the dev snapshot action and unit tests.
+pub fn snapshot_from_ax_tree(cdp_result: Value, page_generation: u64) -> Result<PageSnapshot> {
+    snapshot_from_frames(
+        vec![FrameAx {
+            ax: cdp_result,
+            url: String::new(),
+            owner_selector: None,
+        }],
+        page_generation,
+    )
+}
+
+/// Build a snapshot spanning the main frame plus any child frames. Refs are
+/// numbered continuously across frames; each ref carries the `frame_selector`
+/// of its owning iframe (so codegen can scope it via `page.frameLocator(...)`),
+/// and duplicate `(role, name)` indices are computed **per frame** (the scope a
+/// `getByRole` runs in). The first frame is treated as the main frame.
+pub fn snapshot_from_frames(frames: Vec<FrameAx>, page_generation: u64) -> Result<PageSnapshot> {
+    let max_refs = max_refs();
+    let mut registry = RefRegistry::new(page_generation);
+    let mut lines: Vec<String> = Vec::new();
+    let mut ref_count = 0usize;
+
+    for (frame_index, frame) in frames.into_iter().enumerate() {
+        let is_main = frame_index == 0;
+        // Child frames get a labeled header; their content is indented under it.
+        let depth_base = if is_main {
+            0
+        } else {
+            let label = if frame.url.is_empty() {
+                "- iframe".to_string()
+            } else {
+                format!("- iframe \"{}\"", escape_yaml_string(&frame.url))
+            };
+            lines.push(label);
+            1
+        };
+
+        if ref_count >= max_refs {
+            break;
+        }
+        append_frame(
+            frame.ax,
+            frame.owner_selector.as_deref(),
+            depth_base,
+            max_refs,
+            &mut registry,
+            &mut lines,
+            &mut ref_count,
+        );
+    }
+
+    let yaml = if lines.is_empty() {
+        "- (empty accessibility tree)".to_string()
     } else {
-        // Envelope or bare array fallback.
+        lines.join("\n")
+    };
+
+    Ok(PageSnapshot {
+        yaml,
+        ref_count,
+        page_generation,
+        registry,
+    })
+}
+
+/// Walk one frame's AX tree, appending its rows to `lines` (indented by
+/// `depth_base`) and its refs to `registry` (tagged with `frame_selector`).
+/// Duplicate `(role, name)` indices are computed within this frame only.
+fn append_frame(
+    cdp_result: Value,
+    frame_selector: Option<&str>,
+    depth_base: usize,
+    max_refs: usize,
+    registry: &mut RefRegistry,
+    lines: &mut Vec<String>,
+    ref_count: &mut usize,
+) {
+    let tree: AxTreeResponse = if cdp_result.get("nodes").is_some() {
+        serde_json::from_value(cdp_result).unwrap_or(AxTreeResponse { nodes: Vec::new() })
+    } else {
         serde_json::from_value(Value::Object(
             [("nodes".into(), cdp_result)].into_iter().collect(),
         ))
-    }
-    .context("parse AX tree JSON")?;
-
+        .unwrap_or(AxTreeResponse { nodes: Vec::new() })
+    };
     if tree.nodes.is_empty() {
-        return Err(anyhow!("AX tree contained no nodes"));
+        return;
     }
 
     let mut by_id: HashMap<String, AxNode> = HashMap::new();
     for node in tree.nodes {
         by_id.insert(node.node_id.clone(), node);
     }
+    let Ok(root_id) = find_root_id(&by_id) else {
+        return;
+    };
 
-    let root_id = find_root_id(&by_id)?;
-    let max_refs = max_refs();
-    let mut registry = RefRegistry::new(page_generation);
-    let mut lines = Vec::new();
-    let mut ref_count = 0usize;
-
-    // Collected in DOM/AX pre-order so we can compute per-(role,name) duplicate
-    // indices once the full set is known, then build the registry.
     struct PendingRef {
         ref_id: String,
         ax_node_id: String,
@@ -178,7 +255,7 @@ pub fn snapshot_from_ax_tree(
     }
     let mut pending: Vec<PendingRef> = Vec::new();
 
-    let mut stack = vec![(root_id, 0usize)];
+    let mut stack = vec![(root_id, depth_base)];
     while let Some((node_id, depth)) = stack.pop() {
         let Some(node) = by_id.get(&node_id) else {
             continue;
@@ -194,7 +271,7 @@ pub fn snapshot_from_ax_tree(
         let name = node.name_str();
         let include = should_include_in_snapshot(&role, &name);
 
-        if include && pending.len() < max_refs {
+        if include && *ref_count < max_refs {
             let ref_id = registry.allocate_ref();
             pending.push(PendingRef {
                 ref_id: ref_id.clone(),
@@ -203,7 +280,7 @@ pub fn snapshot_from_ax_tree(
                 role: role.clone(),
                 name: name.clone(),
             });
-            ref_count += 1;
+            *ref_count += 1;
 
             let indent = "  ".repeat(depth);
             let mut line = format!("{indent}- {role}");
@@ -223,7 +300,7 @@ pub fn snapshot_from_ax_tree(
         }
     }
 
-    // Totals per (role, name) → which locators are ambiguous.
+    // Per-(role,name) totals within this frame → which locators are ambiguous.
     let mut totals: HashMap<(String, String), usize> = HashMap::new();
     for p in &pending {
         *totals.entry((p.role.clone(), p.name.clone())).or_default() += 1;
@@ -244,22 +321,10 @@ pub fn snapshot_from_ax_tree(
                 name: p.name,
                 dup_index,
                 dup_count,
+                frame_selector: frame_selector.map(str::to_string),
             },
         );
     }
-
-    let yaml = if lines.is_empty() {
-        "- (empty accessibility tree)".to_string()
-    } else {
-        lines.join("\n")
-    };
-
-    Ok(PageSnapshot {
-        yaml,
-        ref_count,
-        page_generation,
-        registry,
-    })
 }
 
 fn find_root_id(by_id: &HashMap<String, AxNode>) -> Result<String> {
@@ -380,8 +445,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_nodes_errors() {
-        assert!(snapshot_from_ax_tree(serde_json::json!({ "nodes": [] }), 0).is_err());
+    fn empty_nodes_yields_empty_snapshot() {
+        // A frame with no nodes is skipped (not a hard error) so multi-frame
+        // snapshots don't fail when one frame is empty.
+        let snap = snapshot_from_ax_tree(serde_json::json!({ "nodes": [] }), 0).unwrap();
+        assert_eq!(snap.ref_count, 0);
+        assert!(snap.yaml.contains("empty accessibility tree"));
     }
 
     #[test]

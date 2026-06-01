@@ -12,13 +12,18 @@ pub struct ElementRef {
     pub backend_dom_node_id: Option<i32>,
     pub role: String,
     pub name: String,
-    /// 0-based index of this element among all snapshot elements that share the
-    /// same `(role, name)`, in DOM/AX order. With `dup_count`, lets codegen emit
-    /// `.nth(i)` to disambiguate a `getByRole` that would otherwise be ambiguous.
+    /// 0-based index of this element among snapshot elements that share the same
+    /// `(role, name)` *within the same frame*, in DOM/AX order. With `dup_count`,
+    /// lets codegen emit `.nth(i)` to disambiguate an otherwise-ambiguous locator.
     pub dup_index: usize,
-    /// Total number of snapshot elements sharing this `(role, name)`. `> 1` means
-    /// the role+name locator is ambiguous and needs `.nth(dup_index)`.
+    /// Number of snapshot elements sharing this `(role, name)` within the same
+    /// frame. `> 1` means the locator is ambiguous and needs `.nth(dup_index)`.
     pub dup_count: usize,
+    /// A CSS selector for the owning `<iframe>` when this element lives in a child
+    /// frame (`None` = main frame). Codegen scopes the locator through
+    /// `page.frameLocator(<frame_selector>)`. Actions don't need it — WebView2
+    /// flattens frames, so `backendDOMNodeId` resolves cross-frame directly.
+    pub frame_selector: Option<String>,
 }
 
 /// Ref map for the current page generation. Invalidated when navigation bumps
