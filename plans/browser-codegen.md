@@ -609,6 +609,41 @@ verified green across 10 real sites + 4 practice sites; the only non-green real
 cases remain Guardian (cross-origin consent flake) and npmjs (headless bot-wall),
 both runner/environment issues, not codegen.
 
+#### 4.6.6 Pass 6 — investigated, premise disproved → no code change; +eBay (2026-05-31)
+
+**Plan was:** a snapshot enhancement to give image-only card/anchor links an
+accessible name from a prominent child (heading / img-alt), to enable clicking
+e-retail product cards. **Verifying the actual DOM first (per the project's
+"verify, don't assume" rule) disproved the premise — so no code change was made.**
+
+What the inspection found:
+- **Takealot product anchor:** `aria-label="Go to product details"` (a *generic,
+  duplicated* label), no child `<img>`/text — the product **title is a *sibling*
+  heading**, not a child. There is **no Playwright-compatible way** to name that
+  anchor from the title: ARIA name-computation doesn't pull from siblings, so any
+  derived name would *diverge* from Playwright's computed name and **break**
+  reproduction (our refs must equal Playwright's accessible name). Implementing
+  the enhancement would be fitting a wrong DOM model → a Rule-#2 violation.
+- **Amazon product link:** `<a href="/dp/…"><h2>Logitech M185 Wireless Mouse…
+  </h2></a>` — the title *is* the link's content, so its accessible name already
+  *is* the title (Playwright agrees via name-from-content). **Already addressable;
+  no enhancement needed.**
+
+**Conclusion:** the hypothesized "nameless image-link card" pattern doesn't hold —
+well-built retailers already name product links by content (addressable), and the
+anti-pattern sites can't be fixed compatibly. The right outcome is **no core code
+change**. (This is the discipline working: a verified premise check prevented a
+universal change that would have been a no-op on good sites and harmful on bad
+ones.) Deep product-*detail* reproduction is best done by navigating to a **stable
+product URL** (the agent supports `navigate`) rather than clicking a
+non-deterministic search result.
+
+**New site (Rule #1): eBay** — home → search "mechanical keyboard" → assert
+"Filter" facet → **3/3 green, no flake**. A third e-retailer reproducing
+headless, confirming the codegen handles the e-retail browse class broadly.
+
+**Scorecard add:** eBay → green. Real-site reproduction now green on 11 sites.
+
 ### 4.7 Effort / risk
 
 - **Recorder:** small (one hook at the dispatch chokepoint + a Mutex buffer).
