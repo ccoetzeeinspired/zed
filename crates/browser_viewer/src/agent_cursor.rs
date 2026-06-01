@@ -17,6 +17,7 @@ pub struct AgentCursorState {
     pub status: AgentCursorStatus,
     pub label: String,
     pub ambiguity: Vec<BrowserResolvedElement>,
+    pub pointer_position: Option<(f32, f32)>,
 }
 
 impl AgentCursorState {
@@ -38,6 +39,7 @@ impl AgentCursorState {
             status: AgentCursorStatus::Preview,
             label,
             ambiguity: Vec::new(),
+            pointer_position: Some((24., 24.)),
         }
     }
 }

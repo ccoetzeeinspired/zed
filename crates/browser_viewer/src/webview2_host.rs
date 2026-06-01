@@ -20,17 +20,19 @@
 //! lifetime management.
 
 use anyhow::{Result, anyhow};
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use gpui_windows::HostedVisual;
 use webview2_com::{
-    AddScriptToExecuteOnDocumentCreatedCompletedHandler, CallDevToolsProtocolMethodCompletedHandler,
-    CapturePreviewCompletedHandler, CreateCoreWebView2CompositionControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
-    HistoryChangedEventHandler,
+    AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+    CallDevToolsProtocolMethodCompletedHandler, CapturePreviewCompletedHandler,
+    CreateCoreWebView2CompositionControllerCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler, DevToolsProtocolEventReceivedEventHandler,
+    DocumentTitleChangedEventHandler, ExecuteScriptCompletedHandler, HistoryChangedEventHandler,
     Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, COREWEBVIEW2_MOUSE_EVENT_KIND,
         COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS, CreateCoreWebView2Environment, ICoreWebView2,
-        ICoreWebView2CompositionController, ICoreWebView2Controller, ICoreWebView2Environment3,
+        ICoreWebView2CompositionController, ICoreWebView2Controller,
+        ICoreWebView2DevToolsProtocolEventReceiver, ICoreWebView2Environment3,
     },
     NavigationCompletedEventHandler, NavigationStartingEventHandler, SourceChangedEventHandler,
     WebMessageReceivedEventHandler, take_pwstr,
@@ -54,7 +56,10 @@ pub(crate) enum NavigationEvent {
     /// `pushState`/`replaceState` from SPAs.
     SourceChanged(String),
     /// Either `CanGoBack` or `CanGoForward` changed.
-    HistoryChanged { can_go_back: bool, can_go_forward: bool },
+    HistoryChanged {
+        can_go_back: bool,
+        can_go_forward: bool,
+    },
     /// Top-level navigation kicked off.
     NavigationStarting,
     /// Top-level navigation finished, successfully or not.
@@ -64,6 +69,8 @@ pub(crate) enum NavigationEvent {
     /// BrowserItem layer owns the shape so this module doesn't need
     /// to know the protocol.
     DesignModeMessage(String),
+    ConsoleEvent(crate::browser_protocol::BrowserConsoleEventSummary),
+    NetworkEvent(crate::browser_protocol::BrowserNetworkEventSummary),
 }
 
 /// Tokens returned by `add_*` handlers, kept so we can `remove_*` on drop.
@@ -75,6 +82,7 @@ struct EventTokens {
     navigation_starting: Option<i64>,
     navigation_completed: Option<i64>,
     web_message: Option<i64>,
+    devtools: Vec<(ICoreWebView2DevToolsProtocolEventReceiver, i64)>,
 }
 
 pub(crate) struct WebView2Session {
@@ -149,8 +157,8 @@ impl WebView2Session {
         on_done: Box<dyn FnOnce(Result<Vec<u8>>) + 'static>,
     ) -> Result<()> {
         use windows::Win32::Foundation::HGLOBAL;
-        use windows::Win32::System::Com::{IStream, STREAM_SEEK_SET};
         use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
+        use windows::Win32::System::Com::{IStream, STREAM_SEEK_SET};
         // Stream takes ownership of the HGLOBAL — pass null + true
         // for `fdeleteonrelease` so Windows frees it when the stream
         // refcount hits zero.
@@ -200,6 +208,92 @@ impl WebView2Session {
         Ok(())
     }
 
+    /// Ensure the automation listener is present in the current document
+    /// before posting a JSON automation command. `AddScriptToExecuteOnDocumentCreated`
+    /// covers future navigations, but a command can target a document that loaded
+    /// before the async registration completed.
+    pub fn post_automation_message_string(&self, msg: &str) -> Result<()> {
+        let script_h = HSTRING::from(automation_script_source());
+        let msg = msg.to_string();
+        let webview = self.webview.clone();
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |hr, _result| {
+            if let Err(err) = hr {
+                log::warn!("browser_viewer: automation script bootstrap failed: {err}");
+                return Ok(());
+            }
+            let msg_h = HSTRING::from(msg);
+            unsafe {
+                if let Err(err) = webview.PostWebMessageAsString(PCWSTR(msg_h.as_ptr())) {
+                    log::warn!("browser_viewer: automation postMessage failed: {err}");
+                }
+            }
+            Ok(())
+        }));
+        unsafe {
+            self.webview
+                .ExecuteScript(PCWSTR(script_h.as_ptr()), &handler)
+                .map_err(|err| anyhow!("ExecuteScript automation bootstrap: {err}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn execute_script(&self, script: &str) -> Result<oneshot::Receiver<Result<String>>> {
+        let script_h = HSTRING::from(script);
+        let (tx, rx) = oneshot::channel();
+        let mut tx = Some(tx);
+        let handler = ExecuteScriptCompletedHandler::create(Box::new(move |hr, result| {
+            let Some(tx) = tx.take() else {
+                return Ok(());
+            };
+            let output = match hr {
+                Ok(()) => Ok(result.to_string()),
+                Err(err) => Err(anyhow!("ExecuteScript failed: {err}")),
+            };
+            let _ = tx.send(output);
+            Ok(())
+        }));
+        unsafe {
+            self.webview
+                .ExecuteScript(PCWSTR(script_h.as_ptr()), &handler)
+                .map_err(|err| anyhow!("ExecuteScript: {err}"))?;
+        }
+        Ok(rx)
+    }
+
+    pub fn call_devtools_protocol_method(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<oneshot::Receiver<Result<String>>> {
+        let method_name = method.to_string();
+        let method_h = HSTRING::from(method);
+        let params_h = HSTRING::from(params.to_string());
+        let (tx, rx) = oneshot::channel();
+        let mut tx = Some(tx);
+        let handler =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, result| {
+                let Some(tx) = tx.take() else {
+                    return Ok(());
+                };
+                let output = match hr {
+                    Ok(()) => Ok(result.to_string()),
+                    Err(err) => Err(anyhow!("CallDevToolsProtocolMethod {method_name}: {err}")),
+                };
+                let _ = tx.send(output);
+                Ok(())
+            }));
+        unsafe {
+            self.webview
+                .CallDevToolsProtocolMethod(
+                    PCWSTR(method_h.as_ptr()),
+                    PCWSTR(params_h.as_ptr()),
+                    &handler,
+                )
+                .map_err(|err| anyhow!("CallDevToolsProtocolMethod {method}: {err}"))?;
+        }
+        Ok(rx)
+    }
+
     /// Send a `Input.dispatchKeyEvent` over the WebView2 CDP channel.
     /// Phase 3 uses CDP for keyboard because
     /// `ICoreWebView2CompositionController` has no public
@@ -234,19 +328,31 @@ impl WebView2Session {
             windows_virtual_key_code,
             text,
         );
-        let method = HSTRING::from("Input.dispatchKeyEvent");
-        let params_h = HSTRING::from(params);
-        let handler =
-            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_hr, _result| Ok(())));
-        unsafe {
-            self.webview
-                .CallDevToolsProtocolMethod(
-                    PCWSTR(method.as_ptr()),
-                    PCWSTR(params_h.as_ptr()),
-                    &handler,
-                )
-                .map_err(|err| anyhow!("CallDevToolsProtocolMethod: {err}"))?;
+        let _: oneshot::Receiver<Result<String>> =
+            self.call_devtools_protocol_method("Input.dispatchKeyEvent", json_from_string(params))?;
+        Ok(())
+    }
+
+    pub fn dispatch_mouse_event(
+        &self,
+        event_type: &str,
+        x: f32,
+        y: f32,
+        button: Option<&str>,
+    ) -> Result<()> {
+        let mut params = serde_json::json!({
+            "type": event_type,
+            "x": x,
+            "y": y,
+            "pointerType": "mouse",
+        });
+        if let Some(button) = button {
+            params["button"] = serde_json::Value::String(button.to_string());
+            params["clickCount"] = serde_json::Value::Number(1.into());
         }
+
+        let _: oneshot::Receiver<Result<String>> =
+            self.call_devtools_protocol_method("Input.dispatchMouseEvent", params)?;
         Ok(())
     }
 
@@ -277,6 +383,25 @@ impl WebView2Session {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn automation_script_source() -> &'static str {
+    crate::design_mode_script::SCRIPT
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automation_script_source_contains_current_document_listener() {
+        let script = automation_script_source();
+
+        assert!(script.contains("window.chrome.webview.addEventListener('message'"));
+        assert!(script.contains("agent_snapshot_result"));
+        assert!(script.contains("find_element"));
+    }
+}
+
 impl Drop for WebView2Session {
     fn drop(&mut self) {
         unsafe {
@@ -300,6 +425,9 @@ impl Drop for WebView2Session {
             }
             if let Some(t) = self.event_tokens.web_message.take() {
                 let _ = self.webview.remove_WebMessageReceived(t);
+            }
+            for (receiver, token) in self.event_tokens.devtools.drain(..) {
+                let _ = receiver.remove_DevToolsProtocolEventReceived(token);
             }
             if let Err(err) = self.controller.Close() {
                 log::warn!("WebView2Session: controller.Close() failed: {err}");
@@ -427,7 +555,7 @@ fn register_navigation_events(
     // `TryGetWebMessageAsString` (works for any string the page sends,
     // including JSON.stringify output) and forward it to the host
     // unparsed — BrowserItem owns the protocol shape.
-    let tx = events_tx;
+    let tx = events_tx.clone();
     let handler = WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
         if let Some(args) = args {
             let mut msg = PWSTR::null();
@@ -448,7 +576,271 @@ fn register_navigation_events(
     }
     tokens.web_message = Some(token);
 
+    enable_devtools_domains(webview);
+    register_devtools_event(
+        webview,
+        "Runtime.consoleAPICalled",
+        events_tx.clone(),
+        &mut tokens,
+    )?;
+    register_devtools_event(
+        webview,
+        "Runtime.exceptionThrown",
+        events_tx.clone(),
+        &mut tokens,
+    )?;
+    register_devtools_event(webview, "Log.entryAdded", events_tx.clone(), &mut tokens)?;
+    register_devtools_event(
+        webview,
+        "Network.loadingFailed",
+        events_tx.clone(),
+        &mut tokens,
+    )?;
+    register_devtools_event(webview, "Network.responseReceived", events_tx, &mut tokens)?;
+
     Ok(tokens)
+}
+
+fn enable_devtools_domains(webview: &ICoreWebView2) {
+    for method in ["Runtime.enable", "Log.enable", "Network.enable"] {
+        if let Err(err) = call_devtools_no_result(webview, method, serde_json::json!({})) {
+            log::warn!("browser_viewer: {method} failed: {err}");
+        }
+    }
+}
+
+fn call_devtools_no_result(
+    webview: &ICoreWebView2,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<()> {
+    let method_h = HSTRING::from(method);
+    let params_h = HSTRING::from(params.to_string());
+    let handler =
+        CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_hr, _result| Ok(())));
+    unsafe {
+        webview
+            .CallDevToolsProtocolMethod(
+                PCWSTR(method_h.as_ptr()),
+                PCWSTR(params_h.as_ptr()),
+                &handler,
+            )
+            .map_err(|err| anyhow!("CallDevToolsProtocolMethod {method}: {err}"))?;
+    }
+    Ok(())
+}
+
+fn register_devtools_event(
+    webview: &ICoreWebView2,
+    event_name: &str,
+    events_tx: mpsc::UnboundedSender<NavigationEvent>,
+    tokens: &mut EventTokens,
+) -> Result<()> {
+    let event_name_h = HSTRING::from(event_name);
+    let receiver = unsafe {
+        webview
+            .GetDevToolsProtocolEventReceiver(PCWSTR(event_name_h.as_ptr()))
+            .map_err(|err| anyhow!("GetDevToolsProtocolEventReceiver {event_name}: {err}"))?
+    };
+    let event_name = event_name.to_string();
+    let event_name_for_handler = event_name.clone();
+    let handler =
+        DevToolsProtocolEventReceivedEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else {
+                return Ok(());
+            };
+            let mut raw = PWSTR::null();
+            unsafe {
+                if args.ParameterObjectAsJson(&mut raw).is_ok() && !raw.is_null() {
+                    let raw = take_pwstr(raw);
+                    if let Some(event) =
+                        navigation_event_from_devtools(&event_name_for_handler, &raw)
+                    {
+                        let _ = events_tx.unbounded_send(event);
+                    }
+                }
+            }
+            Ok(())
+        }));
+    let mut token = 0i64;
+    unsafe {
+        receiver
+            .add_DevToolsProtocolEventReceived(&handler, &mut token)
+            .map_err(|err| anyhow!("add_DevToolsProtocolEventReceived {event_name}: {err}"))?;
+    }
+    tokens.devtools.push((receiver, token));
+    Ok(())
+}
+
+fn navigation_event_from_devtools(event_name: &str, raw: &str) -> Option<NavigationEvent> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    match event_name {
+        "Runtime.consoleAPICalled" => console_event_from_runtime_console(&value)
+            .map(NavigationEvent::ConsoleEvent),
+        "Runtime.exceptionThrown" => {
+            console_event_from_runtime_exception(&value).map(NavigationEvent::ConsoleEvent)
+        }
+        "Log.entryAdded" => console_event_from_log_entry(&value).map(NavigationEvent::ConsoleEvent),
+        "Network.loadingFailed" => {
+            network_event_from_loading_failed(&value).map(NavigationEvent::NetworkEvent)
+        }
+        "Network.responseReceived" => {
+            network_event_from_response_received(&value).map(NavigationEvent::NetworkEvent)
+        }
+        _ => None,
+    }
+}
+
+fn console_event_from_runtime_console(
+    value: &serde_json::Value,
+) -> Option<crate::browser_protocol::BrowserConsoleEventSummary> {
+    let level = value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("log")
+        .to_string();
+    let text = value
+        .get("args")
+        .and_then(|value| value.as_array())
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| {
+                    arg.get("value")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| arg.get("description").and_then(|value| value.as_str()))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| level.clone());
+    Some(crate::browser_protocol::BrowserConsoleEventSummary {
+        sequence: 0,
+        level,
+        text: truncate_diagnostic_text(&text),
+        url: value
+            .get("stackTrace")
+            .and_then(|stack| stack.get("callFrames"))
+            .and_then(|frames| frames.as_array())
+            .and_then(|frames| frames.first())
+            .and_then(|frame| frame.get("url"))
+            .and_then(|url| url.as_str())
+            .map(ToOwned::to_owned),
+        line: value
+            .get("stackTrace")
+            .and_then(|stack| stack.get("callFrames"))
+            .and_then(|frames| frames.as_array())
+            .and_then(|frames| frames.first())
+            .and_then(|frame| frame.get("lineNumber"))
+            .and_then(|line| line.as_u64()),
+        column: value
+            .get("stackTrace")
+            .and_then(|stack| stack.get("callFrames"))
+            .and_then(|frames| frames.as_array())
+            .and_then(|frames| frames.first())
+            .and_then(|frame| frame.get("columnNumber"))
+            .and_then(|column| column.as_u64()),
+    })
+}
+
+fn console_event_from_runtime_exception(
+    value: &serde_json::Value,
+) -> Option<crate::browser_protocol::BrowserConsoleEventSummary> {
+    let details = value.get("exceptionDetails")?;
+    let text = details
+        .get("exception")
+        .and_then(|exception| exception.get("description"))
+        .and_then(|description| description.as_str())
+        .or_else(|| details.get("text").and_then(|text| text.as_str()))
+        .unwrap_or("JavaScript exception");
+    Some(crate::browser_protocol::BrowserConsoleEventSummary {
+        sequence: 0,
+        level: "error".to_string(),
+        text: truncate_diagnostic_text(text),
+        url: details
+            .get("url")
+            .and_then(|url| url.as_str())
+            .map(ToOwned::to_owned),
+        line: details.get("lineNumber").and_then(|line| line.as_u64()),
+        column: details.get("columnNumber").and_then(|column| column.as_u64()),
+    })
+}
+
+fn console_event_from_log_entry(
+    value: &serde_json::Value,
+) -> Option<crate::browser_protocol::BrowserConsoleEventSummary> {
+    let entry = value.get("entry")?;
+    Some(crate::browser_protocol::BrowserConsoleEventSummary {
+        sequence: 0,
+        level: entry
+            .get("level")
+            .and_then(|level| level.as_str())
+            .unwrap_or("log")
+            .to_string(),
+        text: truncate_diagnostic_text(entry.get("text").and_then(|text| text.as_str())?),
+        url: entry
+            .get("url")
+            .and_then(|url| url.as_str())
+            .map(ToOwned::to_owned),
+        line: entry.get("lineNumber").and_then(|line| line.as_u64()),
+        column: None,
+    })
+}
+
+fn network_event_from_loading_failed(
+    value: &serde_json::Value,
+) -> Option<crate::browser_protocol::BrowserNetworkEventSummary> {
+    Some(crate::browser_protocol::BrowserNetworkEventSummary {
+        sequence: 0,
+        url: value
+            .get("requestId")
+            .and_then(|request_id| request_id.as_str())
+            .unwrap_or("unknown request")
+            .to_string(),
+        method: None,
+        status: None,
+        error_text: value
+            .get("errorText")
+            .and_then(|text| text.as_str())
+            .map(truncate_diagnostic_text),
+    })
+}
+
+fn network_event_from_response_received(
+    value: &serde_json::Value,
+) -> Option<crate::browser_protocol::BrowserNetworkEventSummary> {
+    let response = value.get("response")?;
+    let status = response.get("status").and_then(|status| status.as_u64())? as u16;
+    if status < 400 {
+        return None;
+    }
+    Some(crate::browser_protocol::BrowserNetworkEventSummary {
+        sequence: 0,
+        url: response
+            .get("url")
+            .and_then(|url| url.as_str())
+            .unwrap_or("unknown URL")
+            .to_string(),
+        method: None,
+        status: Some(status),
+        error_text: response
+            .get("statusText")
+            .and_then(|text| text.as_str())
+            .map(truncate_diagnostic_text),
+    })
+}
+
+fn truncate_diagnostic_text(text: &str) -> String {
+    const MAX: usize = 500;
+    if text.len() <= MAX {
+        text.to_string()
+    } else {
+        format!("{}...", &text[..MAX])
+    }
+}
+
+fn json_from_string(raw: String) -> serde_json::Value {
+    serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 /// Pull every byte out of an `IStream` into a `Vec<u8>`. Seeks to the
@@ -550,8 +942,8 @@ pub(crate) fn initialize(
     // The env handler runs after `CreateCoreWebView2Environment` resolves.
     // It owns the visual + parent + bounds + url + on_done, threading them
     // forward into the controller handler.
-    let env_handler =
-        CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(move |result, env| {
+    let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+        move |result, env| {
             if let Err(err) = result {
                 on_done(Err(anyhow!("WebView2 env creation failed: {err}")));
                 return Ok(());
@@ -576,99 +968,99 @@ pub(crate) fn initialize(
                 }
             };
 
-            let ctrl_handler =
-                CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
-                    move |result, comp_ctrl| {
-                        if let Err(err) = result {
-                            on_done(Err(anyhow!(
-                                "WebView2 composition controller creation failed: {err}"
-                            )));
+            let ctrl_handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(
+                Box::new(move |result, comp_ctrl| {
+                    if let Err(err) = result {
+                        on_done(Err(anyhow!(
+                            "WebView2 composition controller creation failed: {err}"
+                        )));
+                        return Ok(());
+                    }
+                    let comp_ctrl = match comp_ctrl {
+                        Some(c) => c,
+                        None => {
+                            on_done(Err(anyhow!("WebView2 composition controller was null")));
                             return Ok(());
                         }
-                        let comp_ctrl = match comp_ctrl {
-                            Some(c) => c,
-                            None => {
-                                on_done(Err(anyhow!("WebView2 composition controller was null")));
-                                return Ok(());
-                            }
+                    };
+
+                    let outcome = (|| -> Result<WebView2Session> {
+                        // The same COM object also implements
+                        // ICoreWebView2Controller, which is what carries
+                        // SetBounds / SetIsVisible / CoreWebView2.
+                        let controller: ICoreWebView2Controller =
+                            comp_ctrl.cast().map_err(|err| {
+                                anyhow!("cast to ICoreWebView2Controller failed: {err}")
+                            })?;
+
+                        unsafe {
+                            comp_ctrl
+                                .SetRootVisualTarget(visual.visual())
+                                .map_err(|err| anyhow!("SetRootVisualTarget: {err}"))?;
+                            controller
+                                .SetBounds(bounds)
+                                .map_err(|err| anyhow!("SetBounds: {err}"))?;
+                            controller
+                                .SetIsVisible(true)
+                                .map_err(|err| anyhow!("SetIsVisible: {err}"))?;
+                        }
+
+                        visual
+                            .commit()
+                            .map_err(|err| anyhow!("DComp commit: {err}"))?;
+
+                        let webview = unsafe {
+                            controller
+                                .CoreWebView2()
+                                .map_err(|err| anyhow!("CoreWebView2: {err}"))?
                         };
 
-                        let outcome = (|| -> Result<WebView2Session> {
-                            // The same COM object also implements
-                            // ICoreWebView2Controller, which is what carries
-                            // SetBounds / SetIsVisible / CoreWebView2.
-                            let controller: ICoreWebView2Controller =
-                                comp_ctrl.cast().map_err(|err| {
-                                    anyhow!("cast to ICoreWebView2Controller failed: {err}")
-                                })?;
+                        // Wire navigation events before the first navigate
+                        // so even the initial load fires title/source events.
+                        let event_tokens = register_navigation_events(&webview, events_tx)?;
 
-                            unsafe {
-                                comp_ctrl
-                                    .SetRootVisualTarget(visual.visual())
-                                    .map_err(|err| anyhow!("SetRootVisualTarget: {err}"))?;
-                                controller
-                                    .SetBounds(bounds)
-                                    .map_err(|err| anyhow!("SetBounds: {err}"))?;
-                                controller
-                                    .SetIsVisible(true)
-                                    .map_err(|err| anyhow!("SetIsVisible: {err}"))?;
-                            }
-
-                            visual.commit().map_err(|err| anyhow!("DComp commit: {err}"))?;
-
-                            let webview = unsafe {
-                                controller
-                                    .CoreWebView2()
-                                    .map_err(|err| anyhow!("CoreWebView2: {err}"))?
-                            };
-
-                            // Wire navigation events before the first navigate
-                            // so even the initial load fires title/source events.
-                            let event_tokens =
-                                register_navigation_events(&webview, events_tx)?;
-
-                            // Phase 4: inject the design-mode script before
-                            // the first navigation. `AddScriptToExecuteOnDocumentCreated`
-                            // runs the script on every navigation, including
-                            // the initial one. The script is idempotent —
-                            // re-evaluating it on the same document just emits
-                            // a `ready` message and exits.
-                            let script_h = HSTRING::from(crate::design_mode_script::SCRIPT);
-                            let install_handler =
-                                AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(
-                                    Box::new(|_hr, _id| Ok(())),
+                        // Phase 4: inject the design-mode script before
+                        // the first navigation. `AddScriptToExecuteOnDocumentCreated`
+                        // runs the script on every navigation, including
+                        // the initial one. The script is idempotent —
+                        // re-evaluating it on the same document just emits
+                        // a `ready` message and exits.
+                        let script_h = HSTRING::from(crate::design_mode_script::SCRIPT);
+                        let install_handler =
+                            AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+                                |_hr, _id| Ok(()),
+                            ));
+                        unsafe {
+                            if let Err(err) = webview.AddScriptToExecuteOnDocumentCreated(
+                                PCWSTR(script_h.as_ptr()),
+                                &install_handler,
+                            ) {
+                                log::warn!(
+                                    "browser_viewer: AddScriptToExecuteOnDocumentCreated failed: {err}"
                                 );
-                            unsafe {
-                                if let Err(err) = webview.AddScriptToExecuteOnDocumentCreated(
-                                    PCWSTR(script_h.as_ptr()),
-                                    &install_handler,
-                                ) {
-                                    log::warn!(
-                                        "browser_viewer: AddScriptToExecuteOnDocumentCreated failed: {err}"
-                                    );
-                                }
                             }
+                        }
 
-                            let url_h = HSTRING::from(&url);
-                            unsafe {
-                                webview
-                                    .Navigate(PCWSTR(url_h.as_ptr()))
-                                    .map_err(|err| anyhow!("Navigate: {err}"))?;
-                            }
+                        let url_h = HSTRING::from(&url);
+                        unsafe {
+                            webview
+                                .Navigate(PCWSTR(url_h.as_ptr()))
+                                .map_err(|err| anyhow!("Navigate: {err}"))?;
+                        }
 
-                            Ok(WebView2Session {
-                                composition_controller: comp_ctrl,
-                                controller,
-                                webview,
-                                visual,
-                                event_tokens,
-                            })
-                        })();
+                        Ok(WebView2Session {
+                            composition_controller: comp_ctrl,
+                            controller,
+                            webview,
+                            visual,
+                            event_tokens,
+                        })
+                    })();
 
-                        on_done(outcome);
-                        Ok(())
-                    },
-                ));
+                    on_done(outcome);
+                    Ok(())
+                }),
+            );
 
             unsafe {
                 if let Err(err) =
@@ -678,7 +1070,8 @@ pub(crate) fn initialize(
                 }
             }
             Ok(())
-        }));
+        },
+    ));
 
     unsafe {
         CreateCoreWebView2Environment(&env_handler)

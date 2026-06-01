@@ -9,6 +9,7 @@
 
 use gpui::{App, actions};
 use settings::Settings as _;
+use std::rc::Rc;
 use ui::SharedString;
 use workspace::Workspace;
 
@@ -57,11 +58,32 @@ pub fn init(cx: &mut App) {
     BrowserSettings::register(cx);
     #[cfg(target_os = "windows")]
     {
-        cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        cx.observe_new(|workspace: &mut Workspace, window, cx| {
             workspace.register_action(|workspace, _: &NewTab, window, cx| {
                 let homepage = BrowserSettings::get_global(cx).homepage.clone();
                 open_new_tab(workspace, SharedString::new(homepage), window, cx);
             });
+            let Some(window) = window else {
+                return;
+            };
+            let workspace_handle = cx.entity().downgrade();
+            let window_handle = window.window_handle();
+            workspace::browser_agent::register_browser_opener(Rc::new(move |url, cx| {
+                let result = window_handle
+                    .update(cx, |_, window, cx| {
+                        workspace_handle.update(cx, |workspace, cx| {
+                            open_new_tab(workspace, SharedString::new(url.clone()), window, cx);
+                            serde_json::json!({
+                                "opened": true,
+                                "url": url,
+                                "surface": "zed-embedded-browser"
+                            })
+                        })
+                    })
+                    .map_err(|err| anyhow::anyhow!(err))
+                    .and_then(|result| result);
+                gpui::Task::ready(result)
+            }));
         })
         .detach();
     }

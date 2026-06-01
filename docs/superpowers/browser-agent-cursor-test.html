@@ -59,6 +59,32 @@
         background: #31394d;
       }
 
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.45;
+      }
+
+      form {
+        display: grid;
+        gap: 12px;
+        margin-bottom: 20px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        color: #d7def1;
+      }
+
+      input {
+        border: 1px solid #66708a;
+        border-radius: 8px;
+        background: #11151f;
+        color: #eef2ff;
+        font: inherit;
+        padding: 10px 12px;
+      }
+
       output {
         display: block;
         min-height: 24px;
@@ -73,13 +99,26 @@
   <body>
     <main>
       <h1>Browser Agent Cursor Test</h1>
-      <p>Use the embedded browser target field to preview and click by visible text or CSS selector.</p>
+      <p>Use the embedded browser snapshot/ref tools to click, fill, and verify actionability.</p>
+
+      <form id="login-form">
+        <label>
+          Email
+          <input id="email" data-testid="email-input" type="email" required />
+        </label>
+        <label>
+          Password
+          <input id="password" data-testid="password-input" type="password" required />
+        </label>
+        <button id="login-submit" data-testid="login-submit" type="submit">Login</button>
+      </form>
 
       <div class="row">
         <button id="sign-in" data-testid="sign-in-button">Sign in</button>
         <button id="create-account" class="secondary" data-testid="create-account-button">
           Create Account
         </button>
+        <button id="disabled-action" class="secondary" disabled>Disabled Action</button>
       </div>
 
       <output id="result">No click yet</output>
@@ -92,6 +131,12 @@
       });
       document.getElementById("create-account").addEventListener("click", () => {
         result.textContent = "clicked: Create Account";
+      });
+      document.getElementById("login-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const email = document.getElementById("email").value;
+        const password = document.getElementById("password").value;
+        result.textContent = `login attempted: ${email} / ${password.length} chars`;
       });
     </script>
   </body>

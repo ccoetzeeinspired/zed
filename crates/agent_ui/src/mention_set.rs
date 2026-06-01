@@ -392,7 +392,7 @@ impl MentionSet {
         workspace: Option<&Entity<Workspace>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Mention>> {
-        let content = workspace
+        let browser_context = workspace
             .and_then(|workspace| {
                 workspace.update(cx, |workspace, cx| {
                     workspace
@@ -405,10 +405,15 @@ impl MentionSet {
                 [
                     "No active Zed browser tab is open.",
                     "Open one with browser::NewTab, then mention @browser again.",
-                    "Do not use the external Codex Desktop Browser plugin for this mention.",
+                    "Call the zed-browser/browser.open MCP tool with the target URL when the user asks to open @browser.",
                 ]
                 .join("\n")
             });
+        let content = format!(
+            "{}\n\n{}",
+            zed_browser_tool_routing_instructions(),
+            browser_context
+        );
 
         Task::ready(Ok(Mention::Text {
             content,
@@ -750,6 +755,20 @@ impl MentionSet {
     }
 }
 
+fn zed_browser_tool_routing_instructions() -> &'static str {
+    "Zed embedded browser routing instructions:\n\
+     - This mention is the Zed embedded browser, not the Codex Desktop Browser plugin.\n\
+     - Use only the zed-browser MCP tools for this mention: browser.open, browser.current_page, browser.navigate, browser.snapshot, browser.click, browser.fill, browser.scroll_to, browser.scroll, browser.console, browser.network, browser.expect, browser.trace, browser.find_element, browser.type_text, browser.click_element, and browser.clear_cursor.\n\
+     - Default loop: browser.open or browser.navigate, then browser.snapshot, then use refs from browser.snapshot with browser.click or browser.fill.\n\
+     - Snapshot refs are short-lived. Re-snapshot after navigation, click, fill, or any visible UI change.\n\
+     - Use browser.expect for retryable checks after actions, such as URL changes, visible text, or expected sections.\n\
+     - Use browser.console and browser.network when a snapshot or action result does not explain a failure.\n\
+     - Use browser.find_element only as a repair path when snapshot output is insufficient; after ambiguous candidates, choose from the candidates or re-snapshot instead of repeating broad probes.\n\
+     - If an exact in-page filter value is unavailable, use the closest visible site control instead of leaving the site.\n\
+     - Do not read, invoke, or fall back to the bundled Browser plugin, the iab backend, Chrome, any external browser, or external web search for this mention.\n\
+     - If there is no active Zed browser tab, call zed-browser/browser.open with the requested URL before any other browser action."
+}
+
 /// Computes disambiguated labels for a set of mentions. When multiple mentions
 /// share the same base name, their labels include extra context (additional
 /// parent path components for files/directories, source for skills) so the user
@@ -817,6 +836,38 @@ mod tests {
                 .contains("Thread mentions are only supported for the native agent"),
             "Unexpected error: {error:#}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_browser_mention_routes_to_zed_browser_tools(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({"file": ""})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let mention_set = cx.new(|_cx| MentionSet::new(project.downgrade(), None, None));
+
+        let task = mention_set.update(cx, |mention_set, cx| {
+            mention_set.confirm_mention_for_browser(None, cx)
+        });
+
+        let mention = task.await.expect("browser mention should resolve");
+        let Mention::Text { content, .. } = mention else {
+            panic!("Expected browser mention to resolve as text");
+        };
+        assert!(content.contains("Use only the zed-browser MCP tools"));
+        assert!(content.contains("browser.snapshot"));
+        assert!(content.contains("browser.expect"));
+        assert!(content.contains("browser.console"));
+        assert!(content.contains("browser.network"));
+        assert!(content.contains("use refs from browser.snapshot"));
+        assert!(content.contains("closest visible site control"));
+        assert!(
+            content.contains("Do not read, invoke, or fall back to the bundled Browser plugin")
+        );
+        assert!(content.contains("external web search"));
+        assert!(content.contains("iab backend"));
+        assert!(content.contains("zed-browser/browser.open"));
     }
 
     #[gpui::test]

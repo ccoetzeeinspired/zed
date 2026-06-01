@@ -434,7 +434,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             new_text,
             label: CodeLabel::plain(uri.name(), None),
             documentation: Some(CompletionDocumentation::SingleLine(
-                "Active embedded Zed browser".into(),
+                "Active embedded Zed browser via zed-browser tools".into(),
             )),
             source: project::CompletionSource::Custom,
             icon_path: Some(icon_path),
@@ -442,7 +442,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             snippet_deduplication_key: None,
             insert_text_mode: None,
             confirm: Some(confirm_completion_callback(
-                "Browser".into(),
+                "Zed Browser".into(),
                 source_range.start,
                 new_text_len - 1,
                 uri,

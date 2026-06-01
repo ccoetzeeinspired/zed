@@ -132,7 +132,11 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s == 0.0 {
         return (l, l, l);
     }
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let hue_to_rgb = |t: f32| -> f32 {
         let mut t = t;
@@ -237,10 +241,14 @@ mod annotate {
 
     fn scaled_dims(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
         if w >= h {
-            let nh = ((h as f32) * (max_edge as f32) / (w as f32)).round().max(1.0) as u32;
+            let nh = ((h as f32) * (max_edge as f32) / (w as f32))
+                .round()
+                .max(1.0) as u32;
             (max_edge, nh)
         } else {
-            let nw = ((w as f32) * (max_edge as f32) / (h as f32)).round().max(1.0) as u32;
+            let nw = ((w as f32) * (max_edge as f32) / (h as f32))
+                .round()
+                .max(1.0) as u32;
             (nw, max_edge)
         }
     }
@@ -354,3 +362,36 @@ mod annotate {
 
 #[cfg(target_os = "windows")]
 pub use annotate::annotate_screenshot;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{point, px, size};
+
+    #[test]
+    fn drawing_canvas_commits_drag_stroke_on_finish() {
+        let mut canvas = DrawingCanvas::default();
+
+        canvas.begin(point(px(10.), px(20.)), gpui::hsla(0.36, 1.0, 0.5, 1.0), px(3.));
+        canvas.extend(point(px(30.), px(40.)));
+        canvas.finish();
+
+        assert_eq!(canvas.strokes.len(), 1);
+        assert!(canvas.current.is_none());
+        assert_eq!(canvas.strokes[0].points.len(), 2);
+        assert!(!canvas.is_empty());
+    }
+
+    #[test]
+    fn drawing_canvas_svg_exports_viewport_local_stroke_coordinates() {
+        let mut canvas = DrawingCanvas::default();
+        canvas.begin(point(px(110.), px(220.)), gpui::hsla(0.36, 1.0, 0.5, 1.0), px(3.));
+        canvas.extend(point(px(130.), px(240.)));
+        canvas.finish();
+
+        let svg = canvas.to_svg(point(px(100.), px(200.)), size(px(400.), px(300.)));
+
+        assert!(svg.contains("viewBox=\"0 0 400 300\""));
+        assert!(svg.contains("M10.0 20.0 L30.0 40.0"));
+    }
+}

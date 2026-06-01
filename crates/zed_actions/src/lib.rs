@@ -580,6 +580,11 @@ pub mod agent {
         /// Annotated screenshot (selected-element outline + freehand strokes
         /// composited onto the page capture), base64-encoded PNG.
         pub annotated_png_base64: SharedString,
+        /// Freehand strokes exported as SVG in viewport-local coordinates.
+        /// This gives the agent textual/vector context even if image input is
+        /// unavailable or ignored by the active ACP backend.
+        #[serde(default)]
+        pub drawing_svg: SharedString,
         /// Whether the user drew freehand annotations.
         pub has_drawing: bool,
     }

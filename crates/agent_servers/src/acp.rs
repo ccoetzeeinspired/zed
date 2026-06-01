@@ -25,7 +25,8 @@ use settings::SettingsStore;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc as std_mpsc};
+use std::thread;
 use std::time::Duration;
 use std::{any::Any, cell::RefCell, collections::VecDeque};
 use task::{Shell, ShellBuilder, SpawnInTerminal};
@@ -45,6 +46,8 @@ use crate::GEMINI_ID;
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
+const ZED_BROWSER_MCP_SERVER_ID: &str = "zed-browser";
+const ZED_BROWSER_MCP_SESSION_ID: &str = "zed-browser-session";
 const ACP_RESPONSE_CHANNEL_CANCELLED: &str =
     "response channel cancelled — connection may have dropped";
 
@@ -377,6 +380,39 @@ where
     }
 }
 
+struct BrowserMcpHttpForegroundWork {
+    request: serde_json::Value,
+    response_tx: std_mpsc::Sender<serde_json::Value>,
+}
+
+impl ForegroundWorkItem for BrowserMcpHttpForegroundWork {
+    fn run(self: Box<Self>, cx: &mut AsyncApp, _ctx: &ClientContext) {
+        let Self {
+            request,
+            response_tx,
+        } = *self;
+        cx.spawn(async move |cx| {
+            let response = zed_browser_mcp_http_response_with_app(request, cx).await;
+            response_tx.send(response).ok();
+        })
+        .detach();
+    }
+
+    fn reject(self: Box<Self>) {
+        let Self {
+            request,
+            response_tx,
+        } = *self;
+        response_tx
+            .send(zed_browser_mcp_error_response(
+                json_rpc_request_id(&request),
+                ErrorCode::InternalError,
+                "Zed browser MCP foreground dispatch queue closed",
+            ))
+            .ok();
+    }
+}
+
 fn enqueue_request<Req, Res>(
     dispatch_tx: &mpsc::UnboundedSender<ForegroundWork>,
     request: Req,
@@ -424,6 +460,7 @@ pub struct AcpConnection {
     auth_methods: Vec<acp::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
+    dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
     session_list: Option<Rc<AcpSessionList>>,
@@ -767,9 +804,25 @@ fn connect_client_future(
             on_request!(handle_wait_for_terminal_exit),
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            on_request!(handle_mcp_connect),
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            on_request!(handle_mcp_message),
+            agent_client_protocol::on_receive_request!(),
+        )
         // --- Notification handlers (agent→client) ---
         .on_receive_notification(
             on_notification!(handle_session_notification),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            on_notification!(handle_mcp_message_notification),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_notification(
+            on_notification!(handle_mcp_disconnect),
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(
@@ -1100,6 +1153,7 @@ impl AcpConnection {
             sessions,
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
             agent_capabilities: response.agent_capabilities,
+            dispatch_tx,
             defaults,
             session_list,
             debug_log,
@@ -1140,6 +1194,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            dispatch_tx: mpsc::unbounded().0,
             defaults,
             child: None,
             session_list: None,
@@ -1566,7 +1621,12 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(
+            &project,
+            &self.agent_capabilities,
+            Some(&self.dispatch_tx),
+            cx,
+        );
 
         cx.spawn(async move |cx| {
             let response = into_foreground_future(
@@ -1750,7 +1810,12 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(
+            &project,
+            &self.agent_capabilities,
+            Some(&self.dispatch_tx),
+            cx,
+        );
         self.open_or_create_session(
             session_id,
             project,
@@ -1793,7 +1858,12 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(
+            &project,
+            &self.agent_capabilities,
+            Some(&self.dispatch_tx),
+            cx,
+        );
         self.open_or_create_session(
             session_id,
             project,
@@ -3835,12 +3905,453 @@ mod tests {
             "session should be removed after final close"
         );
     }
+
+    #[test]
+    fn test_zed_browser_mcp_tools_are_advertised() {
+        let tools = super::zed_browser_mcp_tools();
+        let names = tools
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .map(|tool| {
+                tool.get("name")
+                    .and_then(|name| name.as_str())
+                    .expect("tool should have a string name")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "browser.current_page",
+                "browser.open",
+                "browser.navigate",
+                "browser.snapshot",
+                "browser.screenshot",
+                "browser.click",
+                "browser.fill",
+                "browser.scroll_to",
+                "browser.scroll",
+                "browser.console",
+                "browser.network",
+                "browser.expect",
+                "browser.trace",
+                "browser.find_element",
+                "browser.click_element",
+                "browser.type_text",
+                "browser.clear_cursor",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_tool_call_response_marks_failed_postcondition() {
+        let response = super::zed_browser_tool_call_response(serde_json::json!({
+            "ok": false,
+            "reason": "Please include an '@' in the email address.",
+            "typed": {
+                "expected": "login_probe_529",
+                "observed": "login_probe_529",
+                "ok": false
+            },
+            "page": {
+                "messages": ["Please include an '@' in the email address."]
+            }
+        }))
+        .expect("response should encode");
+
+        assert_eq!(response["isError"], true);
+        assert_eq!(response["structuredContent"]["ok"], false);
+        assert!(
+            response["content"][0]["text"]
+                .as_str()
+                .expect("tool response text should be present")
+                .contains("Continue the browser loop")
+        );
+        assert!(
+            response["content"][0]["text"]
+                .as_str()
+                .expect("tool response text should be present")
+                .contains("browser.screenshot")
+        );
+    }
+
+    #[test]
+    fn test_zed_browser_tool_contract_prefers_in_page_repair_over_web_search() {
+        let tools = super::zed_browser_mcp_tools();
+        let descriptions = tools
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .filter_map(|tool| {
+                tool.get("description")
+                    .and_then(|description| description.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            descriptions.contains(
+                "Do not use external web search to repair ordinary in-page automation failures"
+            ),
+            "browser tool descriptions should keep automation inside the active page before considering web search"
+        );
+        assert!(
+            descriptions.contains("If an exact in-page filter value is unavailable, use the closest visible site control"),
+            "browser tool descriptions should teach closest visible filter selection"
+        );
+        assert!(
+            descriptions.contains("choose targets from the returned selector/tag/role/name/text/bounds list instead of probing with repeated failing find_element calls"),
+            "snapshot guidance should prefer refs/candidates over repeated find_element probes"
+        );
+    }
+
+    #[test]
+    fn test_zed_browser_tool_errors_repair_stale_preview_without_reopen_hint() {
+        let next_step = super::zed_browser_tool_error_next_step(
+            "browser.click_element",
+            &anyhow!("No matching browser target preview"),
+        );
+
+        assert!(next_step.contains("browser.snapshot"));
+        assert!(next_step.contains("browser.find_element"));
+        assert!(next_step.contains("Do not call browser.open"));
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_tool_call_response_keeps_success_non_error() {
+        let response = super::zed_browser_tool_call_response(serde_json::json!({
+            "ok": true,
+            "url": "http://localhost:3000/login"
+        }))
+        .expect("response should encode");
+
+        assert!(response.get("isError").is_none());
+        assert_eq!(response["structuredContent"]["ok"], true);
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_keeps_legacy_tools() {
+        let tools = super::zed_browser_mcp_tools();
+        let names = tools
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(|name| name.as_str()))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"browser.find_element"));
+        assert!(names.contains(&"browser.click_element"));
+        assert!(names.contains(&"browser.type_text"));
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_connection_id_routing() {
+        assert!(super::is_zed_browser_mcp_connection(
+            "zed-browser-00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(!super::is_zed_browser_mcp_connection("zed-browser"));
+        assert!(!super::is_zed_browser_mcp_connection("zed-browser2-123"));
+        assert!(!super::is_zed_browser_mcp_connection("other-123"));
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_http_wraps_success_response() {
+        let response = super::zed_browser_mcp_http_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/list",
+            "params": {}
+        }));
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 7);
+        assert!(response["result"]["tools"].is_array());
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_http_wraps_invalid_request_error() {
+        let response = super::zed_browser_mcp_http_response(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "bad",
+            "params": {}
+        }));
+
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], "bad");
+        assert_eq!(
+            response["error"]["code"],
+            i32::from(ErrorCode::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_http_identifies_notifications() {
+        assert!(super::is_json_rpc_notification(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        })));
+        assert!(!super::is_json_rpc_notification(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        })));
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_prefers_acp_transport_when_supported() {
+        let mut capabilities = acp::AgentCapabilities::default();
+        capabilities.mcp_capabilities.acp = true;
+        capabilities.mcp_capabilities.http = true;
+
+        let server = super::zed_browser_mcp_server_for_capabilities(&capabilities, || {
+            panic!("HTTP server should not start when ACP transport is supported")
+        })
+        .expect("browser MCP server should be advertised");
+
+        assert!(matches!(server, acp::McpServer::Acp(_)));
+    }
+
+    #[test]
+    fn test_zed_browser_mcp_uses_http_transport_for_codex_capabilities() {
+        let mut capabilities = acp::AgentCapabilities::default();
+        capabilities.mcp_capabilities.http = true;
+        capabilities.mcp_capabilities.acp = false;
+
+        let server = super::zed_browser_mcp_server_for_capabilities(&capabilities, || {
+            Ok("http://127.0.0.1:9999/mcp".to_string())
+        })
+        .expect("browser MCP server should be advertised");
+
+        match server {
+            acp::McpServer::Http(server) => {
+                assert_eq!(server.name, super::ZED_BROWSER_MCP_SERVER_ID);
+                assert_eq!(server.url, "http://127.0.0.1:9999/mcp");
+            }
+            other => panic!("expected HTTP MCP server, got {other:?}"),
+        }
+    }
 }
 
-fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
+struct BrowserMcpHttpServer {
+    url: String,
+    dispatch_tx: Arc<Mutex<mpsc::UnboundedSender<ForegroundWork>>>,
+}
+
+static ZED_BROWSER_MCP_HTTP_SERVER: OnceLock<Mutex<Option<BrowserMcpHttpServer>>> = OnceLock::new();
+
+fn ensure_zed_browser_mcp_http_server(
+    dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
+) -> Result<String> {
+    let server_cell = ZED_BROWSER_MCP_HTTP_SERVER.get_or_init(|| Mutex::new(None));
+    let mut server_state = server_cell
+        .lock()
+        .expect("browser MCP server mutex poisoned");
+
+    if let Some(server) = server_state.as_ref() {
+        *server
+            .dispatch_tx
+            .lock()
+            .expect("browser MCP dispatch mutex poisoned") = dispatch_tx;
+        return Ok(server.url.clone());
+    }
+
+    let server = tiny_http::Server::http("127.0.0.1:0")
+        .map_err(|err| anyhow!("failed to bind Zed browser MCP HTTP server: {err}"))?;
+    let url = format!("http://{}/mcp", server.server_addr());
+    let dispatch_tx = Arc::new(Mutex::new(dispatch_tx));
+    let thread_dispatch_tx = dispatch_tx.clone();
+
+    thread::Builder::new()
+        .name("zed-browser-mcp-http".into())
+        .spawn(move || {
+            for request in server.incoming_requests() {
+                respond_to_zed_browser_mcp_http_request(request, &thread_dispatch_tx);
+            }
+        })
+        .context("failed to spawn Zed browser MCP HTTP server thread")?;
+
+    *server_state = Some(BrowserMcpHttpServer {
+        url: url.clone(),
+        dispatch_tx,
+    });
+    Ok(url)
+}
+
+fn respond_to_zed_browser_mcp_http_request(
+    mut request: tiny_http::Request,
+    dispatch_tx: &Arc<Mutex<mpsc::UnboundedSender<ForegroundWork>>>,
+) {
+    let mut body = String::new();
+    let (response, status_code) = if request.as_reader().read_to_string(&mut body).is_err() {
+        (
+            zed_browser_mcp_error_response(
+                serde_json::Value::Null,
+                ErrorCode::ParseError,
+                "Failed to read request body",
+            ),
+            400,
+        )
+    } else {
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) if is_json_rpc_notification(&value) => {
+                if let Some(method) = value.get("method").and_then(|method| method.as_str()) {
+                    log::info!("Zed browser MCP HTTP notification: {method}");
+                }
+                dispatch_zed_browser_mcp_http_notification(value, dispatch_tx);
+                (serde_json::Value::Null, 202)
+            }
+            Ok(value) => {
+                if let Some(method) = value.get("method").and_then(|method| method.as_str()) {
+                    log::info!("Zed browser MCP HTTP request: {method}");
+                }
+                (
+                    dispatch_zed_browser_mcp_http_request(value, dispatch_tx),
+                    200,
+                )
+            }
+            Err(err) => (
+                zed_browser_mcp_error_response(
+                    serde_json::Value::Null,
+                    ErrorCode::ParseError,
+                    format!("Invalid JSON: {err}"),
+                ),
+                400,
+            ),
+        }
+    };
+
+    let response_body = if status_code == 202 {
+        String::new()
+    } else {
+        serde_json::to_string(&response).unwrap_or_else(|err| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": i32::from(ErrorCode::InternalError),
+                    "message": format!("Failed to encode response: {err}"),
+                }
+            })
+            .to_string()
+        })
+    };
+    let mut http_response =
+        tiny_http::Response::from_string(response_body).with_status_code(status_code);
+    if let Ok(header) = tiny_http::Header::from_bytes("Content-Type", "application/json") {
+        http_response = http_response.with_header(header);
+    }
+    if let Ok(header) = tiny_http::Header::from_bytes("Mcp-Session-Id", ZED_BROWSER_MCP_SESSION_ID)
+    {
+        http_response = http_response.with_header(header);
+    }
+    request.respond(http_response).ok();
+}
+
+fn dispatch_zed_browser_mcp_http_notification(
+    request: serde_json::Value,
+    dispatch_tx: &Arc<Mutex<mpsc::UnboundedSender<ForegroundWork>>>,
+) {
+    if !matches!(
+        request.get("method").and_then(|method| method.as_str()),
+        Some("tools/call")
+    ) {
+        let _ = zed_browser_mcp_http_response(request);
+        return;
+    }
+
+    let (response_tx, _response_rx) = std_mpsc::channel();
+    let work: ForegroundWork = Box::new(BrowserMcpHttpForegroundWork {
+        request,
+        response_tx,
+    });
+    if let Err(err) = dispatch_tx
+        .lock()
+        .expect("browser MCP dispatch mutex poisoned")
+        .unbounded_send(work)
+    {
+        err.into_inner().reject();
+    }
+}
+
+fn dispatch_zed_browser_mcp_http_request(
+    request: serde_json::Value,
+    dispatch_tx: &Arc<Mutex<mpsc::UnboundedSender<ForegroundWork>>>,
+) -> serde_json::Value {
+    if !matches!(
+        request.get("method").and_then(|method| method.as_str()),
+        Some("tools/call")
+    ) {
+        return zed_browser_mcp_http_response(request);
+    }
+
+    let (response_tx, response_rx) = std_mpsc::channel();
+    let work: ForegroundWork = Box::new(BrowserMcpHttpForegroundWork {
+        request: request.clone(),
+        response_tx,
+    });
+    let send_result = dispatch_tx
+        .lock()
+        .expect("browser MCP dispatch mutex poisoned")
+        .unbounded_send(work);
+    if let Err(err) = send_result {
+        err.into_inner().reject();
+    }
+
+    response_rx.recv().unwrap_or_else(|_| {
+        zed_browser_mcp_error_response(
+            json_rpc_request_id(&request),
+            ErrorCode::InternalError,
+            "Zed browser MCP response channel closed",
+        )
+    })
+}
+
+fn zed_browser_mcp_server_for_capabilities(
+    agent_capabilities: &acp::AgentCapabilities,
+    ensure_http_server: impl FnOnce() -> Result<String>,
+) -> Option<acp::McpServer> {
+    if agent_capabilities.mcp_capabilities.acp {
+        log::info!(
+            "Advertising embedded browser MCP server over ACP transport as {ZED_BROWSER_MCP_SERVER_ID}"
+        );
+        Some(acp::McpServer::Acp(acp::McpServerAcp::new(
+            ZED_BROWSER_MCP_SERVER_ID,
+            ZED_BROWSER_MCP_SERVER_ID,
+        )))
+    } else if agent_capabilities.mcp_capabilities.http {
+        match ensure_http_server() {
+            Ok(url) => {
+                log::info!("Advertising embedded browser MCP server over HTTP transport at {url}");
+                Some(acp::McpServer::Http(acp::McpServerHttp::new(
+                    ZED_BROWSER_MCP_SERVER_ID,
+                    url,
+                )))
+            }
+            Err(err) => {
+                log::warn!("Failed to start embedded browser MCP HTTP server: {err}");
+                None
+            }
+        }
+    } else {
+        log::info!(
+            "Not advertising embedded browser MCP server: agent does not report ACP or HTTP MCP transport support"
+        );
+        None
+    }
+}
+
+fn mcp_servers_for_project(
+    project: &Entity<Project>,
+    agent_capabilities: &acp::AgentCapabilities,
+    browser_mcp_dispatch_tx: Option<&mpsc::UnboundedSender<ForegroundWork>>,
+    cx: &App,
+) -> Vec<acp::McpServer> {
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
-    context_server_store
+    let mut servers = context_server_store
         .configured_server_ids()
         .iter()
         .filter_map(|id| {
@@ -3882,7 +4393,20 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
                 _ => None,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    if let Some(browser_mcp_server) =
+        zed_browser_mcp_server_for_capabilities(agent_capabilities, || {
+            let dispatch_tx = browser_mcp_dispatch_tx
+                .cloned()
+                .ok_or_else(|| anyhow!("browser MCP dispatch channel unavailable"))?;
+            ensure_zed_browser_mcp_http_server(dispatch_tx)
+        })
+    {
+        servers.push(browser_mcp_server);
+    }
+
+    servers
 }
 
 fn config_state(
@@ -4523,4 +5047,641 @@ fn handle_wait_for_terminal_exit(
         }
     })
     .detach();
+}
+
+fn handle_mcp_connect(
+    args: acp::McpConnectRequest,
+    responder: Responder<acp::McpConnectResponse>,
+    _cx: &mut AsyncApp,
+    _ctx: &ClientContext,
+) {
+    if args.acp_id.as_str() != ZED_BROWSER_MCP_SERVER_ID {
+        return respond_err(
+            responder,
+            acp::Error::new(
+                ErrorCode::InvalidParams.into(),
+                format!("Unknown ACP MCP server: {}", args.acp_id),
+            ),
+        );
+    }
+
+    responder
+        .respond(acp::McpConnectResponse {
+            connection_id: format!("{ZED_BROWSER_MCP_SERVER_ID}-{}", uuid::Uuid::new_v4()),
+            meta: None,
+        })
+        .log_err();
+}
+
+fn handle_mcp_disconnect(
+    args: acp::McpDisconnectNotification,
+    _cx: &mut AsyncApp,
+    _ctx: &ClientContext,
+) {
+    if is_zed_browser_mcp_connection(&args.connection_id) {
+        log::debug!("Zed browser MCP disconnected: {}", args.connection_id);
+    }
+}
+
+fn handle_mcp_message(
+    args: acp::McpOverAcpMessage<agent_client_protocol::UntypedMessage>,
+    responder: Responder<serde_json::Value>,
+    cx: &mut AsyncApp,
+    _ctx: &ClientContext,
+) {
+    if !is_zed_browser_mcp_connection(&args.connection_id) {
+        return respond_err(
+            responder,
+            acp::Error::new(
+                ErrorCode::InvalidParams.into(),
+                format!("Unknown Zed browser MCP connection: {}", args.connection_id),
+            ),
+        );
+    }
+
+    let (method, params) = args.message.into_parts();
+    cx.spawn(async move |cx| {
+        let result = match zed_browser_mcp_message(method.as_str(), params, cx).await {
+            Ok(value) => value,
+            Err(error) => serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": error.to_string(),
+                }],
+                "isError": true,
+            }),
+        };
+
+        responder.respond(result).log_err();
+    })
+    .detach();
+}
+
+fn handle_mcp_message_notification(
+    args: acp::McpOverAcpMessage<agent_client_protocol::UntypedMessage>,
+    _cx: &mut AsyncApp,
+    _ctx: &ClientContext,
+) {
+    if !is_zed_browser_mcp_connection(&args.connection_id) {
+        log::debug!(
+            "Ignoring MCP notification for unknown Zed browser connection {}: {}",
+            args.connection_id,
+            args.message.method()
+        );
+        return;
+    }
+
+    log::debug!(
+        "Zed browser MCP notification on {}: {}",
+        args.connection_id,
+        args.message.method()
+    );
+}
+
+async fn zed_browser_mcp_message(
+    method: &str,
+    params: serde_json::Value,
+    cx: &mut AsyncApp,
+) -> Result<serde_json::Value> {
+    match method {
+        "initialize" => Ok(serde_json::json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "tools": {} },
+            "serverInfo": {
+                "name": ZED_BROWSER_MCP_SERVER_ID,
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+        })),
+        "tools/list" => Ok(serde_json::json!({
+            "tools": zed_browser_mcp_tools(),
+        })),
+        "tools/call" => {
+            let params = params
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("Missing tools/call params"))?;
+            let name = params
+                .get("name")
+                .and_then(|name| name.as_str())
+                .ok_or_else(|| anyhow!("Missing tools/call name"))?;
+            let arguments = params
+                .get("arguments")
+                .and_then(|arguments| arguments.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let output = match call_zed_browser_tool(name, arguments, cx).await {
+                Ok(output) => output,
+                Err(err) => serde_json::json!({
+                    "ok": false,
+                    "tool": name,
+                    "reason": err.to_string(),
+                    "nextStep": zed_browser_tool_error_next_step(name, &err),
+                }),
+            };
+            zed_browser_tool_call_response(output)
+        }
+        _ => Ok(serde_json::json!({})),
+    }
+}
+
+fn zed_browser_tool_error_next_step(name: &str, err: &anyhow::Error) -> &'static str {
+    let reason = err.to_string();
+    if matches!(name, "browser.click_element" | "browser.type_text")
+        && reason.contains("No matching browser target preview")
+    {
+        return "The previewed target is stale or missing. Call browser.snapshot and use a fresh ref with browser.click/browser.fill, or call browser.find_element again before browser.click_element/browser.type_text. Do not call browser.open, do not restart navigation, and do not use external web search for this in-page repair.";
+    }
+
+    "If the user asked to open @browser or there is no active browser tab, call browser.open with the target URL. Otherwise continue from the active page with browser.snapshot, browser.screenshot, browser.console, browser.network, or browser.find_element as appropriate. Do not fall back to the Codex Desktop Browser plugin, Chrome, or external web search for Zed embedded browser requests."
+}
+
+fn zed_browser_tool_call_response(output: serde_json::Value) -> Result<serde_json::Value> {
+    let failed = output
+        .get("ok")
+        .and_then(|ok| ok.as_bool())
+        .is_some_and(|ok| !ok);
+    let output_text = serde_json::to_string_pretty(&output)?;
+    let text = if failed {
+        format!(
+            "Browser action did not satisfy its postcondition. Continue the browser loop: inspect structuredContent.reason, structuredContent.typed, and structuredContent.page.messages; if the DOM snapshot or actionability result does not explain the visible page, call browser.screenshot before retrying. Repair the input or target; then retry before responding to the user.\n\n{output_text}"
+        )
+    } else {
+        output_text
+    };
+    let mut response = serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": text,
+        }],
+        "structuredContent": output,
+    });
+    if failed {
+        response["isError"] = serde_json::Value::Bool(true);
+    }
+    Ok(response)
+}
+
+fn zed_browser_mcp_http_response(request: serde_json::Value) -> serde_json::Value {
+    let id = json_rpc_request_id(&request);
+    let Some(method) = request.get("method").and_then(|method| method.as_str()) else {
+        return zed_browser_mcp_error_response(
+            id,
+            ErrorCode::InvalidRequest,
+            "Missing JSON-RPC method",
+        );
+    };
+
+    if method == "tools/call" {
+        return zed_browser_mcp_error_response(
+            id,
+            ErrorCode::InternalError,
+            "Browser tool calls require the Zed foreground thread",
+        );
+    }
+
+    zed_browser_mcp_http_response_from_result(
+        id,
+        match method {
+            "notifications/initialized" => Ok(serde_json::json!({})),
+            "initialize" => Ok(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": ZED_BROWSER_MCP_SERVER_ID,
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            })),
+            "tools/list" => Ok(serde_json::json!({
+                "tools": zed_browser_mcp_tools(),
+            })),
+            _ => Err(anyhow!("Unknown Zed browser MCP method: {method}")),
+        },
+    )
+}
+
+async fn zed_browser_mcp_http_response_with_app(
+    request: serde_json::Value,
+    cx: &mut AsyncApp,
+) -> serde_json::Value {
+    let id = json_rpc_request_id(&request);
+    let Some(method) = request.get("method").and_then(|method| method.as_str()) else {
+        return zed_browser_mcp_error_response(
+            id,
+            ErrorCode::InvalidRequest,
+            "Missing JSON-RPC method",
+        );
+    };
+    let params = request
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let result = if method == "tools/call" {
+        zed_browser_mcp_message(method, params, cx).await
+    } else {
+        match method {
+            "notifications/initialized" => Ok(serde_json::json!({})),
+            "initialize" => Ok(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": ZED_BROWSER_MCP_SERVER_ID,
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            })),
+            "tools/list" => Ok(serde_json::json!({
+                "tools": zed_browser_mcp_tools(),
+            })),
+            _ => Err(anyhow!("Unknown Zed browser MCP method: {method}")),
+        }
+    };
+
+    zed_browser_mcp_http_response_from_result(id, result)
+}
+
+fn zed_browser_mcp_http_response_from_result(
+    id: serde_json::Value,
+    result: Result<serde_json::Value>,
+) -> serde_json::Value {
+    match result {
+        Ok(result) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }),
+        Err(err) => zed_browser_mcp_error_response(id, ErrorCode::InternalError, err.to_string()),
+    }
+}
+
+fn json_rpc_request_id(request: &serde_json::Value) -> serde_json::Value {
+    request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn is_json_rpc_notification(request: &serde_json::Value) -> bool {
+    request
+        .get("method")
+        .and_then(|method| method.as_str())
+        .is_some()
+        && request.get("id").is_none()
+}
+
+fn zed_browser_mcp_error_response(
+    id: serde_json::Value,
+    code: ErrorCode,
+    message: impl Into<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": i32::from(code),
+            "message": message.into(),
+        }
+    })
+}
+
+fn is_zed_browser_mcp_connection(connection_id: &str) -> bool {
+    connection_id
+        .strip_prefix(ZED_BROWSER_MCP_SERVER_ID)
+        .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
+fn zed_browser_mcp_tools() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "name": "browser.current_page",
+            "description": "Read the active Zed embedded browser tab state, including URL, title, previewed element, and GPUI drawing overlay metadata. If the user asks whether you can see their drawing, inspect drawingOverlay.hasDrawing and drawingOverlay.svg here; page DOM snapshots do not contain freehand overlay strokes. If this reports no active tab and the user asked to open @browser, call browser.open with the target URL.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "browser.open",
+            "description": "Open a Zed embedded browser tab at the supplied URL. Use this when the user asks to open @browser, when no active browser tab exists, or when browser.current_page/browser.navigate reports that the active tab is unavailable. This creates the in-Zed browser surface; do not use the Codex Desktop Browser plugin or Chrome as a fallback for @browser.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "url": { "type": "string" } },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.navigate",
+            "description": "Navigate the active Zed embedded browser tab to a URL. If no active tab exists or the active tab is unavailable, call browser.open with the URL instead of falling back to any external browser.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "url": { "type": "string" } },
+                "required": ["url"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.snapshot",
+            "description": "Read a compact snapshot of visible interactive elements in the active Zed embedded browser tab plus GPUI drawing overlay metadata. Use this after navigation or UI changes before guessing selectors; choose targets from the returned selector/tag/role/name/text/bounds list instead of probing with repeated failing find_element calls. Use visible site controls and snapshot refs before repair tools. If an exact in-page filter value is unavailable, use the closest visible site control instead of leaving the site. Do not use external web search to repair ordinary in-page automation failures. For user freehand drawing annotations, inspect drawingOverlay.hasDrawing and drawingOverlay.svg because the DOM root cannot contain GPUI overlay strokes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "request_id": { "type": "string" } },
+                "required": ["request_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.screenshot",
+            "description": "Capture the actual pixels of the active Zed embedded browser tab to a PNG file. Use this when browser.snapshot/actionability is stale, empty, blocked by a popup, or otherwise does not explain what the user can see.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "request_id": { "type": "string" } },
+                "required": ["request_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.click",
+            "description": "Click an element by ref from the latest browser.snapshot. The ref is valid only for the supplied snapshot_id. Performs actionability checks before dispatching input and returns fresh page state. Prefer this over browser.find_element when the snapshot already returned the target.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "snapshot_id": { "type": "string" },
+                    "ref": { "type": "string" }
+                },
+                "required": ["snapshot_id", "ref"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.fill",
+            "description": "Fill an editable element by ref from browser.snapshot. The ref is valid only for the supplied snapshot_id. Verifies the observed value and returns fresh page state. Prefer this over browser.type_text when the snapshot already returned the target.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "snapshot_id": { "type": "string" },
+                    "ref": { "type": "string" },
+                    "text": { "type": "string" },
+                    "submit": { "type": "boolean", "default": false }
+                },
+                "required": ["snapshot_id", "ref", "text"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.scroll_to",
+            "description": "Scroll a node from the latest browser.snapshot directly into view by ref. Use this when the snapshot already contains the target section or text, such as Reviews, Specifications, or Product Information; it performs one DOM scrollIntoView instead of repeated wheel-scroll/snapshot loops.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "snapshot_id": { "type": "string" },
+                    "ref": { "type": "string" },
+                    "align": { "type": "string", "enum": ["start", "center", "end", "nearest"], "default": "center" }
+                },
+                "required": ["request_id", "snapshot_id", "ref"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.scroll",
+            "description": "Slowly scroll the active Zed embedded browser tab using native wheel input. Positive delta_y scrolls down; negative delta_y scrolls up. Use this instead of find_element when the user asks to scroll, PageDown, or inspect content lower on the page, then call browser.snapshot again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "delta_x": { "type": "number", "default": 0 },
+                    "delta_y": { "type": "number" },
+                    "steps": { "type": "integer", "minimum": 1, "maximum": 60, "default": 8 },
+                    "x": { "type": "number" },
+                    "y": { "type": "number" }
+                },
+                "required": ["request_id", "delta_y"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.console",
+            "description": "Return recent console errors, warnings, logs, and JavaScript exceptions captured from the active Zed embedded browser tab.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "level": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.network",
+            "description": "Return recent failed network requests and HTTP error responses captured from the active Zed embedded browser tab.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "failures_only": { "type": "boolean", "default": true },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.expect",
+            "description": "Retry a browser assertion until it passes or times out. Supported kinds: url_contains, text_contains, visible.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["url_contains", "text_contains", "visible"] },
+                    "value": { "type": "string" },
+                    "selector": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 10000, "default": 1000 }
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.trace",
+            "description": "Return the recent Zed browser automation trace: tool calls, refs, selectors, ok status, and failure reasons.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "browser.find_element",
+            "description": "Compatibility and repair path when browser.snapshot refs are insufficient. Find and preview an element in the active Zed embedded browser tab by text, selector, selected element, role/name, or point. After a Multiple visible elements matched result, choose from the returned candidates or re-snapshot before retrying; do not keep probing the same broad text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "query_kind": { "type": "string", "enum": ["selected", "selector", "text_exact", "text_contains", "role_and_name", "point"] },
+                    "query": { "type": "string" }
+                },
+                "required": ["request_id", "query_kind", "query"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.click_element",
+            "description": "Compatibility and repair path. Click the currently previewed element from browser.find_element in the active Zed embedded browser tab. If the preview is stale or missing, re-snapshot or re-run browser.find_element; do not reopen the page or use external web search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "request_id": { "type": "string" } },
+                "required": ["request_id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.type_text",
+            "description": "Compatibility and repair path. Fill the currently previewed element from browser.find_element in the active Zed embedded browser tab. If the preview is stale or missing, re-snapshot or re-run browser.find_element; do not reopen the page or use external web search.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "request_id": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["request_id", "text"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "browser.clear_cursor",
+            "description": "Clear the visible browser agent cursor preview.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        }
+    ])
+}
+
+async fn call_zed_browser_tool(
+    name: &str,
+    arguments: serde_json::Map<String, serde_json::Value>,
+    cx: &mut AsyncApp,
+) -> Result<serde_json::Value> {
+    let request = match name {
+        "browser.current_page" => workspace::browser_agent::BrowserAgentRequest::CurrentPage,
+        "browser.open" => workspace::browser_agent::BrowserAgentRequest::Open {
+            url: required_string(&arguments, "url")?,
+        },
+        "browser.navigate" => workspace::browser_agent::BrowserAgentRequest::Navigate {
+            url: required_string(&arguments, "url")?,
+        },
+        "browser.snapshot" => workspace::browser_agent::BrowserAgentRequest::Snapshot {
+            request_id: required_string(&arguments, "request_id")?,
+        },
+        "browser.screenshot" => workspace::browser_agent::BrowserAgentRequest::Screenshot {
+            request_id: required_string(&arguments, "request_id")?,
+        },
+        "browser.click" => workspace::browser_agent::BrowserAgentRequest::ClickRef {
+            snapshot_id: required_string(&arguments, "snapshot_id")?,
+            element_ref: required_string(&arguments, "ref")?,
+        },
+        "browser.fill" => workspace::browser_agent::BrowserAgentRequest::FillRef {
+            snapshot_id: required_string(&arguments, "snapshot_id")?,
+            element_ref: required_string(&arguments, "ref")?,
+            text: required_string(&arguments, "text")?,
+            submit: arguments
+                .get("submit")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        },
+        "browser.scroll_to" => workspace::browser_agent::BrowserAgentRequest::ScrollToRef {
+            request_id: required_string(&arguments, "request_id")?,
+            snapshot_id: required_string(&arguments, "snapshot_id")?,
+            element_ref: required_string(&arguments, "ref")?,
+            align: arguments
+                .get("align")
+                .and_then(|value| value.as_str())
+                .unwrap_or("center")
+                .to_string(),
+        },
+        "browser.scroll" => workspace::browser_agent::BrowserAgentRequest::Scroll {
+            request_id: required_string(&arguments, "request_id")?,
+            delta_x: optional_f64(&arguments, "delta_x")?.unwrap_or(0.0),
+            delta_y: required_f64(&arguments, "delta_y")?,
+            steps: optional_u32(&arguments, "steps")?.unwrap_or(8),
+            x: optional_f64(&arguments, "x")?,
+            y: optional_f64(&arguments, "y")?,
+        },
+        "browser.console" => workspace::browser_agent::BrowserAgentRequest::Console {
+            level: arguments
+                .get("level")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
+            limit: optional_u32(&arguments, "limit")?.unwrap_or(20) as usize,
+        },
+        "browser.network" => workspace::browser_agent::BrowserAgentRequest::Network {
+            failures_only: arguments
+                .get("failures_only")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            limit: optional_u32(&arguments, "limit")?.unwrap_or(20) as usize,
+        },
+        "browser.expect" => workspace::browser_agent::BrowserAgentRequest::Expect {
+            kind: required_string(&arguments, "kind")?,
+            value: arguments
+                .get("value")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
+            selector: arguments
+                .get("selector")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned),
+            timeout_ms: optional_u32(&arguments, "timeout_ms")?.unwrap_or(1_000) as u64,
+        },
+        "browser.trace" => workspace::browser_agent::BrowserAgentRequest::Trace,
+        "browser.find_element" => workspace::browser_agent::BrowserAgentRequest::FindElement {
+            request_id: required_string(&arguments, "request_id")?,
+            query_kind: required_string(&arguments, "query_kind")?,
+            query: required_string(&arguments, "query")?,
+        },
+        "browser.click_element" => workspace::browser_agent::BrowserAgentRequest::ClickElement {
+            request_id: required_string(&arguments, "request_id")?,
+        },
+        "browser.type_text" => workspace::browser_agent::BrowserAgentRequest::TypeText {
+            request_id: required_string(&arguments, "request_id")?,
+            text: required_string(&arguments, "text")?,
+        },
+        "browser.clear_cursor" => workspace::browser_agent::BrowserAgentRequest::ClearCursor,
+        other => anyhow::bail!("Unknown Zed browser tool: {other}"),
+    };
+
+    let task = cx.update(|cx| workspace::browser_agent::call_active_browser(request, cx));
+    task.await
+}
+
+fn required_string(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String> {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("Missing string argument: {key}"))
+}
+
+fn required_f64(arguments: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<f64> {
+    optional_f64(arguments, key)?.ok_or_else(|| anyhow!("Missing number argument: {key}"))
+}
+
+fn optional_f64(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<f64>> {
+    arguments
+        .get(key)
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| anyhow!("Expected number argument: {key}"))
+        })
+        .transpose()
+}
+
+fn optional_u32(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<u32>> {
+    arguments
+        .get(key)
+        .map(|value| {
+            let value = value
+                .as_u64()
+                .ok_or_else(|| anyhow!("Expected integer argument: {key}"))?;
+            u32::try_from(value).map_err(|_| anyhow!("Integer argument out of range: {key}"))
+        })
+        .transpose()
 }

@@ -362,7 +362,7 @@ impl MentionUri {
                     .to_string_lossy();
                 format!("Merge Conflict ({name})")
             }
-            MentionUri::Browser => "Browser".to_string(),
+            MentionUri::Browser => "Zed Browser".to_string(),
             MentionUri::Selection {
                 abs_path: path,
                 line_range,
@@ -851,7 +851,7 @@ mod tests {
         let parsed = MentionUri::parse(browser_uri, PathStyle::local()).unwrap();
 
         assert_eq!(parsed, MentionUri::Browser);
-        assert_eq!(parsed.name(), "Browser");
+        assert_eq!(parsed.name(), "Zed Browser");
         assert_eq!(parsed.to_uri().to_string(), browser_uri);
     }
 

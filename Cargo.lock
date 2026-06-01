@@ -309,10 +309,12 @@ dependencies = [
  "tempfile",
  "terminal",
  "thiserror 2.0.17",
+ "tiny_http",
  "ui",
  "util",
  "uuid",
  "watch",
+ "workspace",
  "zed_credentials_provider",
 ]
 
