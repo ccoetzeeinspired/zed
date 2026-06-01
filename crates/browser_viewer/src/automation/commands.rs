@@ -7,7 +7,7 @@ use super::action::{DEFAULT_ACTION_TIMEOUT, RETRY_INTERVAL, SessionAttempt};
 use anyhow::{Result, anyhow};
 use futures::channel::oneshot;
 use gpui::{AsyncApp, Entity};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::automation::action::{
     element_for_action, invoke_on_backend_node, try_bounding_rect_backend_node,
@@ -17,7 +17,7 @@ use crate::automation::action::{
 };
 use crate::automation::cdp::CdpSession;
 use crate::automation::navigate::{WaitForOptions, normalize_navigate_url, wait_for_result};
-use crate::automation::snapshot::{PageSnapshot, snapshot_from_ax_tree};
+use crate::automation::snapshot::{FrameAx, PageSnapshot, snapshot_from_ax_tree, snapshot_from_frames};
 use crate::browser_view::BrowserView;
 
 fn resolve_ref_on_browser(
@@ -36,6 +36,90 @@ fn resolve_ref_on_browser(
             )
         })?;
     element_for_action(element)
+}
+
+/// Generic one-shot CDP call on the page session (awaitable). Best-effort.
+async fn cdp_call(
+    browser: &Entity<BrowserView>,
+    method: &str,
+    params_json: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (tx, rx) = oneshot::channel::<Result<Value>>();
+    let mut tx_slot = Some(tx);
+    let method = method.to_string();
+    let params = params_json.to_string();
+    let kicked = browser.update(cx, |view, cx| {
+        view.with_webview_session(cx, |session| {
+            CdpSession::new(session)
+                .call_method(
+                    &method,
+                    &params,
+                    Box::new(move |r| {
+                        if let Some(tx) = tx_slot.take() {
+                            let _ = tx.send(r);
+                        }
+                    }),
+                )
+                .is_ok()
+        })
+        .unwrap_or(false)
+    });
+    if !kicked {
+        return Err(anyhow!("no live WebView2 session"));
+    }
+    rx.await.map_err(|_| anyhow!("cdp channel dropped"))?
+}
+
+/// CP15 codegen: compute the most durable *unique* selector for the element a
+/// snapshot ref points at, in the page itself. Returns `(is_testid, value)` —
+/// `is_testid` ⇒ a `data-testid` value (use `getByTestId`); else `value` is a
+/// unique CSS selector. `None` if nothing stable+unique exists. Best-effort:
+/// never errors, so recording can't break a tool call.
+pub async fn durable_selector(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    cx: &mut AsyncApp,
+) -> Option<(bool, String)> {
+    let backend = cx.update(|app| {
+        browser
+            .read(app)
+            .item()
+            .read(app)
+            .resolve_automation_ref(ref_id)
+            .and_then(|e| e.backend_dom_node_id)
+    })?;
+    let (tx, rx) = oneshot::channel::<Result<Value>>();
+    let mut tx_slot = Some(tx);
+    let kicked = browser.update(cx, |view, cx| {
+        view.with_webview_session(cx, |session| {
+            crate::automation::action::try_durable_selector_backend_node(
+                session,
+                backend,
+                Box::new(move |r| {
+                    if let Some(tx) = tx_slot.take() {
+                        let _ = tx.send(r);
+                    }
+                }),
+            )
+            .is_ok()
+        })
+        .unwrap_or(false)
+    });
+    if !kicked {
+        return None;
+    }
+    let value = rx.await.ok()?.ok()?;
+    let kind = value.get("k").and_then(|v| v.as_str()).unwrap_or("");
+    let sel = value.get("v").and_then(|v| v.as_str()).unwrap_or("");
+    if sel.is_empty() {
+        return None;
+    }
+    match kind {
+        "testid" => Some((true, sel.to_string())),
+        "css" => Some((false, sel.to_string())),
+        _ => None,
+    }
 }
 
 async fn run_with_actionability_wait_result(
@@ -92,45 +176,132 @@ async fn run_with_actionability_wait_result(
 }
 
 pub async fn snapshot(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result<PageSnapshot> {
-    let browser_for_gen = browser.clone();
     let page_generation = cx.update(|app| {
-        browser_for_gen
+        browser
             .read(app)
             .item()
             .read(app)
             .automation_page_generation()
     });
-    let (tx, rx) = oneshot::channel::<Result<PageSnapshot>>();
-    let mut tx_slot = Some(tx);
-    let kicked_off = browser.update(cx, |view, cx| {
-        view.with_webview_session(cx, |session| {
-            let cdp = CdpSession::new(session);
-            cdp.fetch_full_ax_tree(Box::new(move |tree_result| {
-                if let Some(tx) = tx_slot.take() {
-                    let snapshot = tree_result
-                        .and_then(|tree| snapshot_from_ax_tree(tree, page_generation));
-                    let _ = tx.send(snapshot);
-                }
-            }))
-            .is_ok()
-        })
-        .unwrap_or(false)
-    });
-    if !kicked_off {
-        return Err(anyhow!(
-            "No live WebView2 session on the target browser tab. Wait for the page to finish loading."
-        ));
+
+    // Enable the domains we need across all frames.
+    cdp_call(&browser, "Accessibility.enable", "{}", cx).await?;
+    let _ = cdp_call(&browser, "Page.enable", "{}", cx).await;
+    let _ = cdp_call(&browser, "DOM.enable", "{}", cx).await;
+
+    // Enumerate frames (main first, DFS). WebView2 flattens OOPIFs into the top
+    // session, so cross-origin child frames (e.g. consent CMP iframes) are
+    // reachable here for both reading (getFullAXTree) and acting (resolveNode).
+    let frame_tree = cdp_call(&browser, "Page.getFrameTree", "{}", cx).await?;
+    let mut frames: Vec<(String, String, bool)> = Vec::new(); // (frameId, url, is_main)
+    fn collect(node: &Value, is_main: bool, out: &mut Vec<(String, String, bool)>) {
+        if let Some(frame) = node.get("frame") {
+            let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let url = frame.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if !id.is_empty() {
+                out.push((id, url, is_main));
+            }
+        }
+        if let Some(children) = node.get("childFrames").and_then(|v| v.as_array()) {
+            for c in children {
+                collect(c, false, out);
+            }
+        }
+    }
+    if let Some(root) = frame_tree.get("frameTree") {
+        collect(root, true, &mut frames);
+    }
+    if frames.is_empty() {
+        // Fallback: single-frame snapshot via the legacy path.
+        let tree = cdp_call(&browser, "Accessibility.getFullAXTree", "{}", cx).await?;
+        let snapshot = snapshot_from_ax_tree(tree, page_generation)?;
+        browser.update(cx, |view, cx| view.store_automation_snapshot(cx, snapshot.clone()));
+        return Ok(snapshot);
     }
 
-    let snapshot = rx
+    let mut frame_inputs: Vec<FrameAx> = Vec::new();
+    for (frame_id, url, is_main) in frames {
+        let ax = match cdp_call(
+            &browser,
+            "Accessibility.getFullAXTree",
+            &json!({ "frameId": frame_id }).to_string(),
+            cx,
+        )
         .await
-        .map_err(|_| anyhow!("browser automation snapshot channel dropped"))??;
+        {
+            Ok(v) => v,
+            Err(_) => continue, // skip unreachable frames (best-effort)
+        };
+        let owner_selector = if is_main {
+            None
+        } else {
+            iframe_owner_selector(&browser, &frame_id, &url, cx).await
+        };
+        frame_inputs.push(FrameAx { ax, url, owner_selector });
+    }
 
-    browser.update(cx, |view, cx| {
-        view.store_automation_snapshot(cx, snapshot.clone());
-    });
-
+    let snapshot = snapshot_from_frames(frame_inputs, page_generation)?;
+    browser.update(cx, |view, cx| view.store_automation_snapshot(cx, snapshot.clone()));
     Ok(snapshot)
+}
+
+/// Compute a Playwright-usable CSS selector for the `<iframe>` that owns
+/// `frame_id`: a unique structural selector (id/test-id/name) when available,
+/// else `iframe[src="<url>"]`, else `None`.
+async fn iframe_owner_selector(
+    browser: &Entity<BrowserView>,
+    frame_id: &str,
+    url: &str,
+    cx: &mut AsyncApp,
+) -> Option<String> {
+    let owner = cdp_call(
+        browser,
+        "DOM.getFrameOwner",
+        &json!({ "frameId": frame_id }).to_string(),
+        cx,
+    )
+    .await
+    .ok()?;
+    let backend = owner.get("backendNodeId").and_then(|v| v.as_i64())?;
+    // Read the iframe element's own attributes directly (DOM.describeNode gives
+    // a flat [name, value, name, value, …] list). Build a unique selector from
+    // a stable attribute. NB: use the iframe element's `src` ATTRIBUTE, never the
+    // frame's document URL — they differ for srcdoc/dynamically-created editors.
+    let desc = cdp_call(
+        browser,
+        "DOM.describeNode",
+        &json!({ "backendNodeId": backend }).to_string(),
+        cx,
+    )
+    .await
+    .ok()?;
+    if let Some(attrs) = desc
+        .get("node")
+        .and_then(|n| n.get("attributes"))
+        .and_then(|a| a.as_array())
+    {
+        // Flatten pairs into a lookup.
+        let get = |key: &str| -> Option<String> {
+            attrs
+                .chunks(2)
+                .find(|p| p.first().and_then(|v| v.as_str()) == Some(key))
+                .and_then(|p| p.get(1))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        for key in ["id", "data-testid", "title", "name", "src"] {
+            if let Some(v) = get(key) {
+                return Some(format!("iframe[{key}=\"{}\"]", v.replace('"', "\\\"")));
+            }
+        }
+    }
+    // Genuine last resort: the frame document URL (only when the iframe element
+    // carries no usable attribute at all).
+    if !url.is_empty() && url != "about:blank" {
+        return Some(format!("iframe[src=\"{}\"]", url.replace('"', "\\\"")));
+    }
+    None
 }
 
 /// Click an element. `button` is "left"/"right"/"middle"; with the default

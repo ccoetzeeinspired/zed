@@ -19,7 +19,7 @@ corresponding feature.
 |-------------------------------------------------|-----------------------------------------|
 | [`browser-viewer.md`](plans/browser-viewer.md)  | Shipped (in `cccl-main`)                |
 | [`browser-automation.md`](plans/browser-automation.md) | CP0–CP13 shipped — full Playwright MCP parity (51 tools) |
-| [`browser-codegen.md`](plans/browser-codegen.md) | Proposal — CP15 record→codegen (agent run → runnable Playwright script) + testing strategy. **Start here for the next phase.** |
+| [`browser-codegen.md`](plans/browser-codegen.md) | CP15 v1 **shipped + verified** (`feat/cp15-codegen`) — record→codegen proven: agent run → runnable Playwright `.spec.ts`, 1/1 then 3/3 no-flake on TrueLens login→dashboard, 0 manual edits. See §4.6 Results. |
 
 All shipped features now live in `cccl-main` (see Branches below).
 
@@ -477,14 +477,26 @@ mocking via CDP `Fetch`) remains, deferred by choice. Documented divergences
 `generate_locator` (→ `browser_snapshot` refs), `annotate` (→ design mode),
 tracing/video/`resume`, `get_config`. See `plans/browser-automation.md` §9.
 
-**Next phase — agent → runnable scripts (CP15, candidate).** The high-value
-direction beyond parity: a **record + codegen** layer that turns an agent's
-interactive run into a runnable Playwright `.spec.ts`. Feasible *because* our
-refs are role+name (≈ `getByRole` locators), we own the dispatch chokepoint
-(record-not-recall), and `storage_state` seeds auth (proven). Full design,
-rationale, the action→Playwright mapping, and the test-the-claim experiment:
-[`plans/browser-codegen.md`](plans/browser-codegen.md) — **the orientation doc
-for a fresh session** (it recaps the whole framework + how to build/run/verify).
+**CP15 v1 — agent → runnable scripts (record + codegen). SHIPPED + VERIFIED
+(2026-05-31, branch `feat/cp15-codegen`).** A **record + codegen** layer turns an
+agent's interactive run into a runnable Playwright `.spec.ts`. Proven against the
+canonical TrueLens login→dashboard flow: the agent drove it via MCP with
+`browser_record` on, `browser_codegen` emitted the spec verbatim, and it passed
+under real Playwright 1.60 Chromium (1/1, then 3/3 no-flake, **0 manual edits**).
+Works *because* our refs are role+name (each `eN` → `getByRole(role,{name})`), we
+own the dispatch chokepoint (`ipc.rs::dispatch_request` → record-not-recall, no
+LLM reconstruction), and `storage_state` seeds auth.
+- **Code:** `crates/browser_viewer/src/automation/recorder.rs` (buffer +
+  action→Playwright codegen, 9 unit tests) + the capture/commit hook and
+  `record`/`codegen` methods in `automation/ipc.rs`; MCP tools `browser_record`
+  (start/stop/status, opt `captureStorageState`) + `browser_codegen` in
+  `vendor/zed-browser-mcp/src/index.ts`.
+- **Known residual:** post-click `waitForLoadState()` can land after the next
+  action (click returns before async nav settles); harmless under Playwright
+  auto-wait. **Not yet done:** the `storageState`-seeded variant and
+  fallback-selector capture. Full design + the test-the-claim results:
+  [`plans/browser-codegen.md`](plans/browser-codegen.md) §4.6 — **the orientation
+  doc for a fresh session** (recaps the framework + how to build/run/verify).
 
 **What it does:** The claude-acp agent drives the **embedded browser tab**
 through 51 MCP tools registered as the `zed-browser` context server: navigation

@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 import { callZedAutomation, requireZedOk } from "./ipc.js";
 
@@ -878,6 +878,86 @@ server.tool(
   async () => {
     await requireZedOk(await callZedAutomation("close"));
     return textContent("Closed the active browser tab");
+  },
+);
+
+// ---- CP15: record + codegen (agent run → runnable Playwright spec) ----
+
+server.tool(
+  "browser_record",
+  "Record the automation run for codegen. action=start clears+enables the " +
+    "recorder (optionally captures storage_state to seed auth); stop disables " +
+    "it and returns the action count; status reports current state. After stop, " +
+    "use browser_codegen to emit the Playwright spec.",
+  {
+    action: z
+      .enum(["start", "stop", "status"])
+      .describe("start | stop | status"),
+    captureStorageState: z
+      .boolean()
+      .optional()
+      .describe(
+        "On start: also capture cookies+storage so the generated spec can seed " +
+          "auth via test.use({ storageState }) and skip the login flow",
+      ),
+  },
+  async ({ action, captureStorageState }) => {
+    const result = (await requireZedOk(
+      await callZedAutomation("record", { action, captureStorageState }),
+    )) as {
+      recording?: boolean;
+      actions?: number;
+      storageStateCaptured?: boolean;
+    };
+    if (action === "start") {
+      return textContent(
+        `Recording started${result.storageStateCaptured ? " (storage state captured)" : ""}.`,
+      );
+    }
+    if (action === "stop") {
+      return textContent(
+        `Recording stopped — ${result.actions ?? 0} action(s) captured. Run browser_codegen to emit the spec.`,
+      );
+    }
+    return textContent(
+      `Recording: ${result.recording ? "active" : "inactive"}, ` +
+        `${result.actions ?? 0} action(s)` +
+        `${result.storageStateCaptured ? ", storage state captured" : ""}.`,
+    );
+  },
+);
+
+server.tool(
+  "browser_codegen",
+  "Generate a runnable Playwright .spec.ts from the current recording buffer " +
+    "and write it to disk. If storage state was captured at record start, also " +
+    "writes storage.json next to the spec (referenced by test.use).",
+  {
+    filename: z
+      .string()
+      .optional()
+      .describe("Output path for the .spec.ts; defaults to a temp file"),
+  },
+  async ({ filename }) => {
+    const result = (await requireZedOk(
+      await callZedAutomation("codegen"),
+    )) as { script?: string; storageState?: unknown };
+    const script = result.script ?? "";
+    const out = filename ?? join(tmpdir(), `recorded-flow-${Date.now()}.spec.ts`);
+    writeFileSync(out, script);
+    let note = "";
+    if (result.storageState != null) {
+      const stateOut = join(dirname(out), "storage.json");
+      writeFileSync(stateOut, JSON.stringify(result.storageState, null, 2));
+      note = ` (+ storage state at ${stateOut})`;
+    }
+    return textContent(
+      `Wrote Playwright spec to ${out}${note}\n\n` +
+        "Run it under real Playwright:\n" +
+        `  npx playwright test ${out}\n\n` +
+        "----- spec -----\n" +
+        script,
+    );
   },
 );
 
