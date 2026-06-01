@@ -1037,6 +1037,12 @@ impl Domain for WorkspaceDb {
             ALTER TABLE workspaces ADD COLUMN identity_paths TEXT;
             ALTER TABLE workspaces ADD COLUMN identity_paths_order TEXT;
         ),
+        // FORK: dynamic workspace layout (Stage 5). Nullable JSON blob holding the
+        // user's custom region arrangement (SerializedLayoutNode). NULL / absent =
+        // built-in layout, so old workspaces are unaffected.
+        sql!(
+            ALTER TABLE workspaces ADD COLUMN custom_layout TEXT;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -2430,6 +2436,26 @@ impl WorkspaceDb {
         pub(crate) async fn set_centered_layout(workspace_id: WorkspaceId, centered_layout: bool) -> Result<()> {
             UPDATE workspaces
             SET centered_layout = ?2
+            WHERE workspace_id = ?1
+        }
+    }
+
+    // FORK: dynamic workspace layout (Stage 5). The custom layout tree is stored
+    // as a JSON blob in its own nullable column, written via this dedicated query
+    // (like `set_centered_layout`) rather than through the main `save_workspace`
+    // upsert, so it doesn't disturb the positional column tuples there.
+    query! {
+        pub(crate) async fn save_custom_layout(workspace_id: WorkspaceId, custom_layout: Option<String>) -> Result<()> {
+            UPDATE workspaces
+            SET custom_layout = ?2
+            WHERE workspace_id = ?1
+        }
+    }
+
+    query! {
+        pub(crate) async fn get_custom_layout(workspace_id: WorkspaceId) -> Result<Option<String>> {
+            SELECT custom_layout
+            FROM workspaces
             WHERE workspace_id = ?1
         }
     }
