@@ -320,9 +320,16 @@ impl BrowserView {
         })
         .detach();
 
+        let focus_handle = cx.focus_handle();
+        #[cfg(target_os = "macos")]
+        cx.on_blur(&focus_handle, window, |this, _window, cx| {
+            this.release_native_browser_focus(cx);
+        })
+        .detach();
+
         Self {
             item,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             url_editor,
             design_prompt_editor,
             workspace: None,
@@ -2795,7 +2802,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_releases_page_focus_only_for_focused_url_editor() {
+    fn macos_render_releases_page_focus_only_for_focused_url_editor() {
         assert!(should_release_native_browser_focus(true));
         assert!(!should_release_native_browser_focus(false));
     }
