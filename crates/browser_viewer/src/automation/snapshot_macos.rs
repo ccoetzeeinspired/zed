@@ -100,6 +100,10 @@ pub fn macos_snapshot_script() -> &'static str {
     const aria = trim(element.getAttribute("aria-label"));
     if (aria) return aria;
     const tag = element.tagName.toLowerCase();
+    const directTextOf = (target) => trim(Array.from(target.childNodes)
+      .filter((child) => child.nodeType === Node.TEXT_NODE)
+      .map((child) => child.textContent || "")
+      .join(" "));
     if (tag === "img") return trim(element.getAttribute("alt") || element.getAttribute("title"));
     if (tag === "input" || tag === "textarea") {
       const label = element.labels && element.labels.length ? trim(Array.from(element.labels).map((label) => label.innerText).join(" ")) : "";
@@ -109,38 +113,64 @@ pub fn macos_snapshot_script() -> &'static str {
       const label = element.labels && element.labels.length ? trim(Array.from(element.labels).map((label) => label.innerText).join(" ")) : "";
       return label || trim(element.selectedOptions && element.selectedOptions[0] ? element.selectedOptions[0].innerText : "");
     }
-    if (role === "heading" || role === "button" || role === "link" || role === "listitem") {
-      return trim(element.innerText || element.textContent);
+    if (role === "heading") {
+      return directTextOf(element) || trim(element.innerText || element.textContent);
+    }
+    if (role === "button" || role === "link") {
+      return directTextOf(element)
+        || trim(element.getAttribute("title"))
+        || trim(element.querySelector("img[alt]")?.getAttribute("alt"))
+        || trim(element.innerText || element.textContent);
+    }
+    if (role === "listitem") {
+      return directTextOf(element);
     }
     return trim(element.getAttribute("title"));
   };
 
-  for (const element of document.body ? document.body.querySelectorAll("*") : []) {
-    if (!visible(element)) continue;
+  const nodeById = new Map([[rootId, root]]);
+  const appendNode = (element, parentId) => {
+    if (!visible(element)) return;
     const role = explicitRole(element) || implicitRole(element);
-    if (!role) continue;
-    const name = accessibleName(element, role);
-    if (!name) continue;
+    const name = role ? accessibleName(element, role) : "";
+    const include = !!(role && name);
+    let nearestIncludedAncestorId = parentId;
 
-    const id = String(nodeId++);
-    root.childIds.push(id);
-    const node = {
-      nodeId: id,
-      role: { value: role },
-      name: { value: name },
-      childIds: [],
-      wkDomToken: tokenFor(element)
-    };
-    const durable = durableSelectorFor(element);
-    if (durable) {
-      node.durableSelector = durable.selector;
-      node.durableSelectorKind = durable.kind;
+    if (include) {
+      const id = String(nodeId++);
+      const parent = nodeById.get(parentId);
+      parent?.childIds.push(id);
+      const node = {
+        nodeId: id,
+        role: { value: role },
+        name: { value: name },
+        childIds: [],
+        wkDomToken: tokenFor(element)
+      };
+      const durable = durableSelectorFor(element);
+      if (durable) {
+        node.durableSelector = durable.selector;
+        node.durableSelectorKind = durable.kind;
+      }
+      const headingLevel = role === "heading" ? Number((element.tagName || "").slice(1)) : 0;
+      if (headingLevel >= 1 && headingLevel <= 6) {
+        node.properties = [{ name: "level", value: { value: String(headingLevel) } }];
+      }
+      nodes.push(node);
+      nodeById.set(id, node);
+      nearestIncludedAncestorId = id;
     }
-    const headingLevel = role === "heading" ? Number((element.tagName || "").slice(1)) : 0;
-    if (headingLevel >= 1 && headingLevel <= 6) {
-      node.properties = [{ name: "level", value: { value: String(headingLevel) } }];
+
+    const children = Array.from(element.children);
+    for (const child of children) {
+      appendNode(child, nearestIncludedAncestorId);
     }
-    nodes.push(node);
+  };
+
+  if (document.body) {
+    for (const child of Array.from(document.body.children)) {
+      appendNode(child, rootId);
+    }
   }
 
   return { nodes };
@@ -891,6 +921,24 @@ mod tests {
         ] {
             assert!(script.contains(expected), "{expected}");
         }
+    }
+
+    #[test]
+    fn macos_snapshot_regression_preserves_structure_without_container_text_blobs() {
+        let script = macos_snapshot_script();
+        for expected in [
+            "directTextOf",
+            "appendNode",
+            "nearestIncludedAncestorId",
+            "nodeById",
+            "const children = Array.from",
+        ] {
+            assert!(script.contains(expected), "{expected}");
+        }
+        assert!(
+            !script.contains(r#"return trim(element.innerText || element.textContent);"#),
+            "accessible names must not collapse descendant-heavy containers into one text blob"
+        );
     }
 
     #[test]
