@@ -3545,9 +3545,10 @@ impl Window {
     /// current z-position. On Windows, this wipes the swap-chain
     /// pixels in `bounds` to fully transparent
     /// (`ID3D11DeviceContext1::ClearView` with `[0, 0, 0, 0]`), so an
-    /// underlying DComp visual — e.g. WebView2 attached via
-    /// `gpui_windows::create_underlay_visual_for_hwnd` — shows through.
-    /// On other platforms this is a no-op.
+    /// underlying native browser surface — e.g. WebView2 attached via
+    /// `gpui_windows::create_underlay_visual_for_hwnd`, or a hosted
+    /// WKWebView on macOS — shows through. On unsupported platforms this
+    /// is a no-op.
     ///
     /// Because the cutout is inserted at the calling element's
     /// z-position, primitives painted *after* it (modals, deferred

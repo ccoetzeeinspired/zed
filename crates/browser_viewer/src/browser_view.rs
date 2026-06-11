@@ -137,6 +137,42 @@ pub struct BrowserItem {
     design_drag: Option<(Point<Pixels>, Point<Pixels>)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSurfaceVisibilityUpdate {
+    Show,
+    Hide,
+    Unchanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UrlEditorSync {
+    Sync,
+    PreserveUserInput,
+}
+
+fn native_surface_visibility_update(
+    is_active_item: bool,
+    is_visible: bool,
+) -> NativeSurfaceVisibilityUpdate {
+    match (is_active_item, is_visible) {
+        (true, false) => NativeSurfaceVisibilityUpdate::Show,
+        (false, true) => NativeSurfaceVisibilityUpdate::Hide,
+        _ => NativeSurfaceVisibilityUpdate::Unchanged,
+    }
+}
+
+fn should_paint_native_browser_cutout(has_session: bool, is_visible: bool) -> bool {
+    has_session && is_visible
+}
+
+fn url_editor_sync_policy(editor_focused: bool, force_sync: bool) -> UrlEditorSync {
+    if force_sync || !editor_focused {
+        UrlEditorSync::Sync
+    } else {
+        UrlEditorSync::PreserveUserInput
+    }
+}
+
 impl BrowserItem {
     fn new(url: SharedString) -> Self {
         Self {
@@ -245,6 +281,7 @@ pub struct BrowserView {
     /// each new element selection so the panel's Esc / Ctrl+Enter shortcuts
     /// fire and those keys don't leak to the page.
     design_prompt_focused_for: Option<SharedString>,
+    force_url_editor_sync: bool,
 }
 
 impl BrowserView {
@@ -284,6 +321,7 @@ impl BrowserView {
             design_prompt_editor,
             workspace: None,
             design_prompt_focused_for: None,
+            force_url_editor_sync: false,
         }
     }
 
@@ -359,7 +397,7 @@ impl BrowserView {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub fn automation_navigate(&self, target: String, cx: &mut Context<Self>) {
+    pub fn automation_navigate(&mut self, target: String, cx: &mut Context<Self>) {
         // Pre-set is_loading so a following wait-for-load can't return before
         // the NavigationStarting event fires (otherwise the first poll sees the
         // PREVIOUS load already complete and `evaluate` hits the stale context).
@@ -369,12 +407,13 @@ impl BrowserView {
 
     #[cfg(target_os = "macos")]
     pub fn automation_update_page_state(
-        &self,
+        &mut self,
         url: Option<String>,
         title: Option<String>,
         is_loading: bool,
         cx: &mut Context<Self>,
     ) {
+        let force_url_sync = url.is_some();
         self.item.update(cx, |item, _| {
             item.is_loading = is_loading;
             if let Some(url) = url {
@@ -384,6 +423,10 @@ impl BrowserView {
                 item.title = SharedString::new(title);
             }
         });
+        if force_url_sync {
+            self.force_url_editor_sync = true;
+            cx.notify();
+        }
     }
 
     /// CP7: navigate back in history. Returns `false` (no-op) if there is no
@@ -417,7 +460,8 @@ impl BrowserView {
     }
 
     #[cfg(target_os = "windows")]
-    fn navigate_to(&self, target: String, cx: &mut Context<Self>) {
+    fn navigate_to(&mut self, target: String, cx: &mut Context<Self>) {
+        self.force_url_editor_sync = true;
         self.item.update(cx, |item, _| {
             if let Some(session) = item.session.as_ref() {
                 let url_h = windows::core::HSTRING::from(&target);
@@ -1003,17 +1047,32 @@ impl Render for BrowserView {
         }
         #[cfg(target_os = "macos")]
         {
+            let is_active_item = self.is_active_pane_item(cx);
             self.item.update(cx, |item, _| {
-                if item.is_visible {
-                    return;
+                match native_surface_visibility_update(is_active_item, item.is_visible) {
+                    NativeSurfaceVisibilityUpdate::Show => {
+                        if let Some(session) = item.session.as_ref()
+                            && let Err(err) = session.set_visible(true)
+                        {
+                            log::warn!("BrowserItem: show WKWebView on activate failed: {err:?}");
+                            return;
+                        }
+                        item.is_visible = true;
+                    }
+                    NativeSurfaceVisibilityUpdate::Hide => {
+                        if let Some(session) = item.session.as_ref() {
+                            session.release_keyboard_focus();
+                            if let Err(err) = session.set_visible(false) {
+                                log::warn!(
+                                    "BrowserItem: hide inactive WKWebView on render failed: {err:?}"
+                                );
+                                return;
+                            }
+                        }
+                        item.is_visible = false;
+                    }
+                    NativeSurfaceVisibilityUpdate::Unchanged => {}
                 }
-                if let Some(session) = item.session.as_ref()
-                    && let Err(err) = session.set_visible(true)
-                {
-                    log::warn!("BrowserItem: show WKWebView on activate failed: {err:?}");
-                    return;
-                }
-                item.is_visible = true;
             });
         }
 
@@ -1050,13 +1109,15 @@ impl Render for BrowserView {
                 }
             });
         }
-        if !editor_focused {
+        if url_editor_sync_policy(editor_focused, self.force_url_editor_sync) == UrlEditorSync::Sync
+        {
             let editor_text = self.url_editor.read(cx).text(cx);
             if editor_text != model_url.as_ref() {
                 self.url_editor.update(cx, |editor, cx| {
                     editor.set_text(model_url.as_ref(), window, cx);
                 });
             }
+            self.force_url_editor_sync = false;
         }
 
         let can_back = self.item.read(cx).can_go_back;
@@ -1810,13 +1871,27 @@ impl Item for BrowserView {
 
 impl BrowserView {
     #[cfg(target_os = "macos")]
+    fn is_active_pane_item(&self, cx: &Context<Self>) -> bool {
+        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
+            return true;
+        };
+
+        workspace
+            .read(cx)
+            .pane_for_item_id(cx.entity_id())
+            .and_then(|pane| pane.read(cx).active_item())
+            .is_some_and(|active_item| active_item.item_id() == cx.entity_id())
+    }
+
+    #[cfg(target_os = "macos")]
     fn hide_native_browser_surface(&self, cx: &mut Context<Self>) {
         self.item.update(cx, |item, _| {
             item.is_visible = false;
-            if let Some(session) = item.session.as_ref()
-                && let Err(err) = session.set_visible(false)
-            {
-                log::warn!("BrowserItem: hide WKWebView on deactivate failed: {err:?}");
+            if let Some(session) = item.session.as_ref() {
+                session.release_keyboard_focus();
+                if let Err(err) = session.set_visible(false) {
+                    log::warn!("BrowserItem: hide WKWebView on deactivate failed: {err:?}");
+                }
             }
         });
     }
@@ -1929,8 +2004,8 @@ impl Element for BrowserViewportElement {
         // window's compositor background.
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            let has_session = self.item.read(cx).session.is_some();
-            if has_session {
+            let item = self.item.read(cx);
+            if should_paint_native_browser_cutout(item.session.is_some(), item.is_visible) {
                 window.paint_cutout(bounds);
             }
         }
@@ -2157,7 +2232,8 @@ fn drive_session(
 
 #[cfg(target_os = "macos")]
 impl BrowserView {
-    fn navigate_to(&self, target: String, cx: &mut Context<Self>) {
+    fn navigate_to(&mut self, target: String, cx: &mut Context<Self>) {
+        self.force_url_editor_sync = true;
         self.item.update(cx, |item, cx| {
             item.url = SharedString::new(target.clone());
             item.title = item.url.clone();
@@ -2634,4 +2710,47 @@ fn keystroke_to_cdp(ks: &Keystroke) -> Option<(String, String, i32, Option<Strin
     };
 
     Some((key_for_event, code, vk, text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_browser_surface_visibility_tracks_active_item() {
+        assert_eq!(
+            native_surface_visibility_update(true, false),
+            NativeSurfaceVisibilityUpdate::Show
+        );
+        assert_eq!(
+            native_surface_visibility_update(false, true),
+            NativeSurfaceVisibilityUpdate::Hide
+        );
+        assert_eq!(
+            native_surface_visibility_update(true, true),
+            NativeSurfaceVisibilityUpdate::Unchanged
+        );
+        assert_eq!(
+            native_surface_visibility_update(false, false),
+            NativeSurfaceVisibilityUpdate::Unchanged
+        );
+    }
+
+    #[test]
+    fn native_browser_cutout_requires_visible_session() {
+        assert!(should_paint_native_browser_cutout(true, true));
+        assert!(!should_paint_native_browser_cutout(true, false));
+        assert!(!should_paint_native_browser_cutout(false, true));
+        assert!(!should_paint_native_browser_cutout(false, false));
+    }
+
+    #[test]
+    fn focused_url_editor_syncs_after_host_driven_navigation() {
+        assert_eq!(
+            url_editor_sync_policy(true, false),
+            UrlEditorSync::PreserveUserInput
+        );
+        assert_eq!(url_editor_sync_policy(true, true), UrlEditorSync::Sync);
+        assert_eq!(url_editor_sync_policy(false, false), UrlEditorSync::Sync);
+    }
 }
