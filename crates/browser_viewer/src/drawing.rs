@@ -132,7 +132,11 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     if s == 0.0 {
         return (l, l, l);
     }
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let hue_to_rgb = |t: f32| -> f32 {
         let mut t = t;
@@ -237,10 +241,14 @@ mod annotate {
 
     fn scaled_dims(w: u32, h: u32, max_edge: u32) -> (u32, u32) {
         if w >= h {
-            let nh = ((h as f32) * (max_edge as f32) / (w as f32)).round().max(1.0) as u32;
+            let nh = ((h as f32) * (max_edge as f32) / (w as f32))
+                .round()
+                .max(1.0) as u32;
             (max_edge, nh)
         } else {
-            let nw = ((w as f32) * (max_edge as f32) / (h as f32)).round().max(1.0) as u32;
+            let nw = ((w as f32) * (max_edge as f32) / (h as f32))
+                .round()
+                .max(1.0) as u32;
             (nw, max_edge)
         }
     }

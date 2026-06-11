@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::automation::session::{ElementRef, RefRegistry};
+use crate::automation::session::{DurableSelector, ElementHandle, ElementRef, RefRegistry};
 
 /// Default maximum refs emitted per snapshot (token / perf guard). Raised from
 /// the original 500 after large pages (e.g. naledi.co.za) exceeded it and left
@@ -53,6 +53,12 @@ struct AxNode {
     child_ids: Vec<String>,
     #[serde(default, rename = "backendDOMNodeId")]
     backend_dom_node_id: Option<Value>,
+    #[serde(default, rename = "wkDomToken")]
+    wk_dom_token: Option<String>,
+    #[serde(default, rename = "durableSelector")]
+    durable_selector: Option<String>,
+    #[serde(default, rename = "durableSelectorKind")]
+    durable_selector_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +139,15 @@ impl AxNode {
         match &self.backend_dom_node_id {
             Some(Value::Number(n)) => n.as_i64().and_then(|v| i32::try_from(v).ok()),
             _ => None,
+        }
+    }
+
+    fn durable_selector(&self) -> Option<DurableSelector> {
+        let selector = self.durable_selector.as_ref()?.clone();
+        match self.durable_selector_kind.as_deref() {
+            Some("testid") => Some(DurableSelector::TestId(selector)),
+            Some("css") | None => Some(DurableSelector::Css(selector)),
+            Some(_) => None,
         }
     }
 }
@@ -250,6 +265,8 @@ fn append_frame(
         ref_id: String,
         ax_node_id: String,
         backend_dom_node_id: Option<i32>,
+        wk_dom_token: Option<String>,
+        durable_selector: Option<DurableSelector>,
         role: String,
         name: String,
     }
@@ -277,6 +294,8 @@ fn append_frame(
                 ref_id: ref_id.clone(),
                 ax_node_id: node.node_id.clone(),
                 backend_dom_node_id: node.backend_dom_node_id(),
+                wk_dom_token: node.wk_dom_token.clone(),
+                durable_selector: node.durable_selector(),
                 role: role.clone(),
                 name: name.clone(),
             });
@@ -311,14 +330,20 @@ fn append_frame(
         let dup_index = *seen.get(&key).unwrap_or(&0);
         *seen.entry(key.clone()).or_default() += 1;
         let dup_count = *totals.get(&key).unwrap_or(&1);
+        let element_handle = p
+            .backend_dom_node_id
+            .map(ElementHandle::CdpBackendNodeId)
+            .or_else(|| p.wk_dom_token.map(ElementHandle::WkDomToken));
         registry.insert(
             p.ref_id.clone(),
             ElementRef {
                 ref_id: p.ref_id,
                 ax_node_id: p.ax_node_id,
                 backend_dom_node_id: p.backend_dom_node_id,
+                element_handle,
                 role: p.role,
                 name: p.name,
+                durable_selector: p.durable_selector,
                 dup_index,
                 dup_count,
                 frame_selector: frame_selector.map(str::to_string),
@@ -351,6 +376,9 @@ fn find_root_id(by_id: &HashMap<String, AxNode>) -> Result<String> {
 }
 
 fn should_include_in_snapshot(role: &str, name: &str) -> bool {
+    if role == "RootWebArea" && name.is_empty() {
+        return false;
+    }
     if role == "generic" && name.is_empty() {
         return false;
     }
@@ -405,7 +433,10 @@ mod tests {
     #[test]
     fn snapshot_lists_roles_with_refs() {
         let snap = snapshot_from_ax_tree(sample_tree_json(), 1).unwrap();
-        assert!(snap.yaml.contains("heading \"Example Domain\" [level=1] [ref=e"));
+        assert!(
+            snap.yaml
+                .contains("heading \"Example Domain\" [level=1] [ref=e")
+        );
         assert!(snap.yaml.contains("link \"Learn more\" [ref=e"));
         assert!(!snap.yaml.contains("hidden"));
         assert_eq!(snap.ref_count, 3); // root + heading + link
@@ -418,6 +449,136 @@ mod tests {
         assert_eq!(link.role, "link");
         assert_eq!(link.backend_dom_node_id, Some(42));
         assert_eq!(snap.registry.page_generation(), 7);
+    }
+
+    #[test]
+    fn snapshot_from_frames_assigns_frame_selector_to_child_refs() {
+        let main = serde_json::json!({
+            "nodes": [
+                { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "" }, "childIds": [] }
+            ]
+        });
+        let child = serde_json::json!({
+            "nodes": [
+                { "nodeId": "10", "role": { "value": "RootWebArea" }, "name": { "value": "" }, "childIds": ["11"] },
+                { "nodeId": "11", "role": { "value": "button" }, "name": { "value": "Pay" }, "backendDOMNodeId": 42, "childIds": [] }
+            ]
+        });
+
+        let snapshot = snapshot_from_frames(
+            vec![
+                FrameAx {
+                    ax: main,
+                    url: String::new(),
+                    owner_selector: None,
+                },
+                FrameAx {
+                    ax: child,
+                    url: "https://pay.example/frame".into(),
+                    owner_selector: Some("iframe#pay".into()),
+                },
+            ],
+            7,
+        )
+        .expect("snapshot");
+
+        assert!(
+            snapshot
+                .yaml
+                .contains("- iframe \"https://pay.example/frame\"")
+        );
+        let pay = snapshot.registry.get("e1").expect("pay ref");
+        assert_eq!(pay.role, "button");
+        assert_eq!(pay.name, "Pay");
+        assert_eq!(pay.frame_selector.as_deref(), Some("iframe#pay"));
+    }
+
+    #[test]
+    fn snapshot_from_frames_computes_duplicate_indices_per_frame() {
+        let frame = |root: &str, child: &str| {
+            serde_json::json!({
+                "nodes": [
+                    { "nodeId": root, "role": { "value": "RootWebArea" }, "name": { "value": "" }, "childIds": [child] },
+                    { "nodeId": child, "role": { "value": "button" }, "name": { "value": "Submit" }, "backendDOMNodeId": 11, "childIds": [] }
+                ]
+            })
+        };
+
+        let snapshot = snapshot_from_frames(
+            vec![
+                FrameAx {
+                    ax: frame("1", "2"),
+                    url: String::new(),
+                    owner_selector: None,
+                },
+                FrameAx {
+                    ax: frame("10", "11"),
+                    url: "https://child.example".into(),
+                    owner_selector: Some("iframe#child".into()),
+                },
+            ],
+            8,
+        )
+        .expect("snapshot");
+
+        let main = snapshot.registry.get("e1").expect("main submit");
+        let child = snapshot.registry.get("e2").expect("child submit");
+        assert_eq!((main.dup_index, main.dup_count), (0, 1));
+        assert_eq!((child.dup_index, child.dup_count), (0, 1));
+    }
+
+    #[test]
+    fn cdp_snapshot_populates_webview2_element_handle() {
+        let tree = serde_json::json!({
+            "nodes": [
+                { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "" }, "childIds": ["2"] },
+                { "nodeId": "2", "role": { "value": "button" }, "name": { "value": "Save" }, "backendDOMNodeId": 99, "childIds": [] }
+            ]
+        });
+
+        let snapshot = snapshot_from_ax_tree(tree, 9).expect("snapshot");
+        let save = snapshot.registry.get("e1").expect("save ref");
+        assert_eq!(save.backend_dom_node_id, Some(99));
+        assert_eq!(
+            save.element_handle,
+            Some(crate::automation::session::ElementHandle::CdpBackendNodeId(
+                99
+            ))
+        );
+    }
+
+    #[test]
+    fn wk_snapshot_populates_wk_dom_token_element_handle() {
+        let tree = serde_json::json!({
+            "nodes": [
+                { "nodeId": "1", "role": { "value": "RootWebArea" }, "name": { "value": "" }, "childIds": ["2"] },
+                {
+                    "nodeId": "2",
+                    "role": { "value": "button" },
+                    "name": { "value": "Save" },
+                    "wkDomToken": "zed-42",
+                    "durableSelector": "save-button",
+                    "durableSelectorKind": "testid",
+                    "childIds": []
+                }
+            ]
+        });
+
+        let snapshot = snapshot_from_ax_tree(tree, 9).expect("snapshot");
+        let save = snapshot.registry.get("e1").expect("save ref");
+        assert_eq!(save.backend_dom_node_id, None);
+        assert_eq!(
+            save.element_handle,
+            Some(crate::automation::session::ElementHandle::WkDomToken(
+                "zed-42".into()
+            ))
+        );
+        assert_eq!(
+            save.durable_selector,
+            Some(crate::automation::session::DurableSelector::TestId(
+                "save-button".into()
+            ))
+        );
     }
 
     #[test]

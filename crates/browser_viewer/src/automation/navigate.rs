@@ -94,7 +94,10 @@ fn page_contains_text_expression(text: &str) -> String {
     )
 }
 
-fn evaluate_bool(session: &crate::webview2_host::WebView2Session, expression: &str) -> oneshot::Receiver<Result<bool>> {
+fn evaluate_bool(
+    session: &crate::webview2_host::WebView2Session,
+    expression: &str,
+) -> oneshot::Receiver<Result<bool>> {
     let (tx, rx) = oneshot::channel();
     let mut tx_slot = Some(tx);
     let cdp = CdpSession::new(session);
@@ -140,7 +143,12 @@ pub async fn wait_for_result(
         .text
         .as_deref()
         .map(|t| format!("text {t:?}"))
-        .or_else(|| options.text_gone.as_deref().map(|t| format!("text-gone {t:?}")))
+        .or_else(|| {
+            options
+                .text_gone
+                .as_deref()
+                .map(|t| format!("text-gone {t:?}"))
+        })
         .unwrap_or_else(|| "load".to_string());
 
     loop {
@@ -194,10 +202,7 @@ pub async fn wait_for_result(
         if std::time::Instant::now() >= deadline {
             let message = format!(
                 "browser automation wait for {label} timed out after {:?} (loading={}, title={:?}, url={})",
-                options.timeout,
-                state.is_loading,
-                state.title,
-                state.url
+                options.timeout, state.is_loading, state.title, state.url
             );
             log::error!("{message}");
             return Err(anyhow!(message));

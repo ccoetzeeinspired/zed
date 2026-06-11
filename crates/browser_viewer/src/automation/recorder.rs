@@ -330,7 +330,10 @@ fn render(rec: &Recording) -> String {
     let seedable = !rec.start_url.is_empty() && rec.start_url != "about:blank";
     let mut last_url = rec.start_url.clone();
     if !starts_with_nav && seedable {
-        push_line(&mut out, &format!("await page.goto({});", js_str(&rec.start_url)));
+        push_line(
+            &mut out,
+            &format!("await page.goto({});", js_str(&rec.start_url)),
+        );
         push_line(&mut out, "await page.waitForLoadState();");
     }
 
@@ -397,7 +400,10 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
                 } else {
                     js_str(text)
                 };
-                lines.push(format!("await {}.pressSequentially({opts});", locator(target)));
+                lines.push(format!(
+                    "await {}.pressSequentially({opts});",
+                    locator(target)
+                ));
             } else {
                 lines.push(format!("await {}.fill({});", locator(target), js_str(text)));
             }
@@ -436,10 +442,17 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
             vec![format!("await {}.hover();", locator(target))]
         }
         RecordedAction::ScrollTo { target } => {
-            vec![format!("await {}.scrollIntoViewIfNeeded();", locator(target))]
+            vec![format!(
+                "await {}.scrollIntoViewIfNeeded();",
+                locator(target)
+            )]
         }
         RecordedAction::ScrollBy { dx, dy } => {
-            vec![format!("await page.mouse.wheel({}, {});", num(*dx), num(*dy))]
+            vec![format!(
+                "await page.mouse.wheel({}, {});",
+                num(*dx),
+                num(*dy)
+            )]
         }
         RecordedAction::FileUpload { target, paths } => {
             vec![format!(
@@ -493,7 +506,11 @@ fn render_action(action: &RecordedAction) -> Vec<String> {
             "await page.mouse.up();".to_string(),
         ],
         RecordedAction::MouseWheel { dx, dy } => {
-            vec![format!("await page.mouse.wheel({}, {});", num(*dx), num(*dy))]
+            vec![format!(
+                "await page.mouse.wheel({}, {});",
+                num(*dx),
+                num(*dy)
+            )]
         }
         RecordedAction::WaitForText { text } => {
             vec![format!(
@@ -693,9 +710,11 @@ mod tests {
             }],
         );
         let script = render(&r);
-        assert!(script.contains(
-            "await page.getByRole('button', { name: 'Sign In', exact: true }).click();"
-        ));
+        assert!(
+            script.contains(
+                "await page.getByRole('button', { name: 'Sign In', exact: true }).click();"
+            )
+        );
         assert!(script.contains("import { test, expect } from '@playwright/test';"));
     }
 
@@ -714,6 +733,42 @@ mod tests {
         let script = render(&r);
         assert!(script.contains(".fill('a@b.com');"));
         assert!(script.contains(".press('Enter');"));
+    }
+
+    #[test]
+    fn fill_form_codegen_emits_visible_field_actions() {
+        let r = rec(
+            "https://example.com/search",
+            vec![RecordedAction::FillForm {
+                fields: vec![
+                    FormFieldRec {
+                        target: Target::new("textbox", "Search"),
+                        value: "rust programming".into(),
+                        kind: Some("textbox".into()),
+                    },
+                    FormFieldRec {
+                        target: Target::new("checkbox", "Available online"),
+                        value: "true".into(),
+                        kind: Some("checkbox".into()),
+                    },
+                    FormFieldRec {
+                        target: Target::new("combobox", "Format"),
+                        value: "Book".into(),
+                        kind: Some("select".into()),
+                    },
+                ],
+            }],
+        );
+        let script = render(&r);
+        assert!(script.contains(
+            "await page.getByRole('textbox', { name: 'Search', exact: true }).fill('rust programming');"
+        ));
+        assert!(script.contains(
+            "await page.getByRole('checkbox', { name: 'Available online', exact: true }).setChecked(true);"
+        ));
+        assert!(script.contains(
+            "await page.getByRole('combobox', { name: 'Format', exact: true }).selectOption('Book');"
+        ));
     }
 
     #[test]
@@ -854,13 +909,16 @@ mod tests {
         let r = rec(
             "https://x.com",
             vec![RecordedAction::VerifyElementVisible {
-                target: Target::new("heading", "Privacy")
-                    .with_frame(Some("iframe#cmp".into())),
+                target: Target::new("heading", "Privacy").with_frame(Some("iframe#cmp".into())),
             }],
         );
         let s = render(&r);
-        assert!(s.contains("page.frameLocator('iframe#cmp').getByRole('heading', { name: 'Privacy', exact: true })"));
-        assert!(s.contains(".or(page.frameLocator('iframe#cmp').getByText('Privacy', { exact: true }))"));
+        assert!(s.contains(
+            "page.frameLocator('iframe#cmp').getByRole('heading', { name: 'Privacy', exact: true })"
+        ));
+        assert!(s.contains(
+            ".or(page.frameLocator('iframe#cmp').getByText('Privacy', { exact: true }))"
+        ));
     }
 
     #[test]
@@ -887,9 +945,7 @@ mod tests {
             }],
         );
         let s = render(&r);
-        assert!(
-            s.contains("getByRole('search', { name: 'Search all labels', exact: true })")
-        );
+        assert!(s.contains("getByRole('search', { name: 'Search all labels', exact: true })"));
         assert!(s.contains(".or(page.getByLabel('Search all labels', { exact: true }))"));
         assert!(s.contains(".or(page.getByPlaceholder('Search all labels', { exact: true }))"));
         assert!(s.contains(".or(page.getByText('Search all labels', { exact: true }))"));

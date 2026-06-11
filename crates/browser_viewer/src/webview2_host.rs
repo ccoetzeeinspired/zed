@@ -23,8 +23,9 @@ use anyhow::{Result, anyhow};
 use futures::channel::mpsc;
 use gpui_windows::HostedVisual;
 use webview2_com::{
-    AddScriptToExecuteOnDocumentCreatedCompletedHandler, CallDevToolsProtocolMethodCompletedHandler,
-    CapturePreviewCompletedHandler, CreateCoreWebView2CompositionControllerCompletedHandler,
+    AddScriptToExecuteOnDocumentCreatedCompletedHandler,
+    CallDevToolsProtocolMethodCompletedHandler, CapturePreviewCompletedHandler,
+    CreateCoreWebView2CompositionControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
     HistoryChangedEventHandler,
     Microsoft::Web::WebView2::Win32::{
@@ -54,7 +55,10 @@ pub(crate) enum NavigationEvent {
     /// `pushState`/`replaceState` from SPAs.
     SourceChanged(String),
     /// Either `CanGoBack` or `CanGoForward` changed.
-    HistoryChanged { can_go_back: bool, can_go_forward: bool },
+    HistoryChanged {
+        can_go_back: bool,
+        can_go_forward: bool,
+    },
     /// Top-level navigation kicked off.
     NavigationStarting,
     /// Top-level navigation finished, successfully or not.
@@ -149,8 +153,8 @@ impl WebView2Session {
         on_done: Box<dyn FnOnce(Result<Vec<u8>>) + 'static>,
     ) -> Result<()> {
         use windows::Win32::Foundation::HGLOBAL;
-        use windows::Win32::System::Com::{IStream, STREAM_SEEK_SET};
         use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
+        use windows::Win32::System::Com::{IStream, STREAM_SEEK_SET};
         // Stream takes ownership of the HGLOBAL — pass null + true
         // for `fdeleteonrelease` so Windows frees it when the stream
         // refcount hits zero.
@@ -227,8 +231,8 @@ impl WebView2Session {
         let method_h = HSTRING::from(method);
         let params_h = HSTRING::from(params_json);
         let mut done_slot: Option<Box<dyn FnOnce(Result<String>) + 'static>> = Some(on_done);
-        let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-            move |hr, result_json| {
+        let handler =
+            CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, result_json| {
                 let on_done = done_slot
                     .take()
                     .expect("CallDevToolsProtocolMethodCompletedHandler called twice");
@@ -238,8 +242,7 @@ impl WebView2Session {
                 }
                 on_done(Ok(result_json));
                 Ok(())
-            },
-        ));
+            }));
         unsafe {
             self.webview
                 .CallDevToolsProtocolMethod(
@@ -311,6 +314,123 @@ impl WebView2Session {
                 .map_err(|err| anyhow!("SendMouseInput: {err}"))?;
         }
         Ok(())
+    }
+}
+
+impl crate::automation::platform::AutomationSession for WebView2Session {
+    fn platform(&self) -> crate::automation::platform::BrowserPlatform {
+        crate::automation::platform::BrowserPlatform::WebView2
+    }
+
+    fn call_cdp(
+        &self,
+        method: &str,
+        params_json: &str,
+        on_done: crate::automation::platform::JsonCallback,
+    ) -> Result<()> {
+        self.call_devtools_protocol(
+            method,
+            params_json,
+            Box::new(move |result| {
+                on_done(result.and_then(crate::automation::cdp::parse_cdp_response));
+            }),
+        )
+    }
+
+    fn evaluate_expression(
+        &self,
+        expression: &str,
+        await_promise: bool,
+        on_done: crate::automation::platform::JsonCallback,
+    ) -> Result<()> {
+        let params = serde_json::json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": await_promise,
+        })
+        .to_string();
+        self.call_devtools_protocol(
+            "Runtime.evaluate",
+            &params,
+            Box::new(move |result| {
+                on_done(result.and_then(crate::automation::cdp::parse_cdp_response));
+            }),
+        )
+    }
+
+    fn invoke_on_element(
+        &self,
+        handle: crate::automation::session::ElementHandle,
+        function_declaration: &str,
+        arguments: Option<&[serde_json::Value]>,
+        on_done: crate::automation::platform::JsonCallback,
+    ) -> Result<()> {
+        match handle {
+            crate::automation::session::ElementHandle::CdpBackendNodeId(id) => {
+                crate::automation::action::invoke_on_backend_node(
+                    self,
+                    id,
+                    function_declaration,
+                    arguments,
+                    on_done,
+                )
+            }
+            other => Err(crate::automation::platform::unsupported_capability(
+                crate::automation::platform::BrowserPlatform::WebView2,
+                &format!("element handle {other:?}"),
+            )),
+        }
+    }
+
+    fn dispatch_key_event(
+        &self,
+        event: crate::automation::platform::KeyDispatch,
+        on_done: crate::automation::platform::UnitCallback,
+    ) -> Result<()> {
+        let modifiers = i32::try_from(event.modifiers)
+            .map_err(|_| anyhow!("key modifiers out of range: {}", event.modifiers))?;
+        let windows_virtual_key_code =
+            i32::try_from(event.windows_virtual_key_code).map_err(|_| {
+                anyhow!(
+                    "windows virtual key code out of range: {}",
+                    event.windows_virtual_key_code
+                )
+            })?;
+        let result = WebView2Session::dispatch_key_event(
+            self,
+            &event.event_type,
+            &event.key,
+            &event.code,
+            modifiers,
+            windows_virtual_key_code,
+            event.text.as_deref(),
+        );
+        on_done(result);
+        Ok(())
+    }
+
+    fn dispatch_mouse_event(
+        &self,
+        event: crate::automation::platform::MouseDispatch,
+        on_done: crate::automation::platform::JsonCallback,
+    ) -> Result<()> {
+        let params = serde_json::json!({
+            "type": event.event_type,
+            "x": event.x,
+            "y": event.y,
+            "button": event.button,
+            "buttons": event.buttons,
+            "clickCount": event.click_count,
+            "modifiers": event.modifiers,
+        })
+        .to_string();
+        self.call_devtools_protocol(
+            "Input.dispatchMouseEvent",
+            &params,
+            Box::new(move |result| {
+                on_done(result.and_then(crate::automation::cdp::parse_cdp_response));
+            }),
+        )
     }
 }
 
@@ -587,8 +707,8 @@ pub(crate) fn initialize(
     // The env handler runs after `CreateCoreWebView2Environment` resolves.
     // It owns the visual + parent + bounds + url + on_done, threading them
     // forward into the controller handler.
-    let env_handler =
-        CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(move |result, env| {
+    let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+        move |result, env| {
             if let Err(err) = result {
                 on_done(Err(anyhow!("WebView2 env creation failed: {err}")));
                 return Ok(());
@@ -613,119 +733,118 @@ pub(crate) fn initialize(
                 }
             };
 
-            let ctrl_handler =
-                CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
-                    move |result, comp_ctrl| {
-                        if let Err(err) = result {
-                            on_done(Err(anyhow!(
-                                "WebView2 composition controller creation failed: {err}"
-                            )));
+            let ctrl_handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(
+                Box::new(move |result, comp_ctrl| {
+                    if let Err(err) = result {
+                        on_done(Err(anyhow!(
+                            "WebView2 composition controller creation failed: {err}"
+                        )));
+                        return Ok(());
+                    }
+                    let comp_ctrl = match comp_ctrl {
+                        Some(c) => c,
+                        None => {
+                            on_done(Err(anyhow!("WebView2 composition controller was null")));
                             return Ok(());
                         }
-                        let comp_ctrl = match comp_ctrl {
-                            Some(c) => c,
-                            None => {
-                                on_done(Err(anyhow!("WebView2 composition controller was null")));
-                                return Ok(());
-                            }
+                    };
+
+                    let outcome = (|| -> Result<WebView2Session> {
+                        // The same COM object also implements
+                        // ICoreWebView2Controller, which is what carries
+                        // SetBounds / SetIsVisible / CoreWebView2.
+                        let controller: ICoreWebView2Controller =
+                            comp_ctrl.cast().map_err(|err| {
+                                anyhow!("cast to ICoreWebView2Controller failed: {err}")
+                            })?;
+
+                        unsafe {
+                            comp_ctrl
+                                .SetRootVisualTarget(visual.visual())
+                                .map_err(|err| anyhow!("SetRootVisualTarget: {err}"))?;
+                            controller
+                                .SetBounds(bounds)
+                                .map_err(|err| anyhow!("SetBounds: {err}"))?;
+                            controller
+                                .SetIsVisible(true)
+                                .map_err(|err| anyhow!("SetIsVisible: {err}"))?;
+                        }
+
+                        visual
+                            .commit()
+                            .map_err(|err| anyhow!("DComp commit: {err}"))?;
+
+                        let webview = unsafe {
+                            controller
+                                .CoreWebView2()
+                                .map_err(|err| anyhow!("CoreWebView2: {err}"))?
                         };
 
-                        let outcome = (|| -> Result<WebView2Session> {
-                            // The same COM object also implements
-                            // ICoreWebView2Controller, which is what carries
-                            // SetBounds / SetIsVisible / CoreWebView2.
-                            let controller: ICoreWebView2Controller =
-                                comp_ctrl.cast().map_err(|err| {
-                                    anyhow!("cast to ICoreWebView2Controller failed: {err}")
-                                })?;
+                        // Wire navigation events before the first navigate
+                        // so even the initial load fires title/source events.
+                        let event_tokens = register_navigation_events(&webview, events_tx)?;
 
-                            unsafe {
-                                comp_ctrl
-                                    .SetRootVisualTarget(visual.visual())
-                                    .map_err(|err| anyhow!("SetRootVisualTarget: {err}"))?;
-                                controller
-                                    .SetBounds(bounds)
-                                    .map_err(|err| anyhow!("SetBounds: {err}"))?;
-                                controller
-                                    .SetIsVisible(true)
-                                    .map_err(|err| anyhow!("SetIsVisible: {err}"))?;
-                            }
-
-                            visual.commit().map_err(|err| anyhow!("DComp commit: {err}"))?;
-
-                            let webview = unsafe {
-                                controller
-                                    .CoreWebView2()
-                                    .map_err(|err| anyhow!("CoreWebView2: {err}"))?
-                            };
-
-                            // Wire navigation events before the first navigate
-                            // so even the initial load fires title/source events.
-                            let event_tokens =
-                                register_navigation_events(&webview, events_tx)?;
-
-                            // Phase 4: inject the design-mode script before
-                            // the first navigation. `AddScriptToExecuteOnDocumentCreated`
-                            // runs the script on every navigation, including
-                            // the initial one. The script is idempotent —
-                            // re-evaluating it on the same document just emits
-                            // a `ready` message and exits.
-                            let script_h = HSTRING::from(crate::design_mode_script::SCRIPT);
-                            let install_handler =
-                                AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(
-                                    Box::new(|_hr, _id| Ok(())),
+                        // Phase 4: inject the design-mode script before
+                        // the first navigation. `AddScriptToExecuteOnDocumentCreated`
+                        // runs the script on every navigation, including
+                        // the initial one. The script is idempotent —
+                        // re-evaluating it on the same document just emits
+                        // a `ready` message and exits.
+                        let script_h = HSTRING::from(crate::design_mode_script::SCRIPT);
+                        let install_handler =
+                            AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+                                |_hr, _id| Ok(()),
+                            ));
+                        unsafe {
+                            if let Err(err) = webview.AddScriptToExecuteOnDocumentCreated(
+                                PCWSTR(script_h.as_ptr()),
+                                &install_handler,
+                            ) {
+                                log::warn!(
+                                    "browser_viewer: AddScriptToExecuteOnDocumentCreated failed: {err}"
                                 );
-                            unsafe {
-                                if let Err(err) = webview.AddScriptToExecuteOnDocumentCreated(
-                                    PCWSTR(script_h.as_ptr()),
-                                    &install_handler,
-                                ) {
-                                    log::warn!(
-                                        "browser_viewer: AddScriptToExecuteOnDocumentCreated failed: {err}"
-                                    );
-                                }
                             }
+                        }
 
-                            // CP10: inject the console/network instrumentation
-                            // at document-start too, so browser_console_messages
-                            // / browser_network_requests capture from page load.
-                            let instr_h =
-                                HSTRING::from(crate::automation::instrumentation::SCRIPT);
-                            let instr_handler =
-                                AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(
-                                    Box::new(|_hr, _id| Ok(())),
+                        // CP10: inject the console/network instrumentation
+                        // at document-start too, so browser_console_messages
+                        // / browser_network_requests capture from page load.
+                        let instr_h = HSTRING::from(crate::automation::instrumentation::SCRIPT);
+                        let instr_handler =
+                            AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+                                |_hr, _id| Ok(()),
+                            ));
+                        unsafe {
+                            if let Err(err) = webview.AddScriptToExecuteOnDocumentCreated(
+                                PCWSTR(instr_h.as_ptr()),
+                                &instr_handler,
+                            ) {
+                                log::warn!(
+                                    "browser_viewer: automation instrumentation inject failed: {err}"
                                 );
-                            unsafe {
-                                if let Err(err) = webview.AddScriptToExecuteOnDocumentCreated(
-                                    PCWSTR(instr_h.as_ptr()),
-                                    &instr_handler,
-                                ) {
-                                    log::warn!(
-                                        "browser_viewer: automation instrumentation inject failed: {err}"
-                                    );
-                                }
                             }
+                        }
 
-                            let url_h = HSTRING::from(&url);
-                            unsafe {
-                                webview
-                                    .Navigate(PCWSTR(url_h.as_ptr()))
-                                    .map_err(|err| anyhow!("Navigate: {err}"))?;
-                            }
+                        let url_h = HSTRING::from(&url);
+                        unsafe {
+                            webview
+                                .Navigate(PCWSTR(url_h.as_ptr()))
+                                .map_err(|err| anyhow!("Navigate: {err}"))?;
+                        }
 
-                            Ok(WebView2Session {
-                                composition_controller: comp_ctrl,
-                                controller,
-                                webview,
-                                visual,
-                                event_tokens,
-                            })
-                        })();
+                        Ok(WebView2Session {
+                            composition_controller: comp_ctrl,
+                            controller,
+                            webview,
+                            visual,
+                            event_tokens,
+                        })
+                    })();
 
-                        on_done(outcome);
-                        Ok(())
-                    },
-                ));
+                    on_done(outcome);
+                    Ok(())
+                }),
+            );
 
             unsafe {
                 if let Err(err) =
@@ -735,7 +854,8 @@ pub(crate) fn initialize(
                 }
             }
             Ok(())
-        }));
+        },
+    ));
 
     unsafe {
         CreateCoreWebView2Environment(&env_handler)

@@ -50,7 +50,10 @@ impl Settings for BrowserSettings {
             .collect();
         // Legacy single-field password → map entry.
         if !automation_credentials.contains_key(AUTOMATION_CRED_PASSWORD) {
-            if let Some(password) = browser.automation_dev_password.clone().filter(|p| !p.is_empty())
+            if let Some(password) = browser
+                .automation_dev_password
+                .clone()
+                .filter(|p| !p.is_empty())
             {
                 automation_credentials.insert(AUTOMATION_CRED_PASSWORD.to_string(), password);
             }

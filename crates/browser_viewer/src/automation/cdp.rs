@@ -5,8 +5,7 @@ use serde_json::Value;
 use std::cell::RefCell;
 use std::rc::Rc;
 use webview2_com::{
-    CallDevToolsProtocolMethodCompletedHandler,
-    Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    CallDevToolsProtocolMethodCompletedHandler, Microsoft::Web::WebView2::Win32::ICoreWebView2,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -32,9 +31,7 @@ impl<'a> CdpSession<'a> {
         self.call_method(
             "Accessibility.enable",
             "{}",
-            Box::new(move |result: Result<Value>| {
-                on_done(result.map(|_| ()))
-            }),
+            Box::new(move |result: Result<Value>| on_done(result.map(|_| ()))),
         )
     }
 
@@ -65,10 +62,7 @@ impl<'a> CdpSession<'a> {
                         "Accessibility.getFullAXTree",
                         "{}",
                         Box::new(move |tree_raw| {
-                            finish(
-                                &tree_completion,
-                                tree_raw.and_then(parse_cdp_response),
-                            );
+                            finish(&tree_completion, tree_raw.and_then(parse_cdp_response));
                         }),
                     );
                 }
@@ -218,8 +212,8 @@ pub(crate) fn call_devtools_on_webview(
     let params_h = HSTRING::from(params_json);
     let completion: Completion<String> = Rc::new(RefCell::new(Some(on_done)));
     let handler_completion = completion.clone();
-    let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
-        move |hr, result_json| {
+    let handler =
+        CallDevToolsProtocolMethodCompletedHandler::create(Box::new(move |hr, result_json| {
             let result = if let Err(err) = hr {
                 Err(anyhow!("CDP call failed: {err}"))
             } else {
@@ -227,8 +221,7 @@ pub(crate) fn call_devtools_on_webview(
             };
             finish(&handler_completion, result);
             Ok(())
-        },
-    ));
+        }));
     match unsafe {
         webview.CallDevToolsProtocolMethod(
             PCWSTR(method_h.as_ptr()),

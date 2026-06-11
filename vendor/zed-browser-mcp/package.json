@@ -1,7 +1,7 @@
 {
   "name": "zed-browser-mcp",
   "version": "0.1.0",
-  "description": "Playwright-shaped MCP server for the embedded Zed browser tab (WebView2)",
+  "description": "Playwright-shaped MCP server for the embedded Zed browser tab",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

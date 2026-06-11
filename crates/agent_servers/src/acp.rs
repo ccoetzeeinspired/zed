@@ -22,7 +22,8 @@ use project::{AgentId, Project};
 use remote::remote_client::Interactive;
 use serde::Deserialize;
 use settings::SettingsStore;
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -2589,6 +2590,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::fs as std_fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use feature_flags::FeatureFlag as _;
@@ -2624,6 +2626,80 @@ mod tests {
         );
         assert_eq!(task.label, "Login");
         assert_eq!(task.command_label, "Login");
+    }
+
+    #[test]
+    fn zed_browser_mcp_server_uses_vendored_node_entrypoint() {
+        let repo = tempfile::tempdir().expect("failed to create temp repo");
+        let server_dir = repo.path().join("vendor/zed-browser-mcp/dist");
+        std_fs::create_dir_all(&server_dir).expect("failed to create fake MCP dist");
+        std_fs::write(server_dir.join("index.js"), "console.log('zed-browser');")
+            .expect("failed to create fake MCP entrypoint");
+
+        let server =
+            zed_browser_mcp_server_from_repo_root(repo.path()).expect("expected MCP server");
+
+        let acp::McpServer::Stdio(stdio) = server else {
+            panic!("expected stdio MCP server");
+        };
+        assert_eq!(stdio.name, BUILTIN_ZED_BROWSER_MCP_ID);
+        assert!(stdio.command.is_absolute() || stdio.command == PathBuf::from("node"));
+        assert_eq!(
+            stdio.args,
+            vec![server_dir.join("index.js").to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn zed_browser_mcp_server_is_absent_when_package_is_unbuilt() {
+        let repo = tempfile::tempdir().expect("failed to create temp repo");
+
+        assert!(zed_browser_mcp_server_from_repo_root(repo.path()).is_none());
+    }
+
+    #[test]
+    fn zed_browser_mcp_is_added_unless_explicitly_configured() {
+        assert!(should_add_builtin_zed_browser_mcp(["other-server"]));
+        assert!(!should_add_builtin_zed_browser_mcp([
+            "other-server",
+            BUILTIN_ZED_BROWSER_MCP_ID,
+        ]));
+    }
+
+    #[test]
+    fn zed_browser_mcp_node_resolver_prefers_path_node() {
+        let temp = tempfile::tempdir().expect("failed to create temp dir");
+        let bin_dir = temp.path().join("bin");
+        std_fs::create_dir_all(&bin_dir).expect("failed to create bin dir");
+        let node = bin_dir.join("node");
+        std_fs::write(&node, "").expect("failed to create fake node");
+        let path_env = std::env::join_paths([bin_dir]).expect("failed to join path");
+
+        assert_eq!(
+            resolve_zed_browser_mcp_node_command(Some(path_env.as_os_str()), None, &[]),
+            node
+        );
+    }
+
+    #[test]
+    fn zed_browser_mcp_node_resolver_falls_back_to_nvm_node() {
+        let home = tempfile::tempdir().expect("failed to create fake home");
+        let node = home.path().join(".nvm/versions/node/v24.11.0/bin/node");
+        std_fs::create_dir_all(node.parent().unwrap()).expect("failed to create fake nvm bin");
+        std_fs::write(&node, "").expect("failed to create fake node");
+
+        assert_eq!(
+            resolve_zed_browser_mcp_node_command(None, Some(home.path()), &[]),
+            node
+        );
+    }
+
+    #[test]
+    fn zed_browser_mcp_node_resolver_keeps_node_fallback() {
+        assert_eq!(
+            resolve_zed_browser_mcp_node_command(None, None, &[]),
+            PathBuf::from("node")
+        );
     }
 
     #[test]
@@ -3840,8 +3916,8 @@ mod tests {
 fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
-    context_server_store
-        .configured_server_ids()
+    let configured_server_ids = context_server_store.configured_server_ids();
+    let mut mcp_servers = configured_server_ids
         .iter()
         .filter_map(|id| {
             let configuration = context_server_store.configuration_for_server(id)?;
@@ -3882,7 +3958,103 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
                 _ => None,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    if should_add_builtin_zed_browser_mcp(configured_server_ids.iter().map(|id| id.0.as_ref()))
+        && let Some(server) = builtin_zed_browser_mcp_server()
+    {
+        mcp_servers.push(server);
+    }
+
+    mcp_servers
+}
+
+const BUILTIN_ZED_BROWSER_MCP_ID: &str = "zed-browser";
+
+fn should_add_builtin_zed_browser_mcp<'a>(
+    configured_server_ids: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    !configured_server_ids
+        .into_iter()
+        .any(|id| id == BUILTIN_ZED_BROWSER_MCP_ID)
+}
+
+fn builtin_zed_browser_mcp_server() -> Option<acp::McpServer> {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?.parent()?;
+    zed_browser_mcp_server_from_repo_root(repo_root)
+}
+
+fn zed_browser_mcp_server_from_repo_root(repo_root: &Path) -> Option<acp::McpServer> {
+    let server_path = repo_root
+        .join("vendor")
+        .join("zed-browser-mcp")
+        .join("dist")
+        .join("index.js");
+    server_path.exists().then(|| {
+        acp::McpServer::Stdio(
+            acp::McpServerStdio::new(BUILTIN_ZED_BROWSER_MCP_ID, zed_browser_mcp_node_command())
+                .args(vec![server_path.to_string_lossy().into_owned()]),
+        )
+    })
+}
+
+fn zed_browser_mcp_node_command() -> PathBuf {
+    if let Some(node) = std::env::var_os("ZED_BROWSER_MCP_NODE").map(PathBuf::from) {
+        if node.is_file() {
+            return node;
+        }
+    }
+
+    let common_paths = [
+        PathBuf::from("/opt/homebrew/bin/node"),
+        PathBuf::from("/usr/local/bin/node"),
+        PathBuf::from("/usr/bin/node"),
+    ];
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    resolve_zed_browser_mcp_node_command(
+        std::env::var_os("PATH").as_deref(),
+        home.as_deref(),
+        &common_paths,
+    )
+}
+
+fn resolve_zed_browser_mcp_node_command(
+    path_env: Option<&OsStr>,
+    home: Option<&Path>,
+    common_paths: &[PathBuf],
+) -> PathBuf {
+    if let Some(path_env) = path_env {
+        for dir in std::env::split_paths(path_env) {
+            let candidate = dir.join("node");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    for candidate in common_paths {
+        if candidate.is_file() {
+            return candidate.clone();
+        }
+    }
+
+    if let Some(home) = home {
+        let nvm_versions_dir = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(nvm_versions_dir) {
+            let mut candidates = entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path().join("bin/node"))
+                .filter(|candidate| candidate.is_file())
+                .collect::<Vec<_>>();
+            candidates.sort();
+            if let Some(candidate) = candidates.pop() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from("node")
 }
 
 fn config_state(

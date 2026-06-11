@@ -17,7 +17,9 @@ use crate::automation::action::{
 };
 use crate::automation::cdp::CdpSession;
 use crate::automation::navigate::{WaitForOptions, normalize_navigate_url, wait_for_result};
-use crate::automation::snapshot::{FrameAx, PageSnapshot, snapshot_from_ax_tree, snapshot_from_frames};
+use crate::automation::snapshot::{
+    FrameAx, PageSnapshot, snapshot_from_ax_tree, snapshot_from_frames,
+};
 use crate::browser_view::BrowserView;
 
 fn resolve_ref_on_browser(
@@ -30,11 +32,7 @@ fn resolve_ref_on_browser(
         .item()
         .read(cx)
         .resolve_automation_ref(ref_id)
-        .ok_or_else(|| {
-            anyhow!(
-                "ref {ref_id} not found or stale — run browser_snapshot first"
-            )
-        })?;
+        .ok_or_else(|| anyhow!("ref {ref_id} not found or stale — run browser_snapshot first"))?;
     element_for_action(element)
 }
 
@@ -138,11 +136,14 @@ async fn run_with_actionability_wait_result(
         let attempt = attempt.clone();
         let kicked_off = browser.update(cx, |view, cx| {
             view.with_webview_session(cx, |session| {
-                attempt(session, Box::new(move |result| {
-                    if let Some(tx) = tx_slot.take() {
-                        let _ = tx.send(result);
-                    }
-                }))
+                attempt(
+                    session,
+                    Box::new(move |result| {
+                        if let Some(tx) = tx_slot.take() {
+                            let _ = tx.send(result);
+                        }
+                    }),
+                )
                 .is_ok()
             })
             .unwrap_or(false)
@@ -196,8 +197,16 @@ pub async fn snapshot(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result
     let mut frames: Vec<(String, String, bool)> = Vec::new(); // (frameId, url, is_main)
     fn collect(node: &Value, is_main: bool, out: &mut Vec<(String, String, bool)>) {
         if let Some(frame) = node.get("frame") {
-            let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let url = frame.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = frame
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let url = frame
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if !id.is_empty() {
                 out.push((id, url, is_main));
             }
@@ -215,7 +224,9 @@ pub async fn snapshot(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result
         // Fallback: single-frame snapshot via the legacy path.
         let tree = cdp_call(&browser, "Accessibility.getFullAXTree", "{}", cx).await?;
         let snapshot = snapshot_from_ax_tree(tree, page_generation)?;
-        browser.update(cx, |view, cx| view.store_automation_snapshot(cx, snapshot.clone()));
+        browser.update(cx, |view, cx| {
+            view.store_automation_snapshot(cx, snapshot.clone())
+        });
         return Ok(snapshot);
     }
 
@@ -237,11 +248,17 @@ pub async fn snapshot(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Result
         } else {
             iframe_owner_selector(&browser, &frame_id, &url, cx).await
         };
-        frame_inputs.push(FrameAx { ax, url, owner_selector });
+        frame_inputs.push(FrameAx {
+            ax,
+            url,
+            owner_selector,
+        });
     }
 
     let snapshot = snapshot_from_frames(frame_inputs, page_generation)?;
-    browser.update(cx, |view, cx| view.store_automation_snapshot(cx, snapshot.clone()));
+    browser.update(cx, |view, cx| {
+        view.store_automation_snapshot(cx, snapshot.clone())
+    });
     Ok(snapshot)
 }
 
@@ -338,9 +355,12 @@ pub async fn click(
     let browser_ref = browser.clone();
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
-    let point_raw = run_one_shot(&browser, cx, &format!("click-point {ref_id}"), move |session, done| {
-        try_hover_point_backend_node(session, backend_node_id, done)
-    })
+    let point_raw = run_one_shot(
+        &browser,
+        cx,
+        &format!("click-point {ref_id}"),
+        move |session, done| try_hover_point_backend_node(session, backend_node_id, done),
+    )
     .await?;
     let point = unwrap_cdp_value(point_raw);
     let x = point.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -423,7 +443,13 @@ pub async fn type_text(
     let attempt = Arc::new(
         move |session: &crate::webview2_host::WebView2Session,
               on_done: Box<dyn FnOnce(Result<()>) + 'static>| {
-            try_type_backend_node(session, backend_node_id, &text, keep_focus_for_submit, on_done)
+            try_type_backend_node(
+                session,
+                backend_node_id,
+                &text,
+                keep_focus_for_submit,
+                on_done,
+            )
         },
     );
     run_with_actionability_wait_result(cx, browser, "type", &ref_id, attempt).await
@@ -442,9 +468,12 @@ async fn type_slowly(
     let browser_ref = browser.clone();
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
-    run_one_shot(&browser, cx, &format!("focus {ref_id}"), move |session, done| {
-        try_focus_backend_node(session, backend_node_id, done)
-    })
+    run_one_shot(
+        &browser,
+        cx,
+        &format!("focus {ref_id}"),
+        move |session, done| try_focus_backend_node(session, backend_node_id, done),
+    )
     .await?;
 
     for ch in text.chars() {
@@ -457,14 +486,23 @@ async fn type_slowly(
         };
         let dispatched = browser.update(cx, |view, cx| {
             view.with_webview_session(cx, |session| {
-                let _ = session.dispatch_key_event("keyDown", &key, &code, 0, vk, text_payload.as_deref());
+                let _ = session.dispatch_key_event(
+                    "keyDown",
+                    &key,
+                    &code,
+                    0,
+                    vk,
+                    text_payload.as_deref(),
+                );
                 let _ = session.dispatch_key_event("keyUp", &key, &code, 0, vk, None);
                 true
             })
             .unwrap_or(false)
         });
         if !dispatched {
-            return Err(anyhow!("browser automation type (slowly) {ref_id}: no live WebView2 session"));
+            return Err(anyhow!(
+                "browser automation type (slowly) {ref_id}: no live WebView2 session"
+            ));
         }
         if delay_ms > 0 {
             cx.background_executor()
@@ -482,11 +520,7 @@ async fn type_slowly(
 /// there's no target ref to resolve. The caller should ensure the intended
 /// element is focused first (e.g. `browser_click` it, or `browser_type` which
 /// focuses on its way in).
-pub async fn press_key(
-    browser: Entity<BrowserView>,
-    key: &str,
-    cx: &mut AsyncApp,
-) -> Result<()> {
+pub async fn press_key(browser: Entity<BrowserView>, key: &str, cx: &mut AsyncApp) -> Result<()> {
     let press = crate::automation::keys::parse_key(key)?;
     let dispatched = browser.update(cx, |view, cx| {
         view.with_webview_session(cx, |session| {
@@ -534,9 +568,12 @@ pub async fn scroll(
         let browser_ref = browser.clone();
         let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, &ref_id, app))?;
         let backend_node_id = element.backend_dom_node_id.expect("checked above");
-        run_one_shot(&browser, cx, &format!("scroll-into-view {ref_id}"), move |session, done| {
-            try_scroll_into_view_backend_node(session, backend_node_id, done)
-        })
+        run_one_shot(
+            &browser,
+            cx,
+            &format!("scroll-into-view {ref_id}"),
+            move |session, done| try_scroll_into_view_backend_node(session, backend_node_id, done),
+        )
         .await?
     } else {
         // `behavior:'instant'` so the position read-back below is synchronous
@@ -563,7 +600,10 @@ async fn run_one_shot<F>(
     kick: F,
 ) -> Result<Value>
 where
-    F: FnOnce(&crate::webview2_host::WebView2Session, Box<dyn FnOnce(Result<Value>) + 'static>) -> Result<()>
+    F: FnOnce(
+            &crate::webview2_host::WebView2Session,
+            Box<dyn FnOnce(Result<Value>) + 'static>,
+        ) -> Result<()>
         + 'static,
 {
     let (tx, rx) = oneshot::channel::<Result<Value>>();
@@ -585,7 +625,9 @@ where
         .unwrap_or(false)
     });
     if !kicked_off {
-        return Err(anyhow!("browser automation {label}: no live WebView2 session"));
+        return Err(anyhow!(
+            "browser automation {label}: no live WebView2 session"
+        ));
     }
     rx.await
         .map_err(|_| anyhow!("browser automation {label} channel dropped"))?
@@ -637,9 +679,12 @@ pub async fn screenshot(
         let browser_ref = browser.clone();
         let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, &ref_id, app))?;
         let backend_node_id = element.backend_dom_node_id.expect("checked above");
-        let rect_raw = run_one_shot(&browser, cx, &format!("rect {ref_id}"), move |session, done| {
-            try_bounding_rect_backend_node(session, backend_node_id, done)
-        })
+        let rect_raw = run_one_shot(
+            &browser,
+            cx,
+            &format!("rect {ref_id}"),
+            move |session, done| try_bounding_rect_backend_node(session, backend_node_id, done),
+        )
         .await?;
         params.insert("clip".into(), clip_from_rect(&unwrap_cdp_value(rect_raw))?);
         // A page-coordinate clip only resolves correctly beyond the viewport.
@@ -685,9 +730,14 @@ pub async fn evaluate(
         // Bind the element as `this` and pass it as the first arg too, so both
         // `function() { this… }` and `el => el…` styles work.
         let decl = format!("function() {{ return ({function}).call(this, this); }}");
-        let raw = run_one_shot(&browser, cx, &format!("evaluate {ref_id}"), move |session, done| {
-            invoke_on_backend_node(session, backend_node_id, &decl, None, done)
-        })
+        let raw = run_one_shot(
+            &browser,
+            cx,
+            &format!("evaluate {ref_id}"),
+            move |session, done| {
+                invoke_on_backend_node(session, backend_node_id, &decl, None, done)
+            },
+        )
         .await?;
         return Ok(serde_json::json!({ "result": unwrap_cdp_value(raw) }));
     }
@@ -745,9 +795,12 @@ pub async fn select_option(
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
     let args: Vec<Value> = values.iter().map(|v| Value::from(v.as_str())).collect();
     let ref_label = ref_id.to_string();
-    let raw = run_one_shot(&browser, cx, &format!("select {ref_label}"), move |session, done| {
-        try_select_option_backend_node(session, backend_node_id, &args, done)
-    })
+    let raw = run_one_shot(
+        &browser,
+        cx,
+        &format!("select {ref_label}"),
+        move |session, done| try_select_option_backend_node(session, backend_node_id, &args, done),
+    )
     .await?;
     let result = unwrap_cdp_value(raw);
     if result.get("matched").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
@@ -763,18 +816,27 @@ pub async fn hover(browser: Entity<BrowserView>, ref_id: &str, cx: &mut AsyncApp
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
 
-    let point_raw = run_one_shot(&browser, cx, &format!("hover-point {ref_id}"), move |session, done| {
-        try_hover_point_backend_node(session, backend_node_id, done)
-    })
+    let point_raw = run_one_shot(
+        &browser,
+        cx,
+        &format!("hover-point {ref_id}"),
+        move |session, done| try_hover_point_backend_node(session, backend_node_id, done),
+    )
     .await?;
     let point = unwrap_cdp_value(point_raw);
     let x = point.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let y = point.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-    let params = serde_json::json!({ "type": "mouseMoved", "x": x, "y": y, "buttons": 0 }).to_string();
-    run_one_shot(&browser, cx, &format!("hover {ref_id}"), move |session, done| {
-        CdpSession::new(session).call_method("Input.dispatchMouseEvent", &params, done)
-    })
+    let params =
+        serde_json::json!({ "type": "mouseMoved", "x": x, "y": y, "buttons": 0 }).to_string();
+    run_one_shot(
+        &browser,
+        cx,
+        &format!("hover {ref_id}"),
+        move |session, done| {
+            CdpSession::new(session).call_method("Input.dispatchMouseEvent", &params, done)
+        },
+    )
     .await?;
     Ok(serde_json::json!({ "x": x, "y": y }))
 }
@@ -787,9 +849,12 @@ async fn element_center(
 ) -> Result<(f64, f64)> {
     let element = cx.update(|app| resolve_ref_on_browser(browser, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
-    let raw = run_one_shot(browser, cx, &format!("center {ref_id}"), move |session, done| {
-        try_hover_point_backend_node(session, backend_node_id, done)
-    })
+    let raw = run_one_shot(
+        browser,
+        cx,
+        &format!("center {ref_id}"),
+        move |session, done| try_hover_point_backend_node(session, backend_node_id, done),
+    )
     .await?;
     let point = unwrap_cdp_value(raw);
     Ok((
@@ -810,9 +875,14 @@ pub async fn file_upload(
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
     let count = files.len();
-    run_one_shot(&browser, cx, &format!("file_upload {ref_id}"), move |session, done| {
-        CdpSession::new(session).set_file_input_files(backend_node_id, &files, done)
-    })
+    run_one_shot(
+        &browser,
+        cx,
+        &format!("file_upload {ref_id}"),
+        move |session, done| {
+            CdpSession::new(session).set_file_input_files(backend_node_id, &files, done)
+        },
+    )
     .await?;
     Ok(serde_json::json!({ "uploaded": count }))
 }
@@ -833,7 +903,18 @@ pub async fn drag(
     // (some DnD libs require movement deltas), then release at the target.
     dispatch_mouse(&browser, cx, "mouseMoved", sx, sy, "none", 0, 0, 0).await?;
     dispatch_mouse(&browser, cx, "mousePressed", sx, sy, "left", 1, 1, 0).await?;
-    dispatch_mouse(&browser, cx, "mouseMoved", (sx + ex) / 2.0, (sy + ey) / 2.0, "none", 1, 0, 0).await?;
+    dispatch_mouse(
+        &browser,
+        cx,
+        "mouseMoved",
+        (sx + ex) / 2.0,
+        (sy + ey) / 2.0,
+        "none",
+        1,
+        0,
+        0,
+    )
+    .await?;
     dispatch_mouse(&browser, cx, "mouseMoved", ex, ey, "none", 1, 0, 0).await?;
     dispatch_mouse(&browser, cx, "mouseReleased", ex, ey, "left", 0, 1, 0).await?;
 
@@ -853,9 +934,20 @@ pub async fn drop(
     let browser_ref = browser.clone();
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
-    run_one_shot(&browser, cx, &format!("drop {ref_id}"), move |session, done| {
-        try_drop_backend_node(session, backend_node_id, data.as_deref(), mime.as_deref(), done)
-    })
+    run_one_shot(
+        &browser,
+        cx,
+        &format!("drop {ref_id}"),
+        move |session, done| {
+            try_drop_backend_node(
+                session,
+                backend_node_id,
+                data.as_deref(),
+                mime.as_deref(),
+                done,
+            )
+        },
+    )
     .await?;
     Ok(serde_json::json!({ "dropped": true }))
 }
@@ -900,7 +992,12 @@ pub async fn handle_dialog(
 // ---- CP9: coordinate ("vision") mouse tools (raw viewport CSS px) ----
 
 /// Move the mouse to `(x, y)`.
-pub async fn mouse_move_xy(browser: Entity<BrowserView>, x: f64, y: f64, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn mouse_move_xy(
+    browser: Entity<BrowserView>,
+    x: f64,
+    y: f64,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     dispatch_mouse(&browser, cx, "mouseMoved", x, y, "none", 0, 0, 0).await?;
     Ok(serde_json::json!({ "x": x, "y": y }))
 }
@@ -935,7 +1032,11 @@ pub async fn mouse_button(
     cx: &mut AsyncApp,
 ) -> Result<Value> {
     let (btn, buttons) = button_codes(button)?;
-    let (kind, held) = if down { ("mousePressed", buttons) } else { ("mouseReleased", 0) };
+    let (kind, held) = if down {
+        ("mousePressed", buttons)
+    } else {
+        ("mouseReleased", 0)
+    };
     dispatch_mouse(&browser, cx, kind, x, y, btn, held, 1, 0).await?;
     Ok(serde_json::json!({ "x": x, "y": y, "button": button, "down": down }))
 }
@@ -953,7 +1054,18 @@ pub async fn mouse_drag_xy(
     let (btn, buttons) = button_codes(button)?;
     dispatch_mouse(&browser, cx, "mouseMoved", sx, sy, "none", 0, 0, 0).await?;
     dispatch_mouse(&browser, cx, "mousePressed", sx, sy, btn, buttons, 1, 0).await?;
-    dispatch_mouse(&browser, cx, "mouseMoved", (sx + ex) / 2.0, (sy + ey) / 2.0, "none", buttons, 0, 0).await?;
+    dispatch_mouse(
+        &browser,
+        cx,
+        "mouseMoved",
+        (sx + ex) / 2.0,
+        (sy + ey) / 2.0,
+        "none",
+        buttons,
+        0,
+        0,
+    )
+    .await?;
     dispatch_mouse(&browser, cx, "mouseMoved", ex, ey, "none", buttons, 0, 0).await?;
     dispatch_mouse(&browser, cx, "mouseReleased", ex, ey, btn, 0, 1, 0).await?;
     Ok(serde_json::json!({ "from": [sx, sy], "to": [ex, ey], "button": button }))
@@ -1101,13 +1213,20 @@ pub async fn cookie_list(browser: Entity<BrowserView>, cx: &mut AsyncApp) -> Res
         )
     })
     .await?;
-    let cookies = raw.get("cookies").cloned().unwrap_or_else(|| serde_json::json!([]));
+    let cookies = raw
+        .get("cookies")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
     let count = cookies.as_array().map(|a| a.len()).unwrap_or(0);
     Ok(serde_json::json!({ "cookies": cookies, "count": count }))
 }
 
 /// Get one cookie by name.
-pub async fn cookie_get(browser: Entity<BrowserView>, name: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn cookie_get(
+    browser: Entity<BrowserView>,
+    name: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let list = cookie_list(browser, cx).await?;
     let found = list
         .get("cookies")
@@ -1136,7 +1255,12 @@ pub async fn cookie_set(
     }
     let p = params.to_string();
     let raw = run_one_shot(&browser, cx, "cookie_set", move |session, done| {
-        CdpSession::new(session).call_with_domain_enabled("Network.enable", "Network.setCookie", &p, done)
+        CdpSession::new(session).call_with_domain_enabled(
+            "Network.enable",
+            "Network.setCookie",
+            &p,
+            done,
+        )
     })
     .await?;
     Ok(serde_json::json!({ "success": raw.get("success").cloned().unwrap_or(Value::Bool(true)) }))
@@ -1152,7 +1276,12 @@ pub async fn cookie_delete(
     let url = cx.update(|app| browser.read(app).item().read(app).url().to_string());
     let p = serde_json::json!({ "name": name, "url": url }).to_string();
     run_one_shot(&browser, cx, "cookie_delete", move |session, done| {
-        CdpSession::new(session).call_with_domain_enabled("Network.enable", "Network.deleteCookies", &p, done)
+        CdpSession::new(session).call_with_domain_enabled(
+            "Network.enable",
+            "Network.deleteCookies",
+            &p,
+            done,
+        )
     })
     .await?;
     Ok(serde_json::json!({ "deleted": name }))
@@ -1182,7 +1311,11 @@ fn store_expr(store: &str) -> &'static str {
 }
 
 /// List all entries in `store` (local/session) as `{ key: value }`.
-pub async fn storage_list(browser: Entity<BrowserView>, store: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn storage_list(
+    browser: Entity<BrowserView>,
+    store: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let s = store_expr(store);
     let expr = format!(
         "(()=>{{ const o={s}; const r={{}}; for(let i=0;i<o.length;i++){{ const k=o.key(i); r[k]=o.getItem(k); }} return r; }})()"
@@ -1195,7 +1328,12 @@ pub async fn storage_list(browser: Entity<BrowserView>, store: &str, cx: &mut As
 }
 
 /// Get one `store` value by key.
-pub async fn storage_get(browser: Entity<BrowserView>, store: &str, key: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn storage_get(
+    browser: Entity<BrowserView>,
+    store: &str,
+    key: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let s = store_expr(store);
     let k = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into());
     let expr = format!("(()=>{s}.getItem({k}))()");
@@ -1207,7 +1345,13 @@ pub async fn storage_get(browser: Entity<BrowserView>, store: &str, key: &str, c
 }
 
 /// Set a `store` key/value.
-pub async fn storage_set(browser: Entity<BrowserView>, store: &str, key: &str, value: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn storage_set(
+    browser: Entity<BrowserView>,
+    store: &str,
+    key: &str,
+    value: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let s = store_expr(store);
     let k = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into());
     let v = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
@@ -1220,7 +1364,12 @@ pub async fn storage_set(browser: Entity<BrowserView>, store: &str, key: &str, v
 }
 
 /// Remove a `store` key.
-pub async fn storage_delete(browser: Entity<BrowserView>, store: &str, key: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn storage_delete(
+    browser: Entity<BrowserView>,
+    store: &str,
+    key: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let s = store_expr(store);
     let k = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into());
     let expr = format!("(()=>{{ {s}.removeItem({k}); return true; }})()");
@@ -1232,7 +1381,11 @@ pub async fn storage_delete(browser: Entity<BrowserView>, store: &str, key: &str
 }
 
 /// Clear a whole `store`.
-pub async fn storage_clear(browser: Entity<BrowserView>, store: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn storage_clear(
+    browser: Entity<BrowserView>,
+    store: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let s = store_expr(store);
     let expr = format!("(()=>{{ {s}.clear(); return true; }})()");
     run_one_shot(&browser, cx, "storage_clear", move |session, done| {
@@ -1287,8 +1440,14 @@ pub async fn set_storage_state(
     for (field, store) in [("localStorage", "local"), ("sessionStorage", "session")] {
         if let Some(obj) = state.get(field).and_then(|o| o.as_object()) {
             for (k, v) in obj {
-                let vs = v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string());
-                if storage_set(browser.clone(), store, k, &vs, cx).await.is_ok() {
+                let vs = v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string());
+                if storage_set(browser.clone(), store, k, &vs, cx)
+                    .await
+                    .is_ok()
+                {
                     items += 1;
                 }
             }
@@ -1325,17 +1484,27 @@ async fn eval_on_ref(
 ) -> Result<Value> {
     let element = cx.update(|app| resolve_ref_on_browser(browser, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
-    let raw = run_one_shot(browser, cx, &format!("verify {ref_id}"), move |session, done| {
-        invoke_on_backend_node(session, backend_node_id, script, None, done)
-    })
+    let raw = run_one_shot(
+        browser,
+        cx,
+        &format!("verify {ref_id}"),
+        move |session, done| invoke_on_backend_node(session, backend_node_id, script, None, done),
+    )
     .await?;
     Ok(unwrap_cdp_value(raw))
 }
 
 /// Assert a snapshot-ref element is visible. (We verify by ref — the snapshot is
 /// already role+name keyed — vs Playwright's role+name lookup.)
-pub async fn verify_element_visible(browser: Entity<BrowserView>, ref_id: &str, cx: &mut AsyncApp) -> Result<Value> {
-    let visible = eval_on_ref(&browser, ref_id, VISIBLE_SCRIPT, cx).await?.as_bool().unwrap_or(false);
+pub async fn verify_element_visible(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let visible = eval_on_ref(&browser, ref_id, VISIBLE_SCRIPT, cx)
+        .await?
+        .as_bool()
+        .unwrap_or(false);
     if !visible {
         return Err(anyhow!("element {ref_id} is not visible"));
     }
@@ -1343,9 +1512,16 @@ pub async fn verify_element_visible(browser: Entity<BrowserView>, ref_id: &str, 
 }
 
 /// Assert a snapshot-ref list is visible and has at least one item.
-pub async fn verify_list_visible(browser: Entity<BrowserView>, ref_id: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn verify_list_visible(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let res = eval_on_ref(&browser, ref_id, LIST_SCRIPT, cx).await?;
-    let visible = res.get("visible").and_then(|v| v.as_bool()).unwrap_or(false);
+    let visible = res
+        .get("visible")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let items = res.get("items").and_then(|v| v.as_i64()).unwrap_or(0);
     if !visible {
         return Err(anyhow!("list {ref_id} is not visible"));
@@ -1357,7 +1533,11 @@ pub async fn verify_list_visible(browser: Entity<BrowserView>, ref_id: &str, cx:
 }
 
 /// Assert `text` is visible anywhere on the page (`innerText` includes it).
-pub async fn verify_text_visible(browser: Entity<BrowserView>, text: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn verify_text_visible(
+    browser: Entity<BrowserView>,
+    text: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let needle = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
     let expr = format!("(()=>document.body.innerText.includes({needle}))()");
     let raw = run_one_shot(&browser, cx, "verify_text", move |session, done| {
@@ -1371,11 +1551,18 @@ pub async fn verify_text_visible(browser: Entity<BrowserView>, text: &str, cx: &
 }
 
 /// Assert a snapshot-ref element's value (input value, else text) equals `expected`.
-pub async fn verify_value(browser: Entity<BrowserView>, ref_id: &str, expected: &str, cx: &mut AsyncApp) -> Result<Value> {
+pub async fn verify_value(
+    browser: Entity<BrowserView>,
+    ref_id: &str,
+    expected: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
     let actual_val = eval_on_ref(&browser, ref_id, VALUE_SCRIPT, cx).await?;
     let actual = actual_val.as_str().unwrap_or("");
     if actual != expected {
-        return Err(anyhow!("value mismatch on {ref_id}: expected {expected:?}, got {actual:?}"));
+        return Err(anyhow!(
+            "value mismatch on {ref_id}: expected {expected:?}, got {actual:?}"
+        ));
     }
     Ok(serde_json::json!({ "ok": true, "ref": ref_id, "value": actual }))
 }
@@ -1451,10 +1638,25 @@ pub async fn fill_form(
                 set_checked(browser.clone(), &field.ref_id, checked, cx).await?;
             }
             Some("combobox") | Some("select") => {
-                select_option(browser.clone(), &field.ref_id, vec![field.value.clone()], cx).await?;
+                select_option(
+                    browser.clone(),
+                    &field.ref_id,
+                    vec![field.value.clone()],
+                    cx,
+                )
+                .await?;
             }
             _ => {
-                type_text(browser.clone(), &field.ref_id, &field.value, false, false, 0, cx).await?;
+                type_text(
+                    browser.clone(),
+                    &field.ref_id,
+                    &field.value,
+                    false,
+                    false,
+                    0,
+                    cx,
+                )
+                .await?;
             }
         }
         filled += 1;
@@ -1472,9 +1674,12 @@ async fn set_checked(
     let browser_ref = browser.clone();
     let element = cx.update(|app| resolve_ref_on_browser(&browser_ref, ref_id, app))?;
     let backend_node_id = element.backend_dom_node_id.expect("checked above");
-    run_one_shot(&browser, cx, &format!("check {ref_id}"), move |session, done| {
-        try_set_checked_backend_node(session, backend_node_id, checked, done)
-    })
+    run_one_shot(
+        &browser,
+        cx,
+        &format!("check {ref_id}"),
+        move |session, done| try_set_checked_backend_node(session, backend_node_id, checked, done),
+    )
     .await?;
     Ok(())
 }

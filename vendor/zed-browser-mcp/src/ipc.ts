@@ -63,7 +63,7 @@ export async function requireZedOk(response: IpcResponse): Promise<unknown> {
   if (!response.ok) {
     throw new Error(
       response.error ??
-        "Zed browser automation failed — is Zed running with a browser tab open?",
+        "Zed browser automation failed — is Zed running with an embedded browser tab open?",
     );
   }
   return response.result;

@@ -19,14 +19,14 @@ use serde_json::{Value, json};
 
 use crate::BrowserSettings;
 use crate::automation::commands;
-use crate::automation::navigate::{WaitForOptions, DEFAULT_NAV_TIMEOUT};
+use crate::automation::navigate::{DEFAULT_NAV_TIMEOUT, WaitForOptions};
 use crate::automation::recorder::{self, FormFieldRec, RecordedAction, Target};
 use crate::automation::tabs;
-use crate::browser_view::BrowserView;
-use gpui::Entity;
 use crate::automation::target::{
     resolve_automation_target_global, resolve_automation_workspace_global,
 };
+use crate::browser_view::BrowserView;
+use gpui::Entity;
 use gpui::SharedString;
 use settings::Settings as _;
 
@@ -34,6 +34,8 @@ use settings::Settings as _;
 pub const DEFAULT_IPC_PORT: u16 = 19382;
 
 const IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const NO_ACTIVE_BROWSER_MESSAGE: &str =
+    "No active Zed browser tab. Open an embedded browser tab first.";
 
 #[derive(Debug, Deserialize)]
 struct IpcRequest {
@@ -190,9 +192,7 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
 
     let browser = cx
         .update(|app| resolve_automation_target_global(app))
-        .ok_or_else(|| {
-            anyhow!("No active Zed browser tab. Open one with browser: new tab first.")
-        })?;
+        .ok_or_else(|| anyhow!(NO_ACTIVE_BROWSER_MESSAGE))?;
 
     // CP15: `record` start/stop/status + `codegen` are meta-controls — handle
     // them before the recordable-action path so they aren't themselves recorded.
@@ -255,7 +255,16 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .or_else(|| request.params.get("slowly_delay_ms"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            commands::type_text(browser.clone(), &ref_id, text, submit, slowly, slowly_delay_ms, cx).await?;
+            commands::type_text(
+                browser.clone(),
+                &ref_id,
+                text,
+                submit,
+                slowly,
+                slowly_delay_ms,
+                cx,
+            )
+            .await?;
             if submit {
                 commands::press_key(browser, "Enter", cx).await?;
             }
@@ -277,8 +286,16 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
                 .or_else(|| request.params.get("target"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let dx = request.params.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let dy = request.params.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let dx = request
+                .params
+                .get("dx")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let dy = request
+                .params
+                .get("dy")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             let pos = commands::scroll(browser, ref_id, dx, dy, cx).await?;
             Ok(pos)
         }
@@ -334,10 +351,15 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
         "file_upload" => {
             let ref_id = ref_from_params(&request.params)?;
             let files = parse_string_list(
-                request.params.get("paths").or_else(|| request.params.get("files")),
+                request
+                    .params
+                    .get("paths")
+                    .or_else(|| request.params.get("files")),
             )
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow!("file_upload requires params.paths (a path or array of paths)"))?;
+            .ok_or_else(|| {
+                anyhow!("file_upload requires params.paths (a path or array of paths)")
+            })?;
             commands::file_upload(browser, &ref_id, files, cx).await
         }
         "drag" => {
@@ -361,8 +383,16 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
         }
         "drop" => {
             let ref_id = ref_from_params(&request.params)?;
-            let data = request.params.get("data").and_then(|v| v.as_str()).map(str::to_string);
-            let mime = request.params.get("mime").and_then(|v| v.as_str()).map(str::to_string);
+            let data = request
+                .params
+                .get("data")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let mime = request
+                .params
+                .get("mime")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             commands::drop(browser, &ref_id, data, mime, cx).await
         }
         "handle_dialog" => {
@@ -396,33 +426,86 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
         }
         "mouse_down" => {
             let (x, y) = xy_from_params(&request.params)?;
-            commands::mouse_button(browser, x, y, &button_from_params(&request.params), true, cx).await
+            commands::mouse_button(
+                browser,
+                x,
+                y,
+                &button_from_params(&request.params),
+                true,
+                cx,
+            )
+            .await
         }
         "mouse_up" => {
             let (x, y) = xy_from_params(&request.params)?;
-            commands::mouse_button(browser, x, y, &button_from_params(&request.params), false, cx).await
+            commands::mouse_button(
+                browser,
+                x,
+                y,
+                &button_from_params(&request.params),
+                false,
+                cx,
+            )
+            .await
         }
         "mouse_drag_xy" => {
             let sx = num_param(&request.params, &["startX", "x1", "fromX"])?;
             let sy = num_param(&request.params, &["startY", "y1", "fromY"])?;
             let ex = num_param(&request.params, &["endX", "x2", "toX"])?;
             let ey = num_param(&request.params, &["endY", "y2", "toY"])?;
-            commands::mouse_drag_xy(browser, sx, sy, ex, ey, &button_from_params(&request.params), cx).await
+            commands::mouse_drag_xy(
+                browser,
+                sx,
+                sy,
+                ex,
+                ey,
+                &button_from_params(&request.params),
+                cx,
+            )
+            .await
         }
         "mouse_wheel" => {
-            let x = request.params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let y = request.params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let dx = request.params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let dy = request.params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let x = request
+                .params
+                .get("x")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let y = request
+                .params
+                .get("y")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let dx = request
+                .params
+                .get("deltaX")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let dy = request
+                .params
+                .get("deltaY")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
             commands::mouse_wheel(browser, x, y, dx, dy, cx).await
         }
         "console_messages" => {
-            let level = request.params.get("level").and_then(|v| v.as_str()).map(str::to_string);
-            let clear = request.params.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            let level = request
+                .params
+                .get("level")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let clear = request
+                .params
+                .get("clear")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             commands::console_messages(browser, level, clear, cx).await
         }
         "network_requests" => {
-            let clear = request.params.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            let clear = request
+                .params
+                .get("clear")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             commands::network_requests(browser, clear, cx).await
         }
         "network_request" => {
@@ -439,7 +522,11 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
             commands::resize(browser, width, height, cx).await
         }
         "pdf_save" => {
-            let landscape = request.params.get("landscape").and_then(|v| v.as_bool()).unwrap_or(false);
+            let landscape = request
+                .params
+                .get("landscape")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let print_background = request
                 .params
                 .get("printBackground")
@@ -458,11 +545,9 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
             commands::cookie_get(browser, name, cx).await
         }
         "cookie_set" => {
-            let cookie = request
-                .params
-                .get("cookie")
-                .cloned()
-                .ok_or_else(|| anyhow!("cookie_set requires params.cookie (object with name+value)"))?;
+            let cookie = request.params.get("cookie").cloned().ok_or_else(|| {
+                anyhow!("cookie_set requires params.cookie (object with name+value)")
+            })?;
             commands::cookie_set(browser, cookie, cx).await
         }
         "cookie_delete" => {
@@ -486,7 +571,12 @@ async fn dispatch_request(request: IpcRequest, cx: &mut AsyncApp) -> Result<Valu
         "storage_set" => {
             let store = store_from_params(&request.params);
             let key = key_from_params(&request.params)?;
-            let value = request.params.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let value = request
+                .params
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             commands::storage_set(browser, &store, &key, &value, cx).await
         }
         "storage_delete" => {
@@ -635,8 +725,7 @@ async fn dispatch_record(
             } else {
                 None
             };
-            let start_url =
-                cx.update(|app| browser.read(app).item().read(app).url().to_string());
+            let start_url = cx.update(|app| browser.read(app).item().read(app).url().to_string());
             recorder::start(start_url, storage_state);
             Ok(json!({ "recording": true, "storageStateCaptured": capture_ss }))
         }
@@ -783,8 +872,7 @@ async fn capture_pending_action(
         }
         "file_upload" => {
             let ref_id = ref_str(params)?;
-            let paths =
-                parse_string_list(params.get("paths").or_else(|| params.get("files")))?;
+            let paths = parse_string_list(params.get("paths").or_else(|| params.get("files")))?;
             Some(RecordedAction::FileUpload {
                 target: target_for(browser, &ref_id, cx).await?,
                 paths,
@@ -820,7 +908,10 @@ async fn capture_pending_action(
                     Some(Value::Number(n)) => n.to_string(),
                     _ => String::new(),
                 };
-                let kind = item.get("type").and_then(|v| v.as_str()).map(str::to_string);
+                let kind = item
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 fields.push(FormFieldRec {
                     target: target_for(browser, ref_id, cx).await?,
                     value,
@@ -830,7 +921,10 @@ async fn capture_pending_action(
             Some(RecordedAction::FillForm { fields })
         }
         "handle_dialog" => {
-            let accept = params.get("accept").and_then(|v| v.as_bool()).unwrap_or(true);
+            let accept = params
+                .get("accept")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             let prompt_text = params
                 .get("promptText")
                 .or_else(|| params.get("prompt_text"))
@@ -886,7 +980,9 @@ async fn capture_pending_action(
                     text: text.to_string(),
                 })
             } else {
-                text_gone.map(|t| RecordedAction::WaitForTextGone { text: t.to_string() })
+                text_gone.map(|t| RecordedAction::WaitForTextGone {
+                    text: t.to_string(),
+                })
             }
         }
         "verify_element_visible" => Some(RecordedAction::VerifyElementVisible {
@@ -924,7 +1020,8 @@ fn ref_str(params: &Value) -> Option<String> {
 
 /// First present numeric param among `keys` (no error — for recording).
 fn num_opt(params: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|k| params.get(*k).and_then(|v| v.as_f64()))
+    keys.iter()
+        .find_map(|k| params.get(*k).and_then(|v| v.as_f64()))
 }
 
 async fn dispatch_tabs(params: Value, cx: &mut AsyncApp) -> Result<Value> {
@@ -950,7 +1047,9 @@ async fn dispatch_tabs(params: Value, cx: &mut AsyncApp) -> Result<Value> {
         "new" => {
             let url = match params.get("url").and_then(|v| v.as_str()) {
                 Some(url) => SharedString::new(url.to_string()),
-                None => cx.update(|app| SharedString::new(BrowserSettings::get_global(app).homepage.clone())),
+                None => cx.update(|app| {
+                    SharedString::new(BrowserSettings::get_global(app).homepage.clone())
+                }),
             };
             tabs::new_tab(workspace, window, url, cx).await
         }
@@ -1035,8 +1134,15 @@ fn parse_form_fields(value: Option<&Value>) -> Result<Vec<commands::FormField>> 
             Some(Value::Number(n)) => n.to_string(),
             _ => String::new(),
         };
-        let kind = item.get("type").and_then(|v| v.as_str()).map(str::to_string);
-        fields.push(commands::FormField { ref_id, value, kind });
+        let kind = item
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        fields.push(commands::FormField {
+            ref_id,
+            value,
+            kind,
+        });
     }
     Ok(fields)
 }
@@ -1067,7 +1173,10 @@ mod tests {
 
     #[test]
     fn parse_string_list_accepts_string_and_array() {
-        assert_eq!(parse_string_list(Some(&json!("M"))), Some(vec!["M".to_string()]));
+        assert_eq!(
+            parse_string_list(Some(&json!("M"))),
+            Some(vec!["M".to_string()])
+        );
         assert_eq!(
             parse_string_list(Some(&json!(["S", "L"]))),
             Some(vec!["S".to_string(), "L".to_string()])

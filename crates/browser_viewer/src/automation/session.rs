@@ -1,8 +1,22 @@
 //! Per-tab automation session state and ref registry.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Platform-neutral handle that lets live automation backends resolve snapshot
+/// refs without forcing every backend to expose CDP node IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElementHandle {
+    CdpBackendNodeId(i32),
+    WkDomToken(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableSelector {
+    TestId(String),
+    Css(String),
+}
 
 /// Handle assigned in snapshots (`e1`, `e2`, …) for Playwright-shaped targeting.
 #[derive(Debug, Clone)]
@@ -10,8 +24,10 @@ pub struct ElementRef {
     pub ref_id: String,
     pub ax_node_id: String,
     pub backend_dom_node_id: Option<i32>,
+    pub element_handle: Option<ElementHandle>,
     pub role: String,
     pub name: String,
+    pub durable_selector: Option<DurableSelector>,
     /// 0-based index of this element among snapshot elements that share the same
     /// `(role, name)` *within the same frame*, in DOM/AX order. With `dup_count`,
     /// lets codegen emit `.nth(i)` to disambiguate an otherwise-ambiguous locator.
@@ -110,5 +126,32 @@ impl AutomationSessionState {
             return None;
         }
         registry.get(ref_id).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn element_handle_preserves_existing_backend_dom_node_id() {
+        let element = ElementRef {
+            ref_id: "e1".into(),
+            ax_node_id: "2".into(),
+            backend_dom_node_id: Some(42),
+            element_handle: Some(ElementHandle::CdpBackendNodeId(42)),
+            role: "button".into(),
+            name: "Save".into(),
+            durable_selector: None,
+            dup_index: 0,
+            dup_count: 1,
+            frame_selector: None,
+        };
+
+        assert_eq!(element.backend_dom_node_id, Some(42));
+        assert_eq!(
+            element.element_handle,
+            Some(ElementHandle::CdpBackendNodeId(42))
+        );
     }
 }

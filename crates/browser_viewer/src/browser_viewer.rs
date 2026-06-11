@@ -18,15 +18,20 @@ pub mod bundle;
 pub mod design;
 pub mod drawing;
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub mod automation;
 #[cfg(target_os = "windows")]
 mod design_mode_script;
 #[cfg(target_os = "windows")]
 mod webview2_host;
-#[cfg(target_os = "windows")]
-pub mod automation;
+#[cfg(target_os = "macos")]
+mod wkwebview_host;
 
 pub use browser_settings::BrowserSettings;
 pub use browser_view::{BrowserItem, BrowserView, open_new_tab};
+
+const NO_ACTIVE_BROWSER_MESSAGE: &str =
+    "No active Zed browser tab. Open an embedded browser tab first.";
 
 actions!(
     browser,
@@ -69,22 +74,19 @@ actions!(
 /// Register the browser-viewer feature with the application.
 pub fn init(cx: &mut App) {
     BrowserSettings::register(cx);
-    #[cfg(target_os = "windows")]
-    {
-        automation::init_automation_ipc(cx);
-        cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-            workspace.register_action(|workspace, _: &NewTab, window, cx| {
-                let homepage = BrowserSettings::get_global(cx).homepage.clone();
-                open_new_tab(workspace, SharedString::new(homepage), window, cx);
-            });
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    automation::init_automation_ipc(cx);
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        workspace.register_action(|workspace, _: &NewTab, window, cx| {
+            let homepage = BrowserSettings::get_global(cx).homepage.clone();
+            open_new_tab(workspace, SharedString::new(homepage), window, cx);
+        });
+        #[cfg(target_os = "windows")]
+        {
             workspace.register_action(|workspace, _: &AutomationSmokeTest, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 if let Err(err) = automation::run_smoke_test(browser, window, cx) {
@@ -93,12 +95,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationSnapshot, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 if let Err(err) = automation::run_snapshot(browser, window, cx) {
@@ -107,12 +104,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationTypeEmail, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 let settings = BrowserSettings::get_global(cx);
@@ -138,12 +130,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationTypePassword, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 let settings = BrowserSettings::get_global(cx);
@@ -173,12 +160,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationClickSignIn, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 if let Err(err) = automation::run_click(
@@ -192,12 +174,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationNavigateHomepage, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 let homepage = BrowserSettings::get_global(cx).homepage.clone();
@@ -209,12 +186,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationWaitForLoad, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 if let Err(err) = automation::run_wait_for(
@@ -233,12 +205,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationWaitForText, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 let text = BrowserSettings::get_global(cx)
@@ -261,12 +228,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationClick, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 let ref_id = automation::dev_automation_ref();
@@ -276,12 +238,7 @@ pub fn init(cx: &mut App) {
             });
             workspace.register_action(|workspace, _: &AutomationType, window, cx| {
                 let Some(browser) = automation::resolve_automation_target(workspace, cx) else {
-                    workspace.show_error(
-                        &anyhow::anyhow!(
-                            "No active Zed browser tab. Open one with browser: new tab first."
-                        ),
-                        cx,
-                    );
+                    workspace.show_error(&anyhow::anyhow!(NO_ACTIVE_BROWSER_MESSAGE), cx);
                     return;
                 };
                 let settings = BrowserSettings::get_global(cx);
@@ -311,10 +268,10 @@ pub fn init(cx: &mut App) {
                     workspace.show_error(&err, cx);
                 }
             });
-        })
-        .detach();
-    }
-    #[cfg(not(target_os = "windows"))]
+        }
+    })
+    .detach();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         log::info!("browser_viewer: skipping init (not supported on this platform)");
     }

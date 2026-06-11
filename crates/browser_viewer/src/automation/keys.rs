@@ -202,7 +202,11 @@ mod tests {
         assert_eq!(k.key, "Enter");
         assert_eq!(k.code, "Enter");
         assert_eq!(k.windows_virtual_key_code, 0x0D);
-        assert_eq!(k.text.as_deref(), Some("\r"), "Enter needs text for keypress");
+        assert_eq!(
+            k.text.as_deref(),
+            Some("\r"),
+            "Enter needs text for keypress"
+        );
         assert_eq!(k.modifiers, 0);
     }
 

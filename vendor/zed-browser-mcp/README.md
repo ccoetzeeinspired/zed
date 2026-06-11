@@ -1,6 +1,6 @@
 # zed-browser-mcp
 
-MCP server for the **embedded Zed browser tab** (WebView2). Tools drive the
+MCP server for the **embedded Zed browser tab**. Tools drive the
 in-editor browser via loopback IPC to `browser_viewer::automation` — not a
 detached browser process.
 
@@ -9,14 +9,34 @@ detached browser process.
 ```powershell
 cd D:\src\zed\vendor\zed-browser-mcp
 npm install
-npm run build   # produces dist/index.js (gitignored)
+npm run build   # refreshes tracked dist/index.js when TypeScript changes
 ```
 
-Zed must be running with at least one browser tab open (`browser: new tab`).
+`dist/index.js` is checked in so Zed can expose this server to ACP sessions
+without requiring an install/build step at agent launch time.
+
+Zed must be running with at least one embedded browser tab open.
+
+Local ACP sessions in Zed receive this server automatically from the built-in
+`zed-browser` MCP descriptor. Manual `context_servers` configuration is only
+needed when running the MCP server outside that built-in ACP path.
 
 ## Zed settings
 
-Add to `%APPDATA%\Zed\settings.json`:
+For manual testing, add the server to Zed's `settings.json`.
+
+macOS example:
+
+```jsonc
+"context_servers": {
+  "zed-browser": {
+    "command": "node",
+    "args": ["/Users/you/src/zed/vendor/zed-browser-mcp/dist/index.js"]
+  }
+}
+```
+
+Windows example:
 
 ```jsonc
 "context_servers": {

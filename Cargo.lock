@@ -2245,6 +2245,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "block",
+ "cocoa 0.26.0",
  "editor",
  "futures 0.3.32",
  "gpui",
@@ -2252,6 +2254,7 @@ dependencies = [
  "image",
  "log",
  "menu",
+ "objc",
  "project",
  "raw-window-handle",
  "serde",

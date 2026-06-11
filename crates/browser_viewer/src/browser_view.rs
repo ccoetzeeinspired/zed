@@ -25,7 +25,7 @@ use gpui::{
     ElementId, Entity, EntityId, EventEmitter, FocusHandle, Focusable, GlobalElementId,
     InspectorElementId, IntoElement, KeyDownEvent, KeyUpEvent, Keystroke, LayoutId, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Style, WeakEntity, Window, anchored,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, Style, WeakEntity, Window, anchored,
     deferred, div, point, px, relative, size,
 };
 use ui::Tooltip;
@@ -38,11 +38,11 @@ use workspace::{
 #[cfg(target_os = "windows")]
 mod windows_imports {
     pub use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    pub use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     pub use webview2_com::Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_MOUSE_EVENT_KIND, COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
         COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK,
-        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN, COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN,
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
         COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOUBLE_CLICK,
         COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN,
         COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP, COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
@@ -59,6 +59,7 @@ mod windows_imports {
         COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_X_BUTTON2,
     };
     pub use windows::Win32::Foundation::HWND;
+    pub use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 }
 
 #[cfg(target_os = "windows")]
@@ -66,6 +67,10 @@ use windows_imports::*;
 
 #[cfg(target_os = "windows")]
 use crate::webview2_host::{NavigationEvent, WebView2Session, initialize};
+#[cfg(target_os = "macos")]
+use crate::wkwebview_host::WKWebViewSession;
+#[cfg(target_os = "macos")]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// One notch on a mouse wheel; matches Win32 `WHEEL_DELTA`.
 #[cfg(target_os = "windows")]
@@ -89,6 +94,8 @@ pub struct BrowserItem {
     can_go_forward: bool,
     #[cfg(target_os = "windows")]
     session: Option<WebView2Session>,
+    #[cfg(target_os = "macos")]
+    session: Option<WKWebViewSession>,
     /// True between kicking off WebView2 init and the session landing in
     /// `session`. Prevents re-triggering init on every prepaint.
     init_started: bool,
@@ -98,6 +105,8 @@ pub struct BrowserItem {
     /// tab-switch hide/show so an inactive browser tab's contents don't
     /// bleed through behind the active tab in the same pane.
     is_visible: bool,
+    #[cfg(target_os = "macos")]
+    automation_viewport_override: Option<Size<Pixels>>,
     /// Phase 4: whether design-mode is armed on this tab. The injected
     /// script tracks the same flag client-side; this mirror lets the
     /// host render the indicator and decide whether to forward
@@ -117,7 +126,7 @@ pub struct BrowserItem {
     pub drawing_mode_enabled: bool,
     pub drawing: crate::drawing::DrawingCanvas,
     /// Invalidates automation ref handles on navigation (see `automation`).
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     automation_state: crate::automation::AutomationSessionState,
     /// Phase 4.C: user drag offset for the "Describe the change" panel,
     /// added to its element-anchored base position so it can be moved off
@@ -138,15 +147,19 @@ impl BrowserItem {
             can_go_forward: false,
             #[cfg(target_os = "windows")]
             session: None,
+            #[cfg(target_os = "macos")]
+            session: None,
             init_started: false,
             last_bounds: None,
             is_visible: true,
+            #[cfg(target_os = "macos")]
+            automation_viewport_override: None,
             design_mode_enabled: false,
             design_selection: None,
             design_prompt: String::new(),
             drawing_mode_enabled: false,
             drawing: crate::drawing::DrawingCanvas::default(),
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             automation_state: crate::automation::AutomationSessionState::new(),
             design_panel_offset: point(px(0.), px(0.)),
             design_drag: None,
@@ -155,6 +168,23 @@ impl BrowserItem {
 
     pub fn url(&self) -> &SharedString {
         &self.url
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn set_automation_viewport_override(&mut self, width: Pixels, height: Pixels) {
+        self.automation_viewport_override = Some(size(width, height));
+        self.last_bounds = None;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn clear_automation_viewport_override(&mut self) {
+        self.automation_viewport_override = None;
+        self.last_bounds = None;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn automation_viewport_override(&self) -> Option<Size<Pixels>> {
+        self.automation_viewport_override
     }
 
     pub fn title(&self) -> &SharedString {
@@ -173,12 +203,12 @@ impl BrowserItem {
         self.can_go_forward
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub fn automation_page_generation(&self) -> u64 {
         self.automation_state.page_generation()
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub fn resolve_automation_ref(&self, ref_id: &str) -> Option<crate::automation::ElementRef> {
         self.automation_state.resolve_ref(ref_id)
     }
@@ -271,8 +301,45 @@ impl BrowserView {
         self.item.read(cx).session.as_ref().map(f)
     }
 
+    /// Run `f` against the platform automation session when one is live.
     #[cfg(target_os = "windows")]
-    pub fn store_automation_snapshot(&self, cx: &mut App, snapshot: crate::automation::PageSnapshot) {
+    pub fn with_automation_session<R>(
+        &self,
+        cx: &App,
+        f: impl FnOnce(&crate::webview2_host::WebView2Session) -> R,
+    ) -> Option<R> {
+        self.item.read(cx).session.as_ref().map(f)
+    }
+
+    /// Run `f` against the platform automation session when one is live.
+    #[cfg(target_os = "macos")]
+    pub fn with_automation_session<R>(
+        &self,
+        cx: &App,
+        f: impl FnOnce(&dyn crate::automation::AutomationSession) -> R,
+    ) -> Option<R> {
+        self.item
+            .read(cx)
+            .session
+            .as_ref()
+            .map(|session| f(session))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn with_wkwebview_session<R>(
+        &self,
+        cx: &App,
+        f: impl FnOnce(&crate::wkwebview_host::WKWebViewSession) -> R,
+    ) -> Option<R> {
+        self.item.read(cx).session.as_ref().map(f)
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    pub fn store_automation_snapshot(
+        &self,
+        cx: &mut App,
+        snapshot: crate::automation::PageSnapshot,
+    ) {
         let ref_count = snapshot.ref_count;
         let page_generation = snapshot.page_generation;
         let yaml = snapshot.yaml.clone();
@@ -291,7 +358,7 @@ impl BrowserView {
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub fn automation_navigate(&self, target: String, cx: &mut Context<Self>) {
         // Pre-set is_loading so a following wait-for-load can't return before
         // the NavigationStarting event fires (otherwise the first poll sees the
@@ -300,12 +367,48 @@ impl BrowserView {
         self.navigate_to(target, cx);
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn automation_update_page_state(
+        &self,
+        url: Option<String>,
+        title: Option<String>,
+        is_loading: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.item.update(cx, |item, _| {
+            item.is_loading = is_loading;
+            if let Some(url) = url {
+                item.url = SharedString::new(url);
+            }
+            if let Some(title) = title {
+                item.title = SharedString::new(title);
+            }
+        });
+    }
+
     /// CP7: navigate back in history. Returns `false` (no-op) if there is no
     /// back entry. Pre-sets `is_loading` so a following wait-for-load doesn't
     /// race the `NavigationStarting` event.
     #[cfg(target_os = "windows")]
     pub fn automation_go_back(&self, cx: &mut Context<Self>) -> bool {
         if !self.item.read(cx).can_go_back {
+            return false;
+        }
+        self.item.update(cx, |item, _| item.is_loading = true);
+        self.go_back(cx);
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn automation_go_back(&self, cx: &mut Context<Self>) -> bool {
+        let can_go_back = self
+            .item
+            .read(cx)
+            .session
+            .as_ref()
+            .map(WKWebViewSession::can_go_back)
+            .unwrap_or(false);
+        if !can_go_back {
             return false;
         }
         self.item.update(cx, |item, _| item.is_loading = true);
@@ -467,12 +570,7 @@ impl BrowserView {
     /// unaffected — that focus path routes through the editor's own
     /// key handlers first.
     #[cfg(target_os = "windows")]
-    fn on_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.dispatch_key("keyDown", &event.keystroke, cx);
     }
 
@@ -508,12 +606,7 @@ impl BrowserView {
         });
     }
 
-    fn on_submit_url(
-        &mut self,
-        _: &menu::Confirm,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_submit_url(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         // When the URL editor isn't focused, Enter came from the page
         // viewport (we focus BrowserView on click). GPUI counts the
         // action as consumed once dispatched here, so `on_key_down`
@@ -538,8 +631,10 @@ impl BrowserView {
         let target = parse_address_bar_input(&input, &search_url);
         #[cfg(target_os = "windows")]
         self.navigate_to(target, cx);
-        #[cfg(not(target_os = "windows"))]
-        let _ = target;
+        #[cfg(target_os = "macos")]
+        self.navigate_to(target, cx);
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let _ = (target, cx);
     }
 
     /// Phase 4.D: capture mouse drag into `BrowserItem.drawing`.
@@ -906,6 +1001,21 @@ impl Render for BrowserView {
                 }
             });
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.item.update(cx, |item, _| {
+                if item.is_visible {
+                    return;
+                }
+                if let Some(session) = item.session.as_ref()
+                    && let Err(err) = session.set_visible(true)
+                {
+                    log::warn!("BrowserItem: show WKWebView on activate failed: {err:?}");
+                    return;
+                }
+                item.is_visible = true;
+            });
+        }
 
         // FORK: focus the prompt editor on each new element selection so the
         // panel's Esc / Ctrl+Enter shortcuts fire and those keys don't leak
@@ -932,6 +1042,14 @@ impl Render for BrowserView {
         // URL has changed and (b) the user isn't typing into the input.
         let model_url = self.item.read(cx).url.clone();
         let editor_focused = self.url_editor.focus_handle(cx).is_focused(window);
+        #[cfg(target_os = "macos")]
+        if editor_focused || !self.focus_handle.is_focused(window) {
+            self.item.update(cx, |item, _| {
+                if let Some(session) = item.session.as_ref() {
+                    session.release_keyboard_focus();
+                }
+            });
+        }
         if !editor_focused {
             let editor_text = self.url_editor.read(cx).text(cx);
             if editor_text != model_url.as_ref() {
@@ -1320,7 +1438,15 @@ impl BrowserView {
         // Snapshot everything the bundle needs *now*, before the
         // async screenshot completes — `BrowserItem.design_selection`
         // may be cleared by the user before the callback fires.
-        let (outer_html, source, drawing_snapshot, element_rect, viewport_origin, viewport_size, page_url) = {
+        let (
+            outer_html,
+            source,
+            drawing_snapshot,
+            element_rect,
+            viewport_origin,
+            viewport_size,
+            page_url,
+        ) = {
             let item = self.item.read(cx);
             let Some(sel) = item.design_selection.as_ref() else {
                 log::warn!("browser_viewer: submit fired without a selection");
@@ -1438,9 +1564,9 @@ impl BrowserView {
                         "browser_viewer: [fork-debug] design bundle written to {}",
                         dir.display()
                     ),
-                    Err(err) => log::warn!(
-                        "browser_viewer: [fork-debug] failed to persist bundle: {err:?}"
-                    ),
+                    Err(err) => {
+                        log::warn!("browser_viewer: [fork-debug] failed to persist bundle: {err:?}")
+                    }
                 }
             }
 
@@ -1570,11 +1696,7 @@ impl BrowserView {
                         "Design Mode: OFF (click to enable element picker)"
                     }))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_toggle_design_mode(
-                            &crate::ToggleDesignMode,
-                            window,
-                            cx,
-                        );
+                        this.on_toggle_design_mode(&crate::ToggleDesignMode, window, cx);
                     })),
             )
             .child(
@@ -1587,11 +1709,7 @@ impl BrowserView {
                         "Drawing Mode: OFF (click to draw on the page)"
                     }))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_toggle_drawing_mode(
-                            &crate::ToggleDrawingMode,
-                            window,
-                            cx,
-                        );
+                        this.on_toggle_drawing_mode(&crate::ToggleDrawingMode, window, cx);
                     })),
             )
             .when(has_strokes, |b| {
@@ -1678,6 +1796,33 @@ impl Item for BrowserView {
     /// behind the active tab's underlay, so they no longer leak through its
     /// cutout (the multi-tab bug from Task #28).
     fn deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_native_browser_surface(cx);
+    }
+
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        self.hide_native_browser_surface(cx);
+    }
+
+    fn workspace_deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.hide_native_browser_surface(cx);
+    }
+}
+
+impl BrowserView {
+    #[cfg(target_os = "macos")]
+    fn hide_native_browser_surface(&self, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            item.is_visible = false;
+            if let Some(session) = item.session.as_ref()
+                && let Err(err) = session.set_visible(false)
+            {
+                log::warn!("BrowserItem: hide WKWebView on deactivate failed: {err:?}");
+            }
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn hide_native_browser_surface(&self, cx: &mut Context<Self>) {
         self.item.update(cx, |item, _| {
             item.is_visible = false;
         });
@@ -1746,7 +1891,14 @@ impl Element for BrowserViewportElement {
                 drive_session(item, bounds, hwnd, cx);
             });
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            let native_view = ns_view_from_window(window);
+            self.item.update(cx, |item, cx| {
+                drive_session(item, bounds, native_view, cx);
+            });
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let _ = (bounds, window, cx);
         }
@@ -1775,14 +1927,14 @@ impl Element for BrowserViewportElement {
         // first navigation the viewport area shows the workspace
         // background (a fine "loading" placeholder) rather than the
         // window's compositor background.
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let has_session = self.item.read(cx).session.is_some();
             if has_session {
                 window.paint_cutout(bounds);
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let _ = (bounds, window, cx);
         }
@@ -1859,11 +2011,7 @@ impl Element for DrawingPaintElement {
     ) {
         let canvas = self.item.read(cx).drawing.clone();
         let stroke_color = gpui::hsla(0.36, 1.0, 0.5, 1.0); // bright green
-        for stroke in canvas
-            .strokes
-            .iter()
-            .chain(canvas.current.as_ref())
-        {
+        for stroke in canvas.strokes.iter().chain(canvas.current.as_ref()) {
             if stroke.points.len() < 2 {
                 continue;
             }
@@ -1887,6 +2035,84 @@ fn hwnd_from_window(window: &mut Window) -> Option<HWND> {
     } else {
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ns_view_from_window(window: &mut Window) -> Option<crate::wkwebview_host::NativeView> {
+    let raw = window.window_handle().ok()?.as_raw();
+    if let RawWindowHandle::AppKit(appkit) = raw {
+        Some(appkit.ns_view.as_ptr().cast())
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn drive_session(
+    item: &mut BrowserItem,
+    bounds: Bounds<Pixels>,
+    native_view: Option<crate::wkwebview_host::NativeView>,
+    cx: &mut Context<BrowserItem>,
+) {
+    let session_bounds = macos_session_bounds(item, bounds);
+    if session_bounds.size.width <= Pixels::ZERO || session_bounds.size.height <= Pixels::ZERO {
+        return;
+    }
+
+    let bounds_changed = item.last_bounds != Some(session_bounds);
+    if bounds_changed {
+        if let Some(session) = &item.session
+            && let Err(err) = session.set_rect(session_bounds)
+        {
+            log::warn!("BrowserItem: WKWebView set_rect failed: {err:?}");
+        }
+        item.last_bounds = Some(session_bounds);
+    }
+
+    if !item.init_started && item.session.is_none() {
+        let Some(native_view) = native_view else {
+            return;
+        };
+        if let Err(err) = start_session(item, session_bounds, native_view, cx) {
+            log::error!("BrowserItem: failed to initialize WKWebView: {err:?}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_session_bounds(item: &BrowserItem, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    let Some(override_size) = item.automation_viewport_override() else {
+        return bounds;
+    };
+    Bounds::new(
+        bounds.origin,
+        size(
+            min_pixels(override_size.width, bounds.size.width),
+            min_pixels(override_size.height, bounds.size.height),
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn min_pixels(left: Pixels, right: Pixels) -> Pixels {
+    if left <= right { left } else { right }
+}
+
+#[cfg(target_os = "macos")]
+fn start_session(
+    item: &mut BrowserItem,
+    bounds: Bounds<Pixels>,
+    native_view: crate::wkwebview_host::NativeView,
+    cx: &mut Context<BrowserItem>,
+) -> anyhow::Result<()> {
+    let url = item.url.to_string();
+    let session = WKWebViewSession::initialize(native_view, bounds, &url)?;
+    session.set_visible(item.is_visible)?;
+    item.session = Some(session);
+    item.init_started = true;
+    item.last_bounds = Some(bounds);
+    cx.notify();
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1926,6 +2152,58 @@ fn drive_session(
         if let Err(err) = start_session(item, bounds, hwnd, cx) {
             log::error!("BrowserItem: failed to dispatch WebView2 init: {err:?}");
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl BrowserView {
+    fn navigate_to(&self, target: String, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, cx| {
+            item.url = SharedString::new(target.clone());
+            item.title = item.url.clone();
+            item.is_loading = true;
+            item.clear_automation_viewport_override();
+            item.automation_state.bump_page_generation();
+            if let Some(session) = item.session.as_ref() {
+                match session.navigate(&target) {
+                    Ok(()) => item.is_loading = false,
+                    Err(err) => {
+                        item.is_loading = false;
+                        log::warn!("BrowserView::navigate_to({target}): {err}");
+                    }
+                }
+            }
+            cx.notify();
+        });
+    }
+
+    fn go_back(&self, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, cx| {
+            let can_go_back = item
+                .session
+                .as_ref()
+                .is_some_and(WKWebViewSession::can_go_back);
+            if !can_go_back {
+                return;
+            }
+
+            item.is_loading = true;
+            item.clear_automation_viewport_override();
+            item.automation_state.bump_page_generation();
+
+            if let Some(session) = item.session.as_ref() {
+                match session.go_back() {
+                    Ok(()) => item.is_loading = false,
+                    Err(err) => {
+                        item.is_loading = false;
+                        log::warn!("BrowserView::go_back: {err}");
+                    }
+                }
+            } else {
+                item.is_loading = false;
+            }
+            cx.notify();
+        });
     }
 }
 

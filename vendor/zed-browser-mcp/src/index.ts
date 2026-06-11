@@ -11,6 +11,11 @@ import { callZedAutomation, requireZedOk } from "./ipc.js";
 const server = new McpServer({
   name: "zed-browser",
   version: "0.1.0",
+  description:
+    "Controls the embedded browser tab inside Zed/ACP, not an external or generic Codex browser.",
+}, {
+  instructions:
+    "Use zed-browser first for any request about the browser visible inside Zed, ACP chat, @Browser/current browser context, Takealot pages opened in Zed, or end-to-end testing in the embedded Zed browser. Prefer browser_snapshot before screenshots or external web search so actions are grounded in the current Zed tab.",
 });
 
 function textContent(text: string) {
@@ -19,7 +24,7 @@ function textContent(text: string) {
 
 server.tool(
   "browser_navigate",
-  "Navigate the embedded Zed browser tab to a URL",
+  "Navigate the embedded browser tab inside Zed/ACP to a URL. Use this instead of generic in-app browser navigation when the user asks for the Zed browser.",
   { url: z.string().describe("The URL to navigate to") },
   async ({ url }) => {
     const result = await requireZedOk(
@@ -31,7 +36,7 @@ server.tool(
 
 server.tool(
   "browser_snapshot",
-  "Capture accessibility snapshot of the current page in the embedded Zed browser tab",
+  "Capture an accessibility snapshot of the current page in the embedded Zed browser tab. Use this first for Zed browser tasks before screenshots, coordinate clicks, or external search.",
   {},
   async () => {
     const result = (await requireZedOk(
@@ -48,7 +53,7 @@ server.tool(
 
 server.tool(
   "browser_click",
-  "Perform click on a web page element in the embedded Zed browser tab",
+  "Click a snapshot element in the embedded Zed browser tab using a ref from browser_snapshot.",
   {
     element: z
       .string()
@@ -92,7 +97,7 @@ server.tool(
 
 server.tool(
   "browser_type",
-  "Type text into an editable element in the embedded Zed browser tab",
+  "Type text into an editable element in the embedded Zed browser tab using a ref from browser_snapshot.",
   {
     element: z
       .string()
@@ -968,13 +973,13 @@ async function main() {
   } catch (err) {
     console.error(
       `[zed-browser-mcp] Warning: Zed automation IPC not reachable (${err}). ` +
-        "Start Zed, open a browser tab (browser: new tab), then retry.",
+        "Start Zed, open an embedded browser tab, then retry.",
     );
   }
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("[zed-browser-mcp] ready (stdio MCP → Zed WebView2 tab)");
+  console.error("[zed-browser-mcp] ready (stdio MCP → embedded Zed browser tab)");
 }
 
 main().catch((err) => {

@@ -1,15 +1,20 @@
 //! CP2–3: ref-targeted click and type via CDP DOM (no coordinate injection).
 
+#[cfg(target_os = "windows")]
 use std::cell::RefCell;
+#[cfg(target_os = "windows")]
 use std::rc::Rc;
+#[cfg(target_os = "windows")]
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
+#[cfg(target_os = "windows")]
 use crate::automation::cdp::{Completion, call_devtools_on_webview, finish, parse_cdp_response};
-use crate::automation::session::ElementRef;
+use crate::automation::session::{ElementHandle, ElementRef};
+#[cfg(target_os = "windows")]
 use crate::webview2_host::WebView2Session;
 
 /// Default actionability wait for click/type.
@@ -111,7 +116,24 @@ pub fn element_for_action(element: ElementRef) -> Result<ElementRef> {
     Ok(element)
 }
 
+/// Resolve the platform-neutral element handle to use for live actions.
+pub fn element_handle_for_action(element: ElementRef) -> Result<ElementHandle> {
+    if let Some(handle) = element.element_handle {
+        return Ok(handle);
+    }
+    if let Some(id) = element.backend_dom_node_id {
+        return Ok(ElementHandle::CdpBackendNodeId(id));
+    }
+    Err(anyhow!(
+        "ref {} ({}/{}) is not actionable — run browser_snapshot again or use another element",
+        element.ref_id,
+        element.role,
+        element.name
+    ))
+}
+
 /// One-shot click attempt on a backend DOM node (no retry).
+#[cfg(target_os = "windows")]
 pub fn try_click_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -131,6 +153,7 @@ pub fn try_click_backend_node(
 /// When `keep_focus_for_submit` is true the script skips its trailing
 /// `blur()`, so a following Enter key press lands on the still-focused element
 /// and triggers implicit form submission.
+#[cfg(target_os = "windows")]
 pub fn try_type_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -138,7 +161,10 @@ pub fn try_type_backend_node(
     keep_focus_for_submit: bool,
     on_done: Box<dyn FnOnce(Result<()>) + 'static>,
 ) -> Result<()> {
-    let args = vec![json!({ "value": text }), json!({ "value": keep_focus_for_submit })];
+    let args = vec![
+        json!({ "value": text }),
+        json!({ "value": keep_focus_for_submit }),
+    ];
     invoke_on_backend_node(
         session,
         backend_node_id,
@@ -165,15 +191,23 @@ const BOUNDING_RECT_SCRIPT: &str = r#"function() {
 }"#;
 
 /// One-shot "measure this element's page-coordinate bounding box".
+#[cfg(target_os = "windows")]
 pub fn try_bounding_rect_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
     on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
 ) -> Result<()> {
-    invoke_on_backend_node(session, backend_node_id, BOUNDING_RECT_SCRIPT, None, on_done)
+    invoke_on_backend_node(
+        session,
+        backend_node_id,
+        BOUNDING_RECT_SCRIPT,
+        None,
+        on_done,
+    )
 }
 
 /// One-shot "scroll this element into view" on a backend DOM node.
+#[cfg(target_os = "windows")]
 pub fn try_scroll_into_view_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -203,6 +237,7 @@ const DROP_SCRIPT: &str = r#"function(data, mime) {
 }"#;
 
 /// One-shot synthetic drop of `data` (MIME `mime`) onto a backend node.
+#[cfg(target_os = "windows")]
 pub fn try_drop_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -210,10 +245,7 @@ pub fn try_drop_backend_node(
     mime: Option<&str>,
     on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
 ) -> Result<()> {
-    let args = vec![
-        json!({ "value": data }),
-        json!({ "value": mime }),
-    ];
+    let args = vec![json!({ "value": data }), json!({ "value": mime })];
     invoke_on_backend_node(session, backend_node_id, DROP_SCRIPT, Some(&args), on_done)
 }
 
@@ -225,6 +257,7 @@ const FOCUS_SCRIPT: &str = r#"function() {
 }"#;
 
 /// One-shot "scroll into view + focus" on a backend node.
+#[cfg(target_os = "windows")]
 pub fn try_focus_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -245,6 +278,7 @@ const SET_CHECKED_SCRIPT: &str = r#"function(checked) {
 }"#;
 
 /// One-shot "set checked" on a checkbox/radio backend node.
+#[cfg(target_os = "windows")]
 pub fn try_set_checked_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -252,7 +286,13 @@ pub fn try_set_checked_backend_node(
     on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
 ) -> Result<()> {
     let args = vec![json!({ "value": checked })];
-    invoke_on_backend_node(session, backend_node_id, SET_CHECKED_SCRIPT, Some(&args), on_done)
+    invoke_on_backend_node(
+        session,
+        backend_node_id,
+        SET_CHECKED_SCRIPT,
+        Some(&args),
+        on_done,
+    )
 }
 
 // Select `<option>`s in a `<select>` by value, label, or visible text; fire
@@ -277,6 +317,7 @@ const SELECT_OPTION_SCRIPT: &str = r#"function(values) {
 
 /// One-shot "select option(s)" on a `<select>` backend node. `values` is a JSON
 /// array of strings (matched against option value/label/text).
+#[cfg(target_os = "windows")]
 pub fn try_select_option_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -284,7 +325,13 @@ pub fn try_select_option_backend_node(
     on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
 ) -> Result<()> {
     let args = vec![json!({ "value": values })];
-    invoke_on_backend_node(session, backend_node_id, SELECT_OPTION_SCRIPT, Some(&args), on_done)
+    invoke_on_backend_node(
+        session,
+        backend_node_id,
+        SELECT_OPTION_SCRIPT,
+        Some(&args),
+        on_done,
+    )
 }
 
 // Scroll the element to viewport centre and return that centre point in
@@ -296,6 +343,7 @@ const HOVER_POINT_SCRIPT: &str = r#"function() {
 }"#;
 
 /// One-shot "scroll into view + report viewport-centre point" for hover.
+#[cfg(target_os = "windows")]
 pub fn try_hover_point_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -337,15 +385,23 @@ const DURABLE_SELECTOR_SCRIPT: &str = r#"function() {
 
 /// One-shot "compute a durable unique selector" for a backend node. The result
 /// is `{ k, v }` (see `DURABLE_SELECTOR_SCRIPT`).
+#[cfg(target_os = "windows")]
 pub fn try_durable_selector_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
     on_done: Box<dyn FnOnce(Result<Value>) + 'static>,
 ) -> Result<()> {
-    invoke_on_backend_node(session, backend_node_id, DURABLE_SELECTOR_SCRIPT, None, on_done)
+    invoke_on_backend_node(
+        session,
+        backend_node_id,
+        DURABLE_SELECTOR_SCRIPT,
+        None,
+        on_done,
+    )
 }
 
 /// Run `functionDeclaration` on the node identified by `backend_node_id`.
+#[cfg(target_os = "windows")]
 pub fn invoke_on_backend_node(
     session: &WebView2Session,
     backend_node_id: i32,
@@ -364,50 +420,56 @@ pub fn invoke_on_backend_node(
         &webview_for_enable,
         "DOM.enable",
         "{}",
-        Box::new(move |enable_raw| match enable_raw.and_then(|raw| parse_cdp_response(raw)) {
-            Err(err) => finish(&enable_completion, Err(err)),
-            Ok(_) => {
-                let resolve_params = json!({ "backendNodeId": backend_node_id }).to_string();
-                let webview_for_resolve = webview.clone();
-                let function_declaration = function_declaration.clone();
-                let arguments = arguments.clone();
-                let completion = completion.clone();
-                let _ = call_devtools_on_webview(
-                    &webview_for_resolve,
-                    "DOM.resolveNode",
-                    &resolve_params,
-                    Box::new(move |resolve_raw| {
-                        let resolve_completion = completion.clone();
-                        match resolve_raw
-                            .and_then(|raw| parse_cdp_response(raw))
-                            .and_then(|value| object_id_from_resolve(&value))
-                        {
-                            Err(err) => finish(&resolve_completion, Err(err)),
-                            Ok(object_id) => {
-                                let call_params = call_function_on_params(
-                                    &object_id,
-                                    &function_declaration,
-                                    arguments.as_deref(),
-                                );
-                                let call_completion = completion.clone();
-                                let webview_for_call = webview.clone();
-                                let _ = call_devtools_on_webview(
-                                    &webview_for_call,
-                                    "Runtime.callFunctionOn",
-                                    &call_params,
-                                    Box::new(move |call_raw| {
-                                        finish(&call_completion, parse_call_function_result(call_raw));
-                                    }),
-                                );
+        Box::new(
+            move |enable_raw| match enable_raw.and_then(|raw| parse_cdp_response(raw)) {
+                Err(err) => finish(&enable_completion, Err(err)),
+                Ok(_) => {
+                    let resolve_params = json!({ "backendNodeId": backend_node_id }).to_string();
+                    let webview_for_resolve = webview.clone();
+                    let function_declaration = function_declaration.clone();
+                    let arguments = arguments.clone();
+                    let completion = completion.clone();
+                    let _ = call_devtools_on_webview(
+                        &webview_for_resolve,
+                        "DOM.resolveNode",
+                        &resolve_params,
+                        Box::new(move |resolve_raw| {
+                            let resolve_completion = completion.clone();
+                            match resolve_raw
+                                .and_then(|raw| parse_cdp_response(raw))
+                                .and_then(|value| object_id_from_resolve(&value))
+                            {
+                                Err(err) => finish(&resolve_completion, Err(err)),
+                                Ok(object_id) => {
+                                    let call_params = call_function_on_params(
+                                        &object_id,
+                                        &function_declaration,
+                                        arguments.as_deref(),
+                                    );
+                                    let call_completion = completion.clone();
+                                    let webview_for_call = webview.clone();
+                                    let _ = call_devtools_on_webview(
+                                        &webview_for_call,
+                                        "Runtime.callFunctionOn",
+                                        &call_params,
+                                        Box::new(move |call_raw| {
+                                            finish(
+                                                &call_completion,
+                                                parse_call_function_result(call_raw),
+                                            );
+                                        }),
+                                    );
+                                }
                             }
-                        }
-                    }),
-                );
-            }
-        }),
+                        }),
+                    );
+                }
+            },
+        ),
     )
 }
 
+#[cfg(target_os = "windows")]
 fn call_function_on_params(
     object_id: &str,
     function_declaration: &str,
@@ -425,6 +487,7 @@ fn call_function_on_params(
     params.to_string()
 }
 
+#[cfg(target_os = "windows")]
 fn object_id_from_resolve(value: &Value) -> Result<String> {
     value
         .get("object")
@@ -434,6 +497,7 @@ fn object_id_from_resolve(value: &Value) -> Result<String> {
         .ok_or_else(|| anyhow!("DOM.resolveNode response missing object.objectId"))
 }
 
+#[cfg(target_os = "windows")]
 fn parse_call_function_result(raw: Result<String>) -> Result<Value> {
     let value = raw.and_then(parse_cdp_response)?;
     if let Some(details) = value.get("exceptionDetails") {
@@ -447,14 +511,37 @@ fn parse_call_function_result(raw: Result<String>) -> Result<Value> {
     Ok(value.get("result").cloned().unwrap_or(value))
 }
 
-pub(crate) type SessionAttempt =
-    Arc<dyn Fn(&WebView2Session, Box<dyn FnOnce(Result<()>) + 'static>) -> Result<()> + Send + Sync>;
+#[cfg(target_os = "windows")]
+pub(crate) type SessionAttempt = Arc<
+    dyn Fn(&WebView2Session, Box<dyn FnOnce(Result<()>) + 'static>) -> Result<()> + Send + Sync,
+>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn element_handle_for_action_prefers_platform_handle() {
+        let element = ElementRef {
+            ref_id: "e1".into(),
+            ax_node_id: "2".into(),
+            backend_dom_node_id: Some(42),
+            element_handle: Some(ElementHandle::CdpBackendNodeId(42)),
+            role: "button".into(),
+            name: "Save".into(),
+            durable_selector: None,
+            dup_index: 0,
+            dup_count: 1,
+            frame_selector: None,
+        };
+
+        assert_eq!(
+            element_handle_for_action(element).unwrap(),
+            ElementHandle::CdpBackendNodeId(42)
+        );
+    }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn object_id_from_resolve_parses_cdp_shape() {
         let value = json!({
             "object": {
@@ -466,12 +553,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn parse_call_function_result_surfaces_exception() {
         let raw = Ok(r#"{"exceptionDetails":{"text":"element is disabled"}}"#.to_string());
         assert!(parse_call_function_result(raw).is_err());
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn call_function_on_params_includes_arguments() {
         let params: Value = serde_json::from_str(&call_function_on_params(
             "OBJ",

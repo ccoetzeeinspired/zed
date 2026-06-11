@@ -86,9 +86,12 @@ pub async fn select(
     cx: &mut AsyncApp,
 ) -> Result<Value> {
     let tabs = cx.update(|app| collect_tabs(&workspace, app));
-    let (view, _) = tabs
-        .get(index)
-        .ok_or_else(|| anyhow!("tab index {index} out of range ({} tab(s) open)", tabs.len()))?;
+    let (view, _) = tabs.get(index).ok_or_else(|| {
+        anyhow!(
+            "tab index {index} out of range ({} tab(s) open)",
+            tabs.len()
+        )
+    })?;
     let view = view.clone();
 
     let activated = cx.update_window(window, |_, window, cx| {
@@ -98,7 +101,9 @@ pub async fn select(
         })
     })?;
     if !activated {
-        return Err(anyhow!("failed to activate tab {index} (not found in any pane)"));
+        return Err(anyhow!(
+            "failed to activate tab {index} (not found in any pane)"
+        ));
     }
 
     snapshot_json(&workspace, cx)
@@ -129,9 +134,12 @@ pub async fn close(
     cx: &mut AsyncApp,
 ) -> Result<Value> {
     let tabs = cx.update(|app| collect_tabs(&workspace, app));
-    let (view, _) = tabs
-        .get(index)
-        .ok_or_else(|| anyhow!("tab index {index} out of range ({} tab(s) open)", tabs.len()))?;
+    let (view, _) = tabs.get(index).ok_or_else(|| {
+        anyhow!(
+            "tab index {index} out of range ({} tab(s) open)",
+            tabs.len()
+        )
+    })?;
     let view = view.clone();
     let item_id = view.entity_id();
 

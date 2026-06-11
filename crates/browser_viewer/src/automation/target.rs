@@ -22,9 +22,7 @@ pub fn resolve_automation_target(workspace: &Workspace, cx: &App) -> Option<Enti
 pub fn resolve_automation_target_global(cx: &App) -> Option<Entity<BrowserView>> {
     let app_state = AppState::global(cx);
     let store = app_state.workspace_store.read(cx);
-    let window_handles = cx
-        .window_stack()
-        .unwrap_or_else(|| cx.windows());
+    let window_handles = cx.window_stack().unwrap_or_else(|| cx.windows());
 
     for window in window_handles {
         for (ws_window, weak) in store.workspaces_with_windows() {
@@ -46,9 +44,7 @@ pub fn resolve_automation_target_global(cx: &App) -> Option<Entity<BrowserView>>
         let Some(workspace) = weak.upgrade() else {
             continue;
         };
-        if let Some(browser) =
-            workspace.read_with(cx, |ws, cx| resolve_automation_target(ws, cx))
-        {
+        if let Some(browser) = workspace.read_with(cx, |ws, cx| resolve_automation_target(ws, cx)) {
             return Some(browser);
         }
     }
