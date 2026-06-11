@@ -31,6 +31,13 @@ unsafe extern "C" {}
 
 pub type NativeView = id;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WKPageState {
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub is_loading: bool,
+}
+
 pub struct WKWebViewSession {
     parent: NativeView,
     host: NativeView,
@@ -163,6 +170,25 @@ impl WKWebViewSession {
             let _: id = msg_send![self.webview, loadRequest: request];
         }
         Ok(())
+    }
+
+    pub fn page_state(&self) -> WKPageState {
+        unsafe {
+            let url: id = msg_send![self.webview, URL];
+            let absolute_url: id = if url == nil {
+                nil
+            } else {
+                msg_send![url, absoluteString]
+            };
+            let title: id = msg_send![self.webview, title];
+            let is_loading: bool = msg_send![self.webview, isLoading];
+
+            WKPageState {
+                url: ns_string_to_string(absolute_url),
+                title: ns_string_to_string(title),
+                is_loading,
+            }
+        }
     }
 
     pub fn can_go_back(&self) -> bool {

@@ -28,6 +28,8 @@ use gpui::{
     Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, Style, WeakEntity, Window, anchored,
     deferred, div, point, px, relative, size,
 };
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 use ui::Tooltip;
 use ui::prelude::*;
 use workspace::{
@@ -68,9 +70,12 @@ use windows_imports::*;
 #[cfg(target_os = "windows")]
 use crate::webview2_host::{NavigationEvent, WebView2Session, initialize};
 #[cfg(target_os = "macos")]
-use crate::wkwebview_host::WKWebViewSession;
+use crate::wkwebview_host::{WKPageState, WKWebViewSession};
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+#[cfg(target_os = "macos")]
+const MACOS_PAGE_STATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// One notch on a mouse wheel; matches Win32 `WHEEL_DELTA`.
 #[cfg(target_os = "windows")]
@@ -140,7 +145,6 @@ pub struct BrowserItem {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeSurfaceVisibilityUpdate {
     Show,
-    Hide,
     Unchanged,
 }
 
@@ -150,14 +154,11 @@ enum UrlEditorSync {
     PreserveUserInput,
 }
 
-fn native_surface_visibility_update(
-    is_active_item: bool,
-    is_visible: bool,
-) -> NativeSurfaceVisibilityUpdate {
-    match (is_active_item, is_visible) {
-        (true, false) => NativeSurfaceVisibilityUpdate::Show,
-        (false, true) => NativeSurfaceVisibilityUpdate::Hide,
-        _ => NativeSurfaceVisibilityUpdate::Unchanged,
+fn native_surface_visibility_update(is_visible: bool) -> NativeSurfaceVisibilityUpdate {
+    if is_visible {
+        NativeSurfaceVisibilityUpdate::Unchanged
+    } else {
+        NativeSurfaceVisibilityUpdate::Show
     }
 }
 
@@ -171,6 +172,11 @@ fn url_editor_sync_policy(editor_focused: bool, force_sync: bool) -> UrlEditorSy
     } else {
         UrlEditorSync::PreserveUserInput
     }
+}
+
+#[cfg(target_os = "macos")]
+fn should_release_native_browser_focus(editor_focused: bool) -> bool {
+    editor_focused
 }
 
 impl BrowserItem {
@@ -673,10 +679,16 @@ impl BrowserView {
         let input = self.url_editor.read(cx).text(cx);
         let search_url = crate::BrowserSettings::get_global(cx).search_url.clone();
         let target = parse_address_bar_input(&input, &search_url);
+        self.url_editor.update(cx, |editor, cx| {
+            editor.set_text(target.as_str(), window, cx);
+        });
         #[cfg(target_os = "windows")]
         self.navigate_to(target, cx);
         #[cfg(target_os = "macos")]
-        self.navigate_to(target, cx);
+        {
+            self.navigate_to(target, cx);
+            window.focus(&self.focus_handle, cx);
+        }
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let _ = (target, cx);
     }
@@ -1047,9 +1059,8 @@ impl Render for BrowserView {
         }
         #[cfg(target_os = "macos")]
         {
-            let is_active_item = self.is_active_pane_item(cx);
             self.item.update(cx, |item, _| {
-                match native_surface_visibility_update(is_active_item, item.is_visible) {
+                match native_surface_visibility_update(item.is_visible) {
                     NativeSurfaceVisibilityUpdate::Show => {
                         if let Some(session) = item.session.as_ref()
                             && let Err(err) = session.set_visible(true)
@@ -1058,18 +1069,6 @@ impl Render for BrowserView {
                             return;
                         }
                         item.is_visible = true;
-                    }
-                    NativeSurfaceVisibilityUpdate::Hide => {
-                        if let Some(session) = item.session.as_ref() {
-                            session.release_keyboard_focus();
-                            if let Err(err) = session.set_visible(false) {
-                                log::warn!(
-                                    "BrowserItem: hide inactive WKWebView on render failed: {err:?}"
-                                );
-                                return;
-                            }
-                        }
-                        item.is_visible = false;
                     }
                     NativeSurfaceVisibilityUpdate::Unchanged => {}
                 }
@@ -1102,7 +1101,7 @@ impl Render for BrowserView {
         let model_url = self.item.read(cx).url.clone();
         let editor_focused = self.url_editor.focus_handle(cx).is_focused(window);
         #[cfg(target_os = "macos")]
-        if editor_focused || !self.focus_handle.is_focused(window) {
+        if should_release_native_browser_focus(editor_focused) {
             self.item.update(cx, |item, _| {
                 if let Some(session) = item.session.as_ref() {
                     session.release_keyboard_focus();
@@ -1865,22 +1864,23 @@ impl Item for BrowserView {
     }
 
     fn workspace_deactivated(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.release_native_browser_focus(cx);
+        }
+        #[cfg(not(target_os = "macos"))]
         self.hide_native_browser_surface(cx);
     }
 }
 
 impl BrowserView {
     #[cfg(target_os = "macos")]
-    fn is_active_pane_item(&self, cx: &Context<Self>) -> bool {
-        let Some(workspace) = self.workspace.as_ref().and_then(WeakEntity::upgrade) else {
-            return true;
-        };
-
-        workspace
-            .read(cx)
-            .pane_for_item_id(cx.entity_id())
-            .and_then(|pane| pane.read(cx).active_item())
-            .is_some_and(|active_item| active_item.item_id() == cx.entity_id())
+    fn release_native_browser_focus(&self, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            if let Some(session) = item.session.as_ref() {
+                session.release_keyboard_focus();
+            }
+        });
     }
 
     #[cfg(target_os = "macos")]
@@ -2187,7 +2187,54 @@ fn start_session(
     item.init_started = true;
     item.last_bounds = Some(bounds);
     cx.notify();
+    let background = cx.background_executor().clone();
+    cx.spawn(async move |this, cx| {
+        loop {
+            background.timer(MACOS_PAGE_STATE_POLL_INTERVAL).await;
+
+            let page_state = this
+                .update(cx, |item, _| {
+                    item.session.as_ref().map(WKWebViewSession::page_state)
+                })
+                .ok()
+                .flatten();
+            let Some(page_state) = page_state else {
+                break;
+            };
+
+            if this
+                .update(cx, |item, cx| {
+                    apply_macos_page_state(item, page_state);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_page_state(item: &mut BrowserItem, page_state: WKPageState) {
+    if let Some(url) = page_state.url
+        && !url.is_empty()
+        && item.url.as_ref() != url
+    {
+        item.url = SharedString::new(url);
+        item.automation_state.bump_page_generation();
+    }
+
+    if let Some(title) = page_state.title {
+        let trimmed_title = title.trim();
+        if !trimmed_title.is_empty() && item.title.as_ref() != trimmed_title {
+            item.title = SharedString::new(trimmed_title);
+        }
+    }
+
+    item.is_loading = page_state.is_loading;
 }
 
 #[cfg(target_os = "windows")]
@@ -2719,19 +2766,11 @@ mod tests {
     #[test]
     fn native_browser_surface_visibility_tracks_active_item() {
         assert_eq!(
-            native_surface_visibility_update(true, false),
+            native_surface_visibility_update(false),
             NativeSurfaceVisibilityUpdate::Show
         );
         assert_eq!(
-            native_surface_visibility_update(false, true),
-            NativeSurfaceVisibilityUpdate::Hide
-        );
-        assert_eq!(
-            native_surface_visibility_update(true, true),
-            NativeSurfaceVisibilityUpdate::Unchanged
-        );
-        assert_eq!(
-            native_surface_visibility_update(false, false),
+            native_surface_visibility_update(true),
             NativeSurfaceVisibilityUpdate::Unchanged
         );
     }
@@ -2752,5 +2791,51 @@ mod tests {
         );
         assert_eq!(url_editor_sync_policy(true, true), UrlEditorSync::Sync);
         assert_eq!(url_editor_sync_policy(false, false), UrlEditorSync::Sync);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_releases_page_focus_only_for_focused_url_editor() {
+        assert!(should_release_native_browser_focus(true));
+        assert!(!should_release_native_browser_focus(false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_page_state_updates_model_from_native_wk_state() {
+        let mut item = BrowserItem::new(SharedString::new("https://example.com"));
+
+        apply_macos_page_state(
+            &mut item,
+            WKPageState {
+                url: Some("https://youtube.com/watch?v=123".to_string()),
+                title: Some("Video title".to_string()),
+                is_loading: true,
+            },
+        );
+
+        assert_eq!(item.url.as_ref(), "https://youtube.com/watch?v=123");
+        assert_eq!(item.title.as_ref(), "Video title");
+        assert!(item.is_loading);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_page_state_ignores_empty_native_title() {
+        let mut item = BrowserItem::new(SharedString::new("https://example.com"));
+        item.title = SharedString::new("Existing");
+
+        apply_macos_page_state(
+            &mut item,
+            WKPageState {
+                url: Some("https://example.com/".to_string()),
+                title: Some("".to_string()),
+                is_loading: false,
+            },
+        );
+
+        assert_eq!(item.url.as_ref(), "https://example.com/");
+        assert_eq!(item.title.as_ref(), "Existing");
+        assert!(!item.is_loading);
     }
 }

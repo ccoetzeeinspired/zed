@@ -186,6 +186,10 @@ unsafe fn build_classes() {
                     handle_view_event as extern "C" fn(&Object, Sel, id),
                 );
                 decl.add_method(
+                    sel!(hitTest:),
+                    hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+                );
+                decl.add_method(
                     sel!(magnifyWithEvent:),
                     handle_view_event as extern "C" fn(&Object, Sel, id),
                 );
@@ -315,6 +319,40 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
         // macOS screen coordinates are relative to bottom left
         window_height - px(position.y as f32),
     )
+}
+
+fn scaled_bounds_to_pixels(
+    bounds: Bounds<gpui::ScaledPixels>,
+    scale_factor: f32,
+) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(
+            px(bounds.origin.x.as_f32() / scale_factor),
+            px(bounds.origin.y.as_f32() / scale_factor),
+        ),
+        size: size(
+            px(bounds.size.width.as_f32() / scale_factor),
+            px(bounds.size.height.as_f32() / scale_factor),
+        ),
+    }
+}
+
+fn native_cutout_hit_test_bounds(scene: &gpui::Scene, native_window: id) -> Vec<Bounds<Pixels>> {
+    let scale_factor = unsafe {
+        let scale_factor: f64 = msg_send![native_window, backingScaleFactor];
+        scale_factor as f32
+    };
+
+    scene
+        .cutouts
+        .iter()
+        .map(|cutout| {
+            scaled_bounds_to_pixels(cutout.bounds, scale_factor).intersect(
+                &scaled_bounds_to_pixels(cutout.content_mask.bounds, scale_factor),
+            )
+        })
+        .filter(|bounds| bounds.size.width > px(0.) && bounds.size.height > px(0.))
+        .collect()
 }
 
 /// Stores the cursor style on the active GPUI window and invalidates its cursor rects.
@@ -506,6 +544,7 @@ struct MacWindowState {
     closed: Arc<AtomicBool>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    native_cutout_hit_test_bounds: Vec<Bounds<Pixels>>,
 }
 
 impl MacWindowState {
@@ -834,6 +873,7 @@ impl MacWindow {
                 activated_least_once: false,
                 closed: Arc::new(AtomicBool::new(false)),
                 sheet_parent: None,
+                native_cutout_hit_test_bounds: Vec::new(),
             })));
 
             (*native_window).set_ivar(
@@ -1638,6 +1678,8 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
+        this.native_cutout_hit_test_bounds =
+            native_cutout_hit_test_bounds(scene, this.native_window);
         this.renderer.draw(scene);
     }
 
@@ -1803,6 +1845,23 @@ extern "C" fn dealloc_view(this: &Object, _: Sel) {
     unsafe {
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
+    }
+}
+
+extern "C" fn hit_test(this: &Object, _: Sel, position: NSPoint) -> id {
+    let window_state = unsafe { get_window_state(this) };
+    let should_pass_through = {
+        let lock = window_state.lock();
+        let point = convert_mouse_position(position, lock.content_size().height);
+        lock.native_cutout_hit_test_bounds
+            .iter()
+            .any(|bounds| bounds.contains(&point))
+    };
+
+    if should_pass_through {
+        nil
+    } else {
+        unsafe { msg_send![super(this, class!(NSView)), hitTest: position] }
     }
 }
 
