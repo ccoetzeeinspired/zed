@@ -11,7 +11,7 @@ const server = new McpServer({
     version: "0.1.0",
     description: "Controls the embedded browser tab inside Zed/ACP, not an external or generic Codex browser.",
 }, {
-    instructions: "Use zed-browser first for any request about the browser visible inside Zed, ACP chat, @Browser/current browser context, Takealot pages opened in Zed, or end-to-end testing in the embedded Zed browser. Prefer browser_snapshot before screenshots or external web search so actions are grounded in the current Zed tab.",
+    instructions: "Use zed-browser first for any request about the browser visible inside Zed, ACP chat, @Browser/current browser context, Takealot pages opened in Zed, or end-to-end testing in the embedded Zed browser. After navigation or page-changing actions, call browser_wait_for for load, URL, visible text, or element visibility before taking another snapshot. Prefer browser_snapshot for structure and browser_wait_for/browser_verify_* for assertions before screenshots, coordinate clicks, or external web search.",
 });
 function textContent(text) {
     return { content: [{ type: "text", text }] };
@@ -507,28 +507,60 @@ server.tool("browser_tabs", "List, select, open, or close browser tabs in the em
     const body = lines.length ? lines.join("\n") : "(no browser tabs open)";
     return textContent(`### Browser tabs (${result.count ?? tabs.length})\n${body}`);
 });
-server.tool("browser_wait_for", "Wait for text to appear or a specified time to pass in the embedded Zed browser tab", {
+server.tool("browser_wait_for", "Wait in the embedded Zed browser tab for load, URL, visible text, text disappearance, or snapshot-ref element visibility. Use this after navigation/scroll/actions and before screenshot loops.", {
     time: z.number().optional().describe("Time to wait in seconds"),
     text: z.string().optional().describe("Text to wait for on the page"),
     textGone: z
         .string()
         .optional()
         .describe("Text to wait to disappear from the page"),
-}, async ({ time, text, textGone }) => {
-    if (textGone) {
-        await requireZedOk(await callZedAutomation("wait_for", { textGone }));
-        return textContent(`Text gone ${JSON.stringify(textGone)}`);
-    }
-    if (text) {
-        await requireZedOk(await callZedAutomation("wait_for", { text }));
-        return textContent(`Found text ${JSON.stringify(text)}`);
-    }
+    url: z.string().optional().describe("Exact URL to wait for"),
+    urlContains: z
+        .string()
+        .optional()
+        .describe("URL substring to wait for"),
+    ref: z
+        .string()
+        .optional()
+        .describe("Snapshot ref (e.g. e14) whose element should become visible"),
+    waitLoad: z
+        .boolean()
+        .optional()
+        .describe("Whether to also wait for document load completion"),
+    timeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Timeout in milliseconds"),
+}, async ({ time, text, textGone, url, urlContains, ref, waitLoad, timeoutMs }) => {
+    const hasCondition = Boolean(text || textGone || url || urlContains || ref);
     if (time != null && time > 0) {
         await requireZedOk(await callZedAutomation("wait_for", { time }));
         return textContent(`Waited ${time}s`);
     }
-    await requireZedOk(await callZedAutomation("wait_for", { wait_load: true }));
-    return textContent("Page load complete");
+    const result = await requireZedOk(await callZedAutomation("wait_for", {
+        ...(text ? { text } : {}),
+        ...(textGone ? { textGone } : {}),
+        ...(url ? { url } : {}),
+        ...(urlContains ? { urlContains } : {}),
+        ...(ref ? { ref } : {}),
+        ...(waitLoad != null ? { waitLoad } : hasCondition ? {} : { wait_load: true }),
+        ...(timeoutMs != null ? { timeoutMs } : {}),
+    }));
+    const checks = result.checks
+        ? Object.entries(result.checks)
+            .filter(([, value]) => value != null)
+            .map(([key, value]) => `${key}=${value}`)
+            .join(", ")
+        : "";
+    const state = [
+        result.url ? `url=${result.url}` : undefined,
+        result.title ? `title=${JSON.stringify(result.title)}` : undefined,
+        result.readyState ? `readyState=${result.readyState}` : undefined,
+        checks ? `checks: ${checks}` : undefined,
+    ].filter(Boolean).join("\n");
+    return textContent(`Wait complete${state ? `\n${state}` : ""}`);
 });
 server.tool("browser_navigate_back", "Go back to the previous page in the embedded Zed browser tab", {}, async () => {
     const result = (await requireZedOk(await callZedAutomation("navigate_back")));

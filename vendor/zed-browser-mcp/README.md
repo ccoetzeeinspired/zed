@@ -59,7 +59,7 @@ For **claude-acp**, configured `context_servers` are forwarded automatically as 
 | `browser_snapshot` | Accessibility YAML + `eN` refs |
 | `browser_click` | Click by ref (`target` or `ref`) |
 | `browser_type` | Type into input by ref |
-| `browser_wait_for` | Wait for load, text, or time |
+| `browser_wait_for` | Wait for load, URL, visible text, text-gone, element ref, or time |
 
 ## IPC
 
@@ -75,7 +75,11 @@ Protocol: one JSON line per request/response:
 ## Agent loop example
 
 ```text
-browser_navigate → browser_wait_for → browser_snapshot → browser_type / browser_click → …
+browser_navigate → browser_wait_for(url/text/load) → browser_snapshot → browser_wait_for(ref/text) → browser_type / browser_click → …
 ```
+
+Use `browser_wait_for` and `browser_verify_*` for structured assertions before
+falling back to screenshots. Screenshots are for visual confirmation, not the
+primary way to search for text or prove navigation.
 
 Always re-snapshot after navigation — refs are invalidated on page change.
