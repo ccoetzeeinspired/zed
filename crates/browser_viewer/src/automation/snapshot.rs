@@ -640,4 +640,76 @@ mod tests {
         assert!(snap.yaml.contains("link \"More information\""));
         assert_eq!(snap.ref_count, 2);
     }
+
+    #[test]
+    fn snapshot_preserves_commerce_heading_and_product_refs() {
+        let tree = serde_json::json!({
+            "nodes": [
+                {
+                    "nodeId": "1",
+                    "role": { "value": "RootWebArea" },
+                    "name": { "value": "Shop" },
+                    "childIds": ["2"]
+                },
+                {
+                    "nodeId": "2",
+                    "role": { "value": "heading" },
+                    "name": { "value": "Thanksalot Cellphones & Wearable Deals" },
+                    "properties": [{ "name": "level", "value": { "value": "2" } }],
+                    "wkDomToken": "heading-token",
+                    "childIds": ["3", "4"]
+                },
+                {
+                    "nodeId": "3",
+                    "role": { "value": "link" },
+                    "name": { "value": "Samsung Galaxy Fit3 Silver" },
+                    "wkDomToken": "product-token",
+                    "durableSelector": "[href=\"/samsung-galaxy-fit3-silver\"]",
+                    "durableSelectorKind": "css",
+                    "childIds": []
+                },
+                {
+                    "nodeId": "4",
+                    "role": { "value": "button" },
+                    "name": { "value": "View More" },
+                    "wkDomToken": "view-more-token",
+                    "childIds": []
+                }
+            ]
+        });
+
+        let snap = snapshot_from_ax_tree(tree, 11).unwrap();
+
+        assert!(
+            snap.yaml
+                .contains("heading \"Thanksalot Cellphones & Wearable Deals\" [level=2] [ref=e")
+        );
+        assert!(
+            snap.yaml
+                .contains("  - link \"Samsung Galaxy Fit3 Silver\" [ref=e")
+        );
+        assert!(snap.yaml.contains("  - button \"View More\" [ref=e"));
+        assert!(
+            !snap.yaml.contains(
+                "Thanksalot Cellphones & Wearable Deals Samsung Galaxy Fit3 Silver View More"
+            ),
+            "commerce sections must not collapse into one descendant text blob"
+        );
+
+        let product = snap.registry.get("e3").expect("product ref");
+        assert_eq!(product.role, "link");
+        assert_eq!(product.name, "Samsung Galaxy Fit3 Silver");
+        assert_eq!(
+            product.element_handle,
+            Some(crate::automation::session::ElementHandle::WkDomToken(
+                "product-token".into()
+            ))
+        );
+        assert_eq!(
+            product.durable_selector,
+            Some(crate::automation::session::DurableSelector::Css(
+                "[href=\"/samsung-galaxy-fit3-silver\"]".into()
+            ))
+        );
+    }
 }
