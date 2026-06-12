@@ -179,6 +179,19 @@ fn should_release_native_browser_focus(editor_focused: bool) -> bool {
     editor_focused
 }
 
+#[cfg(target_os = "macos")]
+fn should_release_native_browser_focus_on_external_mouse_down() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn should_release_native_browser_focus_for_mouse_down(
+    mouse_position: Point<Pixels>,
+    viewport_bounds: Option<Bounds<Pixels>>,
+) -> bool {
+    viewport_bounds.is_none_or(|bounds| !bounds.contains(&mouse_position))
+}
+
 impl BrowserItem {
     fn new(url: SharedString) -> Self {
         Self {
@@ -320,16 +333,9 @@ impl BrowserView {
         })
         .detach();
 
-        let focus_handle = cx.focus_handle();
-        #[cfg(target_os = "macos")]
-        cx.on_blur(&focus_handle, window, |this, _window, cx| {
-            this.release_native_browser_focus(cx);
-        })
-        .detach();
-
         Self {
             item,
-            focus_handle,
+            focus_handle: cx.focus_handle(),
             url_editor,
             design_prompt_editor,
             workspace: None,
@@ -1184,6 +1190,16 @@ impl Render for BrowserView {
         let root = root
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up));
+
+        #[cfg(target_os = "macos")]
+        let root = root.on_mouse_down_out(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+            let viewport_bounds = this.item.read(cx).last_bounds;
+            if should_release_native_browser_focus_on_external_mouse_down()
+                && should_release_native_browser_focus_for_mouse_down(ev.position, viewport_bounds)
+            {
+                this.release_native_browser_focus(cx);
+            }
+        }));
 
         let mut tree = root
             .size_full()
@@ -2802,9 +2818,37 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_render_releases_page_focus_only_for_focused_url_editor() {
+    fn macos_releases_page_focus_only_for_focused_url_editor() {
         assert!(should_release_native_browser_focus(true));
         assert!(!should_release_native_browser_focus(false));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_releases_page_focus_when_clicking_outside_browser_view() {
+        assert!(should_release_native_browser_focus_on_external_mouse_down());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keeps_page_focus_for_clicks_inside_native_viewport() {
+        let viewport = Bounds {
+            origin: point(px(10.), px(20.)),
+            size: size(px(300.), px(200.)),
+        };
+
+        assert!(!should_release_native_browser_focus_for_mouse_down(
+            point(px(25.), px(40.)),
+            Some(viewport),
+        ));
+        assert!(should_release_native_browser_focus_for_mouse_down(
+            point(px(5.), px(40.)),
+            Some(viewport),
+        ));
+        assert!(should_release_native_browser_focus_for_mouse_down(
+            point(px(25.), px(240.)),
+            Some(viewport),
+        ));
     }
 
     #[cfg(target_os = "macos")]
