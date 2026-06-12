@@ -66,6 +66,28 @@ struct MacosFormField {
     kind: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacosWaitOptions {
+    wait_load: bool,
+    text: Option<String>,
+    text_gone: Option<String>,
+    url: Option<String>,
+    url_contains: Option<String>,
+    visible_ref: Option<String>,
+    timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacosWaitState {
+    loading: bool,
+    ready_state: String,
+    title: String,
+    url: String,
+    text_visible: Option<bool>,
+    text_gone_absent: Option<bool>,
+    element_visible: Option<bool>,
+}
+
 struct GlobalBrowserAutomationIpc(async_mpsc::UnboundedSender<PendingIpcRequest>);
 
 impl Global for GlobalBrowserAutomationIpc {}
@@ -85,6 +107,159 @@ fn ipc_ok_response(id: Value, result: Value) -> String {
 fn ipc_error_response(id: Value, error: &str) -> String {
     serde_json::to_string(&json!({ "id": id, "ok": false, "error": error }))
         .unwrap_or_else(|_| format!("{{\"ok\":false,\"error\":{error:?}}}"))
+}
+
+fn parse_macos_wait_options(params: &Value) -> MacosWaitOptions {
+    let text = params
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let text_gone = params
+        .get("textGone")
+        .or_else(|| params.get("text_gone"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let url = params
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let url_contains = params
+        .get("urlContains")
+        .or_else(|| params.get("url_contains"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let visible_ref = params
+        .get("ref")
+        .or_else(|| params.get("ref_id"))
+        .or_else(|| params.get("element"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let has_condition = text.is_some()
+        || text_gone.is_some()
+        || url.is_some()
+        || url_contains.is_some()
+        || visible_ref.is_some();
+    let wait_load = params
+        .get("wait_load")
+        .or_else(|| params.get("waitLoad"))
+        .and_then(Value::as_bool)
+        .unwrap_or(!has_condition);
+    let timeout = params
+        .get("timeoutMs")
+        .or_else(|| params.get("timeout_ms"))
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT);
+
+    MacosWaitOptions {
+        wait_load,
+        text,
+        text_gone,
+        url,
+        url_contains,
+        visible_ref,
+        timeout,
+    }
+}
+
+fn macos_wait_load_ready(options: &MacosWaitOptions, state: &MacosWaitState) -> bool {
+    !options.wait_load
+        || state.ready_state == "complete"
+        || (state.ready_state.is_empty() && !state.loading)
+}
+
+fn macos_wait_ready(options: &MacosWaitOptions, state: &MacosWaitState) -> bool {
+    macos_wait_load_ready(options, state)
+        && options
+            .text
+            .as_deref()
+            .is_none_or(|needle| state.title.contains(needle) || state.text_visible == Some(true))
+        && options
+            .text_gone
+            .as_ref()
+            .is_none_or(|_| state.text_gone_absent == Some(true))
+        && options.url.as_deref().is_none_or(|url| state.url == url)
+        && options
+            .url_contains
+            .as_deref()
+            .is_none_or(|needle| state.url.contains(needle))
+        && options
+            .visible_ref
+            .as_ref()
+            .is_none_or(|_| state.element_visible == Some(true))
+}
+
+fn macos_wait_pending_conditions(
+    options: &MacosWaitOptions,
+    state: &MacosWaitState,
+) -> Vec<String> {
+    let mut pending = Vec::new();
+    if !macos_wait_load_ready(options, state) {
+        pending.push("load state complete".to_string());
+    }
+    if let Some(text) = options.text.as_deref()
+        && !state.title.contains(text)
+        && state.text_visible != Some(true)
+    {
+        pending.push(format!("visible text {text:?}"));
+    }
+    if let Some(text) = options.text_gone.as_deref()
+        && state.text_gone_absent != Some(true)
+    {
+        pending.push(format!("text gone {text:?}"));
+    }
+    if let Some(url) = options.url.as_deref()
+        && state.url != url
+    {
+        pending.push(format!("url equals {url:?}"));
+    }
+    if let Some(needle) = options.url_contains.as_deref()
+        && !state.url.contains(needle)
+    {
+        pending.push(format!("url contains {needle:?}"));
+    }
+    if let Some(ref_id) = options.visible_ref.as_deref()
+        && state.element_visible != Some(true)
+    {
+        pending.push(format!("element {ref_id} visible"));
+    }
+    pending
+}
+
+fn macos_wait_success_json(options: &MacosWaitOptions, state: &MacosWaitState) -> Value {
+    json!({
+        "ready": true,
+        "url": state.url,
+        "title": state.title,
+        "readyState": state.ready_state,
+        "checks": {
+            "load": options.wait_load.then_some(macos_wait_load_ready(options, state)),
+            "text": options.text.as_ref().map(|needle| {
+                state.title.contains(needle) || state.text_visible == Some(true)
+            }),
+            "textGone": options.text_gone.as_ref().map(|_| state.text_gone_absent == Some(true)),
+            "url": options.url.as_ref().map(|expected| state.url == *expected),
+            "urlContains": options.url_contains.as_ref().map(|needle| state.url.contains(needle)),
+            "elementVisible": options.visible_ref.as_ref().map(|_| state.element_visible == Some(true)),
+        }
+    })
+}
+
+fn macos_wait_timeout_message(options: &MacosWaitOptions, state: &MacosWaitState) -> String {
+    let pending = macos_wait_pending_conditions(options, state);
+    format!(
+        "browser automation wait_for timed out after {:?}; pending: {}; loading={}, readyState={:?}, title={:?}, url={}",
+        options.timeout,
+        if pending.is_empty() {
+            "unknown".to_string()
+        } else {
+            pending.join(", ")
+        },
+        state.loading,
+        state.ready_state,
+        state.title,
+        state.url
+    )
 }
 
 /// Start the automation IPC listener (loopback TCP + GPUI dispatch loop).
@@ -386,7 +561,20 @@ async fn dispatch_navigate_back(cx: &mut AsyncApp) -> Result<Value> {
     if !went_back {
         return Err(anyhow!("no back history on this tab"));
     }
-    wait_for_macos(browser.clone(), true, None, None, cx).await?;
+    wait_for_macos(
+        browser.clone(),
+        MacosWaitOptions {
+            wait_load: true,
+            text: None,
+            text_gone: None,
+            url: None,
+            url_contains: None,
+            visible_ref: None,
+            timeout: DEFAULT_WAIT_TIMEOUT,
+        },
+        cx,
+    )
+    .await?;
     let raw =
         evaluate_expression_on_browser(&browser, "(() => location.href)()".to_string(), cx).await?;
     let url = cdp_result_value(raw)
@@ -1083,17 +1271,14 @@ async fn dispatch_verify_value(params: Value, cx: &mut AsyncApp) -> Result<Value
 }
 
 async fn dispatch_wait_for(params: Value, cx: &mut AsyncApp) -> Result<Value> {
-    let text = params
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let text_gone = params
-        .get("textGone")
-        .or_else(|| params.get("text_gone"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let options = parse_macos_wait_options(&params);
 
-    if text.is_none() && text_gone.is_none() {
+    if options.text.is_none()
+        && options.text_gone.is_none()
+        && options.url.is_none()
+        && options.url_contains.is_none()
+        && options.visible_ref.is_none()
+    {
         if let Some(secs) = params.get("time").and_then(Value::as_f64) {
             if secs > 0.0 {
                 cx.background_executor()
@@ -1105,12 +1290,7 @@ async fn dispatch_wait_for(params: Value, cx: &mut AsyncApp) -> Result<Value> {
     }
 
     let browser = active_browser(cx)?;
-    let wait_load = params
-        .get("wait_load")
-        .and_then(Value::as_bool)
-        .unwrap_or(text.is_none() && text_gone.is_none());
-    wait_for_macos(browser, wait_load, text, text_gone, cx).await?;
-    Ok(json!({ "ready": true }))
+    wait_for_macos(browser, options, cx).await
 }
 
 async fn dispatch_record(
@@ -1520,12 +1700,15 @@ async fn evaluate_bool_on_browser(
 
 async fn wait_for_macos(
     browser: Entity<BrowserView>,
-    wait_load: bool,
-    text: Option<String>,
-    text_gone: Option<String>,
+    options: MacosWaitOptions,
     cx: &mut AsyncApp,
-) -> Result<()> {
-    let deadline = Instant::now() + DEFAULT_WAIT_TIMEOUT;
+) -> Result<Value> {
+    let visible_token = if let Some(ref_id) = options.visible_ref.as_deref() {
+        Some((ref_id.to_string(), wk_token_for_ref(&browser, ref_id, cx)?))
+    } else {
+        None
+    };
+    let deadline = Instant::now() + options.timeout;
     loop {
         let mut loading = browser.update(cx, |view, cx| view.item().read(cx).is_loading());
         let mut title = browser.update(cx, |view, cx| view.item().read(cx).title().to_string());
@@ -1549,43 +1732,65 @@ async fn wait_for_macos(
         if ready_state == "complete" {
             loading = false;
         }
-        let load_ready =
-            !wait_load || ready_state == "complete" || (ready_state.is_empty() && !loading);
-
-        let text_ready = match text.as_deref() {
-            Some(needle) if title.contains(needle) => true,
-            Some(needle) if load_ready => {
-                evaluate_bool_on_browser(&browser, macos_page_contains_text_script(needle), cx)
-                    .await
-                    .unwrap_or(false)
-            }
-            Some(_) => false,
-            None => true,
+        let mut state = MacosWaitState {
+            loading,
+            ready_state: ready_state.to_string(),
+            title,
+            url,
+            text_visible: None,
+            text_gone_absent: None,
+            element_visible: None,
         };
+        let load_ready = macos_wait_load_ready(&options, &state);
 
-        let gone_ready = match text_gone.as_deref() {
-            Some(needle) if title.contains(needle) => false,
-            Some(needle) if load_ready => {
-                !evaluate_bool_on_browser(&browser, macos_page_contains_text_script(needle), cx)
+        if let Some(needle) = options.text.as_deref() {
+            state.text_visible = if state.title.contains(needle) {
+                Some(true)
+            } else if load_ready {
+                Some(
+                    evaluate_bool_on_browser(&browser, macos_page_contains_text_script(needle), cx)
+                        .await
+                        .unwrap_or(false),
+                )
+            } else {
+                Some(false)
+            };
+        }
+
+        if let Some(needle) = options.text_gone.as_deref() {
+            state.text_gone_absent = if state.title.contains(needle) {
+                Some(false)
+            } else if load_ready {
+                Some(
+                    !evaluate_bool_on_browser(
+                        &browser,
+                        macos_page_contains_text_script(needle),
+                        cx,
+                    )
                     .await
-                    .unwrap_or(true)
-            }
-            Some(_) => false,
-            None => true,
-        };
+                    .unwrap_or(true),
+                )
+            } else {
+                Some(false)
+            };
+        }
 
-        if load_ready && text_ready && gone_ready {
-            return Ok(());
+        if let Some((ref_id, token)) = visible_token.as_ref() {
+            state.element_visible = Some(
+                evaluate_bool_on_browser(&browser, macos_element_visible_script(token), cx)
+                    .await
+                    .map_err(|err| {
+                        anyhow!("element {ref_id} visibility check failed during wait_for: {err}")
+                    })?,
+            );
+        }
+
+        if macos_wait_ready(&options, &state) {
+            return Ok(macos_wait_success_json(&options, &state));
         }
 
         if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "browser automation wait_for timed out after {:?} (loading={}, title={:?}, url={})",
-                DEFAULT_WAIT_TIMEOUT,
-                loading,
-                title,
-                url
-            ));
+            return Err(anyhow!(macos_wait_timeout_message(&options, &state)));
         }
 
         cx.background_executor().timer(POLL_INTERVAL).await;
@@ -2091,6 +2296,118 @@ mod tests {
             vec!["Books".to_string(), "Ebooks".to_string()]
         );
         assert!(parse_string_or_array(Some(&json!(false))).is_none());
+    }
+
+    #[test]
+    fn macos_wait_options_parse_url_text_and_element_conditions() {
+        let options = parse_macos_wait_options(&json!({
+            "text": "Thanksalot Cellphones & Wearable Deals",
+            "urlContains": "/search",
+            "ref": "e12",
+            "timeoutMs": 1500
+        }));
+
+        assert!(!options.wait_load);
+        assert_eq!(
+            options.text.as_deref(),
+            Some("Thanksalot Cellphones & Wearable Deals")
+        );
+        assert_eq!(options.url_contains.as_deref(), Some("/search"));
+        assert_eq!(options.visible_ref.as_deref(), Some("e12"));
+        assert_eq!(options.timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn macos_wait_ready_requires_all_requested_conditions() {
+        let options = MacosWaitOptions {
+            wait_load: true,
+            text: Some("Wearable Deals".to_string()),
+            text_gone: None,
+            url: None,
+            url_contains: Some("takealot.com".to_string()),
+            visible_ref: Some("e9".to_string()),
+            timeout: DEFAULT_WAIT_TIMEOUT,
+        };
+        let state = MacosWaitState {
+            loading: false,
+            ready_state: "complete".to_string(),
+            title: "Takealot".to_string(),
+            url: "https://www.takealot.com/".to_string(),
+            text_visible: Some(true),
+            text_gone_absent: None,
+            element_visible: Some(false),
+        };
+
+        assert!(!macos_wait_ready(&options, &state));
+        assert_eq!(
+            macos_wait_pending_conditions(&options, &state),
+            vec!["element e9 visible".to_string()]
+        );
+
+        let ready_state = MacosWaitState {
+            element_visible: Some(true),
+            ..state
+        };
+        assert!(macos_wait_ready(&options, &ready_state));
+    }
+
+    #[test]
+    fn macos_wait_timeout_message_names_failed_conditions() {
+        let options = MacosWaitOptions {
+            wait_load: true,
+            text: Some("Wearable Deals".to_string()),
+            text_gone: None,
+            url: Some("https://www.takealot.com/search?s=samsung".to_string()),
+            url_contains: None,
+            visible_ref: None,
+            timeout: Duration::from_millis(750),
+        };
+        let state = MacosWaitState {
+            loading: true,
+            ready_state: "interactive".to_string(),
+            title: "Takealot".to_string(),
+            url: "https://www.takealot.com/".to_string(),
+            text_visible: Some(false),
+            text_gone_absent: None,
+            element_visible: None,
+        };
+
+        let message = macos_wait_timeout_message(&options, &state);
+        assert!(message.contains("750ms"));
+        assert!(message.contains("load state complete"));
+        assert!(message.contains("visible text \"Wearable Deals\""));
+        assert!(message.contains("url equals \"https://www.takealot.com/search?s=samsung\""));
+        assert!(message.contains("readyState=\"interactive\""));
+    }
+
+    #[test]
+    fn macos_wait_success_json_reports_observed_page_state() {
+        let options = MacosWaitOptions {
+            wait_load: true,
+            text: Some("Example Domain".to_string()),
+            text_gone: None,
+            url: None,
+            url_contains: Some("example.com".to_string()),
+            visible_ref: None,
+            timeout: DEFAULT_WAIT_TIMEOUT,
+        };
+        let state = MacosWaitState {
+            loading: false,
+            ready_state: "complete".to_string(),
+            title: "Example Domain".to_string(),
+            url: "https://example.com/".to_string(),
+            text_visible: Some(true),
+            text_gone_absent: None,
+            element_visible: None,
+        };
+
+        let result = macos_wait_success_json(&options, &state);
+        assert_eq!(result["ready"], true);
+        assert_eq!(result["url"], "https://example.com/");
+        assert_eq!(result["readyState"], "complete");
+        assert_eq!(result["checks"]["load"], true);
+        assert_eq!(result["checks"]["text"], true);
+        assert_eq!(result["checks"]["urlContains"], true);
     }
 
     #[test]
